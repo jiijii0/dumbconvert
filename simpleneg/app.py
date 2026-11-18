@@ -2177,6 +2177,7 @@ class MainWindow(QMainWindow):
         self._adjusting: str | None = None        # Settings field changed by ↑ / ↓ while its key is held
         self._rendered_angle = 0.0                # fine rotation of the picture on screen
         self._request_angle: dict[int, float] = {}
+        self._request_turn: dict[int, tuple[int, bool]] = {}   # (quarter turns, mirrored) of each render
         self._request_draft: dict[int, bool] = {}
         self._straighten_timer = QTimer(singleShot=True, interval=250)   # real render once dragging pauses
         self._straighten_timer.timeout.connect(self.request_preview)
@@ -4737,12 +4738,19 @@ class MainWindow(QMainWindow):
         size = PREVIEW_DRAFT if draft else PREVIEW_SIZE
         fn = lambda: engine.preview(p.path, st, size, uncropped=uncropped, keep_source=True)
         self._request_angle[rid] = st.fine_rotation
+        self._request_turn[rid] = (st.rotation, st.mirror)
         self._request_draft[rid] = draft
         self.preview_pool.start(Job(fn, lambda r: self.signals.preview.emit(p, r, rid)))
 
     def on_preview(self, p: Photo, result, request_id: int):
         self.preview_busy = False
-        if p is self.current and request_id == self.preview_request:
+        # turned or flipped while this rendered: the picture on screen was already turned by hand,
+        # showing this one would snap it back (the turn looked lost). Render again instead.
+        turned = self._request_turn.get(request_id) != (p.settings.rotation, p.settings.mirror)
+        if p is self.current and request_id == self.preview_request and turned and not isinstance(result, str):
+            self._pending_full = self._pending_full or not self._request_draft.get(request_id, False)
+            self.preview_pending = True
+        elif p is self.current and request_id == self.preview_request:
             if isinstance(result, str):
                 self.preview.set_image(None)
                 self.preview.setText(f"Could not convert {p.path.name}\n\n{result}")
@@ -4766,6 +4774,7 @@ class MainWindow(QMainWindow):
                     self.preview.hires = None       # its colours are out of date: show the preview meanwhile
                     self.on_zoom(self.preview.zoom)
         self._request_angle.pop(request_id, None)
+        self._request_turn.pop(request_id, None)
         self._request_draft.pop(request_id, None)
         if self.preview_pending:
             self.preview_pending = False
