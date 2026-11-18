@@ -67,15 +67,17 @@ xattr -dr com.apple.quarantine /Applications/DumbConvert.app
 
 ## Run from source
 
-Needs Python 3.13+ and Rust (`brew install rust`).
+Needs [uv](https://docs.astral.sh/uv/) and Rust (`brew install uv rust`). uv downloads
+Python 3.13 itself, so the Python that ships with macOS (3.9, too old for this project) is
+never involved.
 
 ```sh
 git clone --recurse-submodules https://github.com/jiijii0/dumbconvert.git
 cd dumbconvert
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/pip install ./vendor/negpy/negpy_core
-.venv/bin/pip install --no-deps -e ./vendor/negpy
+uv venv --python 3.13
+uv pip install -r requirements.txt
+uv pip install ./vendor/negpy/negpy_core
+uv pip install --no-deps -e ./vendor/negpy
 ./run.command
 ```
 
