@@ -2175,6 +2175,7 @@ class MainWindow(QMainWindow):
         self._sync_base: engine.Settings | None = None    # for applying edits to selected frames
         self._show_before = False
         self._adjusting: str | None = None        # Settings field changed by ↑ / ↓ while its key is held
+        self._strip_pressed = False               # a mouse button is down on the filmstrip
         self._rendered_angle = 0.0                # fine rotation of the picture on screen
         self._request_angle: dict[int, float] = {}
         self._request_draft: dict[int, bool] = {}
@@ -2371,6 +2372,12 @@ class MainWindow(QMainWindow):
         t = e.type()
         if t == QEvent.ApplicationDeactivate:
             self._set_adjusting(None)
+        if t == QEvent.MouseButtonPress and hasattr(self, "grid") and obj is self.grid.viewport():
+            self._strip_pressed = True
+        elif t == QEvent.MouseButtonRelease and self._strip_pressed:
+            self._strip_pressed = False               # the click is over: now the strip may move
+            if self.current and self.current.item is not None:
+                self.grid.scrollToItem(self.current.item, QAbstractItemView.PositionAtCenter)
         if t not in (QEvent.KeyPress, QEvent.KeyRelease, QEvent.ShortcutOverride):
             return super().eventFilter(obj, e)
         if (self.main_stack.currentIndex() != 0 or QApplication.activeWindow() is not self or self._typing()
@@ -3742,7 +3749,11 @@ class MainWindow(QMainWindow):
             self._leave_frame()
         self.current = self.photos[row]
         self.preview.reset_zoom()                         # a new frame starts at fit
-        self.grid.scrollToItem(self.current.item, QAbstractItemView.PositionAtCenter)
+        # Centre the strip on it, but not under a click still held: the strip would slide under the
+        # mouse, and the slightest move would select (and centre on) the frame now under it, frames
+        # further on. Centred once the button is released (eventFilter).
+        if not self._strip_pressed:
+            self.grid.scrollToItem(self.current.item, QAbstractItemView.PositionAtCenter)
         if not self.current.history:
             self.current.history, self.current.hindex = [self.current.settings.copy()], 0
         self._sync_base = self.current.settings.copy()
