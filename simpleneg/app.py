@@ -1143,6 +1143,42 @@ class Backdrop(QWidget):
             self.unsetCursor()
 
 
+class ElidedLabel(QLabel):
+    """One line of text that ends in … when it does not fit, instead of widening its parent.
+    While shortened, the whole text is the tooltip of `tip_on` (the label itself by default)."""
+
+    def __init__(self, tip_on: QWidget | None = None):
+        super().__init__()
+        self._full = ""
+        self._tip_on = tip_on
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def setText(self, text: str):
+        self._full = text
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide()
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() in (QEvent.FontChange, QEvent.StyleChange):
+            self._elide()
+
+    def _elide(self):
+        shown = self.fontMetrics().elidedText(self._full, Qt.ElideRight, max(self.width(), 0))
+        if shown != super().text():
+            super().setText(shown)
+        (self._tip_on or self).setToolTip(self._full if shown != self._full else "")
+
+
 class RollCard(QFrame):
     """One roll (or the single frames) in the left column: its name, then film stock and frame count.
     A roll's chevron expands the card to show its details (the details widget is moved in)."""
@@ -1170,9 +1206,10 @@ class RollCard(QFrame):
         head.setContentsMargins(14, 10, 10, 10)
         text = QVBoxLayout()
         text.setSpacing(2)
-        self.title = QLabel()
+        # long names end in … (whole name in the tooltip): they never widen the card past the column
+        self.title = ElidedLabel(tip_on=self.head)    # the labels let the mouse through to the plate
         self.title.setObjectName("rollTitle")
-        self.sub = QLabel()
+        self.sub = ElidedLabel()
         self.sub.setObjectName("rollSub")
         for w in (self.title, self.sub):
             w.setAttribute(Qt.WA_TransparentForMouseEvents)
