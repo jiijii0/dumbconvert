@@ -395,7 +395,8 @@ def button(text: str, slot=None, name: str = "") -> QPushButton:
 
 # Preferences: the few choices that outlive a session (the Settings tab). Stored by macOS in
 # ~/Library/Preferences, next to the key bindings and the camera / lens presets.
-PREF_DEFAULTS = {"auto_crop_new": False, "scan_warnings": True, "flat_field": "", "export": "", "sheet": ""}
+PREF_DEFAULTS = {"auto_crop_new": False, "scan_warnings": True, "flat_field": "", "export": "", "sheet": "",
+                 "histogram": "rgb"}
 
 
 def pref(key: str):
@@ -439,6 +440,81 @@ class GearButton(FadeButton):
         ring.closeSubpath()
         p.drawPath(ring)
         p.drawEllipse(QPointF(0, 0), 2.3, 2.3)
+        p.end()
+
+
+CHANNELS = ((236, 64, 64), (64, 210, 96), (72, 120, 255))   # red, green, blue: the histogram and its switch
+
+
+class ChannelButton(FadeButton):
+    """The histogram's mode switch: three dots, red, green and blue, for the colour channels.
+    Clicked, they glide together into one grey dot (brightness only), and apart again."""
+
+    mode_changed = Signal(str)
+    GREY = (196, 196, 200)
+    TIPS = {"rgb": "Showing red, green and blue: click for brightness only",
+            "mono": "Showing brightness: click for red, green and blue"}
+
+    def __init__(self, mode: str = "rgb"):
+        super().__init__("")
+        self.setObjectName("toggle")                      # the quiet plate the other switches sit on
+        self.setFixedHeight(28)                          # as wide as the other switches (their style sets it)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = 0.0
+        self._merge = QVariantAnimation(self)             # 0: three dots, 1: one grey dot
+        self._merge.setDuration(340)
+        self._merge.setEasingCurve(QEasingCurve.InOutCubic)
+        self._merge.valueChanged.connect(lambda _v: self.update())
+        self.mode = ""
+        self.set_mode(mode, animate=False)
+        self.clicked.connect(lambda _checked=False: self.set_mode("rgb" if self.mode == "mono" else "mono"))
+
+    @property
+    def merged(self) -> float:
+        v = self._merge.currentValue()
+        return float(v) if v is not None else (1.0 if self.mode == "mono" else 0.0)
+
+    def set_mode(self, mode: str, animate: bool = True):
+        mode = "mono" if mode == "mono" else "rgb"
+        if mode == self.mode:
+            return
+        start, end = self.merged, (1.0 if mode == "mono" else 0.0)
+        self.mode = mode
+        self.setToolTip(self.TIPS[mode])
+        self._merge.stop()
+        self._merge.setStartValue(start if animate else end)
+        self._merge.setEndValue(end)
+        if animate:
+            self._merge.start()
+        else:
+            self._merge.setCurrentTime(self._merge.duration())
+        self.update()
+        self.mode_changed.emit(mode)
+
+    def _tint(self, t: float):
+        self._hover = t
+        self.update()
+
+    def paintEvent(self, e):
+        import math
+        super().paintEvent(e)                             # the plate, from the stylesheet
+        t = self.merged
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.translate(self.width() / 2, self.height() / 2 + 0.5)
+        spread = 4.4 * (1 - t) + 0.4 * self._hover * (1 - t)   # hovering parts them a touch
+        r = 3.1 + 1.9 * t                                 # the grey dot is a little bigger than one channel
+        light = 0.8 + 0.2 * self._hover                   # a little dimmer at rest, full colour under the mouse
+        grey = self.GREY
+        if t > 0.999:                                     # one dot: three stacked would thicken its soft edge
+            p.setBrush(QColor(*(round(g * light) for g in grey)))
+            p.drawEllipse(QPointF(0, 0), r, r)
+        else:
+            for rgb, angle in zip(CHANNELS, (-90, 150, 30)):     # red on top, green left, blue right
+                a = math.radians(angle)
+                p.setBrush(QColor(*(round((c + (g - c) * t) * light) for c, g in zip(rgb, grey))))
+                p.drawEllipse(QPointF(spread * math.cos(a), spread * math.sin(a)), r, r)
         p.end()
 
 
@@ -653,6 +729,126 @@ class LineSlider(QWidget):
     def mouseDoubleClickEvent(self, e):
         self._drag = False
         self.reset()
+
+
+HIST_SAMPLES = 250_000   # pixels counted for the histogram: plenty for its shape, cheap per render
+
+
+def histogram(rgb: np.ndarray) -> np.ndarray:
+    """Counts of each value 0..255 in a uint8 RGB array: rows R, G, B and luminance (Rec. 709).
+
+    A big picture is sampled on an even grid, so a draft render while dragging costs a few ms.
+    """
+    h, w = rgb.shape[:2]
+    step = max(1, int((h * w / HIST_SAMPLES) ** 0.5))
+    px = rgb[::step, ::step, :3].reshape(-1, 3)
+    lum = (px.astype(np.uint32) @ np.array([54, 183, 19], np.uint32)) >> 8   # weights sum to 256
+    return np.stack([np.bincount(c, minlength=256)[:256] for c in (px[:, 0], px[:, 1], px[:, 2], lum)])
+
+
+class Histogram(QWidget):
+    """The shown picture's histogram: R, G and B laid over each other (where they overlap they add
+    up towards white), or a single grey curve for brightness. Shadows left, highlights right."""
+
+    MODES = ("rgb", "mono")
+
+    def __init__(self, mode: str = "rgb"):
+        super().__init__()
+        self.mode = mode if mode in self.MODES else "rgb"
+        self.counts: np.ndarray | None = None
+        self.setFixedHeight(84)
+
+    def set_image(self, rgb: np.ndarray | None):
+        self.counts = None if rgb is None else histogram(rgb)
+        self.update()
+
+    def set_mode(self, mode: str):
+        self.mode = mode
+        self.update()
+
+    SOFTEN = 1.6          # the drawn curve is blurred by this many values (of 256): calm, still exact enough
+    _KERNEL = np.exp(-0.5 * (np.arange(-5, 6) / SOFTEN) ** 2)
+    _KERNEL /= _KERNEL.sum()
+
+    @staticmethod
+    def _smooth(row: np.ndarray) -> np.ndarray:
+        out = np.convolve(row, (0.25, 0.5, 0.25), mode="same")      # tone curves leave combs of empty values
+        out[0], out[-1] = row[0], row[-1]                           # but clipping at either end stays as it is
+        return out
+
+    @classmethod
+    def soften(cls, row: np.ndarray) -> np.ndarray:
+        """The curve as drawn: a gentle blur, mirrored at the ends so clipping keeps its full height."""
+        padded = np.pad(row.astype(float), 5, mode="symmetric")
+        return np.convolve(padded, cls._KERNEL, mode="valid")
+
+    @staticmethod
+    def peak(rows: np.ndarray) -> float:
+        """The height the curves are scaled to. Clipping at either end, and a spike or two inside
+        (a film border, a flat sky), would flatten everything else: each curve's 7th-tallest
+        point counts, which a spike (3 points wide once smoothed) never reaches."""
+        inner = np.sort(rows[:, 1:255], axis=1)[:, -7]
+        return float(inner.max()) * 1.05 or float(rows.max()) or 1.0
+
+    @staticmethod
+    def _curve(row: np.ndarray, peak: float, area: QRectF) -> tuple[QPainterPath, QPainterPath]:
+        """One curve: a smooth line through the values, and the area under it to fill."""
+        ys = area.bottom() - np.minimum(row / peak, 1.0) * area.height()
+        xs = area.left() + (np.arange(256) + 0.5) / 256 * area.width()
+        pts = [QPointF(x, y) for x, y in zip(xs, ys)]
+        line = QPainterPath(QPointF(area.left(), ys[0]))
+        line.lineTo(pts[0])
+        for i in range(255):                                        # Catmull-Rom, as cubic Béziers
+            a, b, c, d = pts[max(i - 1, 0)], pts[i], pts[i + 1], pts[min(i + 2, 255)]
+            line.cubicTo(b + (c - a) / 6, c - (d - b) / 6, c)
+        line.lineTo(QPointF(area.right(), ys[-1]))
+        under = QPainterPath(line)
+        under.lineTo(QPointF(area.right(), area.bottom()))
+        under.lineTo(QPointF(area.left(), area.bottom()))
+        under.closeSubpath()
+        return line, under
+
+    def _fill(self, area: QRectF, r: int, g: int, b: int, top: int, bottom: int) -> QLinearGradient:
+        grad = QLinearGradient(0, area.top(), 0, area.bottom())    # fades towards the floor, like the faders
+        grad.setColorAt(0, QColor(r, g, b, top))
+        grad.setColorAt(1, QColor(r, g, b, bottom))
+        return grad
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        box = QRectF(self.rect())
+        frame = QPainterPath()
+        frame.addRoundedRect(box, 6, 6)
+        p.fillPath(frame, QColor(COLORS["field"]))
+        p.setClipPath(frame)                                       # the curves follow the rounded corners
+        p.setPen(QPen(QColor(COLORS["line"]), 1))              # quarter marks: shadows, mids, highlights
+        for i in (1, 2, 3):
+            x = round(box.left() + box.width() * i / 4) + 0.5
+            p.drawLine(QPointF(x, box.top() + 4), QPointF(x, box.bottom() - 4))
+        if self.counts is None or not self.counts[3].any():
+            p.end()
+            return
+        area = box.adjusted(0, 8, 0, 0)
+        counts = self.counts[:3] if self.mode == "rgb" else self.counts[3:]
+        peak = self.peak(np.array([self._smooth(r) for r in counts]))
+        rows = [self.soften(r) for r in counts]
+        if self.mode == "rgb":
+            p.setCompositionMode(QPainter.CompositionMode_Plus)    # overlaps add up towards white
+            colors = CHANNELS
+            fill, stroke = (120, 40), 200
+        else:
+            grey = QColor(COLORS["text"])
+            colors = ((grey.red(), grey.green(), grey.blue()),)
+            fill, stroke = (95, 25), 150
+        for row, (r, g, b) in zip(rows, colors):
+            line, under = self._curve(row, peak, area)
+            p.fillPath(under, self._fill(area, r, g, b, *fill))
+            pen = QPen(QColor(r, g, b, stroke), 1.2)
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.RoundCap)
+            p.strokePath(line, pen)
+        p.end()
 
 
 def _icon_tint(self, t: float):
@@ -2666,6 +2862,18 @@ class MainWindow(QMainWindow):
 
         self.steppers: dict[str, Stepper] = {}
         p, lay = panel()                                  # all six faders, like a mixing desk
+        self.histogram = Histogram(pref("histogram"))     # above them, what they do to the picture
+        hist_label = QLabel("Histogram")
+        hist_label.setObjectName("rowLabel")
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(hist_label)
+        row.addStretch(1)
+        self.hist_mode_btn = ChannelButton(self.histogram.mode)
+        self.hist_mode_btn.mode_changed.connect(self.set_histogram_mode)
+        row.addWidget(self.hist_mode_btn)
+        lay.addLayout(row)
+        lay.addWidget(self.histogram)
         row = QHBoxLayout()
         row.setSpacing(0)
         for key, title, up, down in [("density", "D", "dens+", "dens-"), ("contrast", "Con", "con+", "con-"),
@@ -3363,6 +3571,7 @@ class MainWindow(QMainWindow):
         """Nothing loaded any more: back to the first screen."""
         self.grid.clear()
         self.preview.set_image(None)
+        self.histogram.set_image(None)
         self.preview.setText("")
         self.title.setText("")
         self.stack.setCurrentIndex(0)
@@ -4745,10 +4954,12 @@ class MainWindow(QMainWindow):
         if p is self.current and request_id == self.preview_request:
             if isinstance(result, str):
                 self.preview.set_image(None)
+                self.histogram.set_image(None)
                 self.preview.setText(f"Could not convert {p.path.name}\n\n{result}")
             else:
                 self.preview.setText("")
                 self.preview.set_image(to_pixmap(result), draft=self._request_draft.get(request_id, False))
+                self.histogram.set_image(result)
                 # this render already contains its rotation; show only what changed since
                 self._rendered_angle = self._request_angle.get(request_id, 0.0)
                 self.preview.angle = p.settings.fine_rotation - self._rendered_angle
@@ -4771,6 +4982,11 @@ class MainWindow(QMainWindow):
             self.preview_pending = False
             full, self._pending_full = self._pending_full, False
             self.request_preview(draft=not full)
+
+    def set_histogram_mode(self, mode: str):
+        self.histogram.set_mode(mode)
+        self.hist_mode_btn.set_mode(mode)           # from code: the dots follow (from a click they are there)
+        set_pref("histogram", mode)
 
     # ----- Export ----------------------------------------------------------
     def open_export(self):
