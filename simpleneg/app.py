@@ -2175,6 +2175,11 @@ class MainWindow(QMainWindow):
         self._sync_base: engine.Settings | None = None    # for applying edits to selected frames
         self._show_before = False
         self._adjusting: str | None = None        # Settings field changed by ↑ / ↓ while its key is held
+        # ...and by moving the mouse up / down. Polled: Qt sends no mouse moves without a button
+        # pressed unless every widget under the pointer tracks the mouse.
+        self._mouse_adjust_timer = QTimer(interval=15)
+        self._mouse_adjust_timer.timeout.connect(self._mouse_adjust)
+        self._mouse_adjust_y = 0
         self._rendered_angle = 0.0                # fine rotation of the picture on screen
         self._request_angle: dict[int, float] = {}
         self._request_draft: dict[int, bool] = {}
@@ -2410,9 +2415,26 @@ class MainWindow(QMainWindow):
         if field_:
             self.steppers[field_].set_active(True)
             up, down = self.ADJUST_HINTS[field_]
-            self.statusBar().showMessage(f"{field_.capitalize()}:  ↑ {up}   ↓ {down}   (Shift: bigger steps)")
+            self.statusBar().showMessage(f"{field_.capitalize()}:  ↑ {up}   ↓ {down}   or move the mouse"
+                                         "   (Shift: bigger steps)")
+            self._mouse_adjust_y = QCursor.pos().y()
+            self._mouse_adjust_timer.start()
         else:
+            self._mouse_adjust_timer.stop()
             self.statusBar().clearMessage()
+
+    MOUSE_ADJUST_PX = 8     # mouse travel for one step while an adjust key is held
+
+    def _mouse_adjust(self):
+        """Hold an adjust key and move the mouse: up is the same as ↑, down as ↓."""
+        if not self._adjusting:
+            self._mouse_adjust_timer.stop()
+            return
+        steps = int((self._mouse_adjust_y - QCursor.pos().y()) / self.MOUSE_ADJUST_PX)   # towards zero
+        if steps:
+            self._mouse_adjust_y -= steps * self.MOUSE_ADJUST_PX     # keep the rest for the next step
+            big = QApplication.keyboardModifiers() & Qt.ShiftModifier
+            self.nudge(self._adjusting, steps * (4 if big else 1))
 
     def nudge(self, field_: str, steps: int):
         if not self.current or self._typing():
