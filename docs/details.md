@@ -154,6 +154,7 @@ does not fit continues on a second sheet. The sheet is drawn by NegPy's contact-
 | Saturation | Chroma |
 | C / M / Y | Cyan / Magenta / Yellow filtration, balanced so a step of each moves the picture equally (yellow ×1.40, magenta ×0.87). One step = 0.02; the fader covers the full range |
 | L / Mirror / R | Rotation (quarter turns) / Flip horizontal |
+| Straighten | Fine rotation, empty corners trimmed (Crop to valid). With no crop, the frame is still measured inside the film, not in the light around it: NegPy's film box from before straightening, turned with the picture (`engine._film_area`) |
 | Crop: Edit / Auto | Manual crop rect / Auto Crop. Auto also levels a tilted scan (NegPy's frame-edge measure), unless you straightened it yourself |
 | Auto WB | DumbConvert's own: makes the least colourful pixels neutral by setting C/M/Y |
 | Refine ▸ Re-measure Inside Crop | Measures the film again inside the crop (`analysis_rect`), then Auto WB |

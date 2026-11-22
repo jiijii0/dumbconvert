@@ -225,10 +225,90 @@ def to_config(st: Settings, uncropped: bool = False, path: Path | None = None) -
                 # (a turn, a flip or straightening changes the key, and NegPy looks again)
                 flat["crop_rect"] = tuple(st.auto_rect)
                 flat["crop_detect_key"] = st.auto_key
+    if path is not None and flat["crop_to_valid"] and not (st.crop or st.auto_crop or st.analysis_rect):
+        # straightened, no crop: measured inside the film, as before straightening (see _film_area)
+        area = _film_area(path, st)
+        if area:
+            flat["analysis_rect"] = area
     cfg = WorkspaceConfig.from_flat_dict(flat)
     if path is not None and abs(st.contrast - 1.0) > 1e-6:
         cfg = _with_contrast(cfg, path, st)
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Straightened frames
+# ---------------------------------------------------------------------------
+# On a frame with no crop, NegPy finds the film in the scan and measures exposure and colour
+# inside it, not in the light around it. Straightening leaves empty corners, which NegPy trims
+# away (crop_to_valid); to NegPy that is a crop, so it stops looking for the film and measures
+# all that is left, the light included: the picture went dark at the first 0.1°. The film is
+# still where it was. Its box is found once, on the frame before straightening, and a
+# straightened frame is measured in the upright rectangle inside that box as it now lies.
+_film_boxes: dict[tuple, tuple | None] = {}
+_film_boxes_lock = threading.Lock()
+
+
+def _film_box(path: Path, st: Settings) -> tuple[tuple, float] | None:
+    """NegPy's film box on this frame before straightening: (rect in 0..1 of the turned picture,
+    that picture's width / height). None when the film fills the scan. Cached per turn and flip."""
+    key = (source_hash(path), flat_profile_id(st), st.rotation % 4, st.mirror)
+    with _film_boxes_lock:
+        if key in _film_boxes:
+            return _film_boxes[key]
+    plain = st.copy()
+    plain.fine_rotation, plain.crop, plain.auto_crop, plain.analysis_rect, plain.contrast = 0.0, None, False, None, 1.0
+    cfg = to_config(plain)
+    ip = _processor()
+    src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
+    step = max(1, int(np.ceil(max(src.shape[:2]) / 1200)))   # finding the film needs no full resolution
+    small = np.ascontiguousarray(src[::step, ::step])
+    _, metrics = ip.run_pipeline(small, cfg, source_hash(path) + "|film", max(small.shape[:2]),
+                                 prefer_gpu=False, readback_metrics=True)
+    found = metrics.get("meter_resolved")
+    h, w = small.shape[:2]
+    box = None if found is None or found.rect is None else (
+        tuple(float(v) for v in found.rect), (h / w) if st.rotation % 2 else (w / h))
+    with _film_boxes_lock:
+        if len(_film_boxes) > 2000:      # a long session: forget the oldest
+            for k in list(_film_boxes)[:500]:
+                del _film_boxes[k]
+        _film_boxes[key] = box
+    return box
+
+
+def _film_area(path: Path, st: Settings) -> tuple | None:
+    """Where a straightened frame with no crop is measured: inside the film, less the border NegPy
+    leaves out at every edge (its analysis buffer, which a given area replaces). None: no film box."""
+    box = _film_box(path, st)
+    if box is None:
+        return None
+    x0, y0, x1, y1 = _inside_turned(box[0], box[1], st.fine_rotation)
+    b = min(max(st.border, 0.0), 0.3)
+    dx, dy = b * (x1 - x0), b * (y1 - y0)
+    return (x0 + dx, y0 + dy, x1 - dx, y1 - dy)
+
+
+def _inside_turned(rect: tuple, aspect: float, angle: float) -> tuple:
+    """The largest upright rect inside `rect` once the picture (width / height `aspect`) is
+    straightened by `angle` degrees: `rect` turns with the picture, about the picture's centre."""
+    import negpy_core
+
+    w, h = 1000.0 * aspect, 1000.0
+    x0, y0, x1, y1 = rect
+    fw, fh = (x1 - x0) * w, (y1 - y0) * h
+    turn = negpy_core.rotation_matrix((w / 2.0, h / 2.0), angle, 1.0)    # as NegPy's fine rotation turns it
+    cx, cy = turn @ np.array([(x0 + x1) / 2 * w, (y0 + y1) / 2 * h, 1.0])
+    a = min(abs(np.radians(angle)), np.pi / 4)
+    s, c = np.sin(a), np.cos(a)
+    long_side, short_side = max(fw, fh), min(fw, fh)
+    if short_side <= 2 * s * c * long_side:      # turned so far that the short side alone sets the size
+        half = short_side / 2
+        iw, ih = (half / s, half / c) if fw >= fh else (half / c, half / s)
+    else:
+        iw, ih = (fw * c - fh * s) / (c * c - s * s), (fh * c - fw * s) / (c * c - s * s)
+    return (float(max(0.0, (cx - iw / 2) / w)), float(max(0.0, (cy - ih / 2) / h)),
+            float(min(1.0, (cx + iw / 2) / w)), float(min(1.0, (cy + ih / 2) / h)))
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +383,7 @@ def _meter(path: Path, st: Settings) -> dict:
     with _meters_lock:
         if key in _meters:
             return _meters[key]
-    cfg = to_config(neutral)
+    cfg = to_config(neutral, path=path)
     ip = _processor()
     src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
     step = max(1, int(np.ceil(max(src.shape[:2]) / 1200)))   # measuring needs no full resolution
@@ -961,7 +1041,8 @@ def frame_bounds(path: Path, st: Settings) -> tuple[tuple, tuple, tuple | None]:
     ceils, and its grey axis (where its neutral tones sit; None when it has none)."""
     per_frame = st.copy()
     per_frame.roll_floors = per_frame.roll_ceils = per_frame.roll_axis = None
-    cfg = to_config(per_frame, uncropped=False)
+    per_frame.contrast = 1.0             # the film measures the same at any contrast
+    cfg = to_config(per_frame, uncropped=False, path=path)
     ip = _processor()
     src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
     step = max(1, int(np.ceil(max(src.shape[:2]) / 1200)))   # measuring needs no full resolution

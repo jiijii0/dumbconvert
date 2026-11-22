@@ -102,6 +102,73 @@ class AutoCropTest(unittest.TestCase):
         self.assertAlmostEqual(w / h, shown.shape[1] / shown.shape[0], delta=0.004)
 
 
+class StraightenTest(unittest.TestCase):
+    """Straightening a frame with no crop changed its colours at the first 0.1°: NegPy then measured
+    the light around the film too, not only the film."""
+
+    @staticmethod
+    def _measured(path, st):
+        """The film floors and ceils NegPy measures for this render."""
+        cfg = engine.to_config(st, path=path)
+        ip = engine._processor()
+        src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
+        ip.release_source_cache()
+        _, metrics = ip.run_pipeline(np.ascontiguousarray(src[::2, ::2]), cfg, engine.source_hash(path) + "|test",
+                                     max(src.shape[:2]) // 2, prefer_gpu=False, readback_metrics=True)
+        b = metrics["log_bounds"]
+        return np.array([*b.floors, *b.ceils])
+
+    def test_straightening_keeps_the_colours(self):
+        def middle(img):                 # stays where it is: the frame turns about its centre
+            h, w = img.shape[:2]
+            k = h // 10
+            return img[h // 2 - k:h // 2 + k, w // 2 - k:w // 2 + k].reshape(-1, 3).mean(0)
+
+        f = test_file()
+        level = middle(render(f, engine.Settings()))
+        for angle in (0.1, 2.0):
+            with self.subTest(angle=angle):
+                diff = np.abs(middle(render(f, engine.Settings(fine_rotation=angle))) - level)
+                self.assertLess(diff.max(), 12.0, f"straightening changed the colours: {diff.round(1)}")
+
+    def test_a_straightened_frame_measures_the_film_only(self):
+        f = test_file()
+        for turn in ({}, {"rotation": 1, "mirror": True}):
+            level = self._measured(f, engine.Settings(**turn))
+            for angle in (0.1, 2.0, -7.0):
+                with self.subTest(turn=turn, angle=angle):
+                    tilted = self._measured(f, engine.Settings(fine_rotation=angle, **turn))
+                    np.testing.assert_allclose(tilted, level, atol=0.15)
+
+    def test_the_measured_area_lies_inside_the_turned_film(self):
+        # on a picture NegPy turned itself: white where the film (off centre, on purpose) is
+        from negpy.features.geometry.logic import apply_fine_rotation
+
+        h, w = 400, 600
+        film = (0.1, 0.2, 0.7, 0.9)
+        picture = np.zeros((h, w, 3), np.float32)
+        picture[int(film[1] * h):int(film[3] * h), int(film[0] * w):int(film[2] * w)] = 1.0
+        for angle in (-10.0, 3.0, 10.0, 40.0):
+            with self.subTest(angle=angle):
+                x0, y0, x1, y1 = engine._inside_turned(film, w / h, angle)
+                inside = apply_fine_rotation(picture, angle)[int(np.ceil(y0 * h)) + 1:int(y1 * h) - 1,
+                                                             int(np.ceil(x0 * w)) + 1:int(x1 * w) - 1]
+                self.assertGreater(inside.size, 0)
+                self.assertGreater(inside.min(), 0.9, "the measured area reaches outside the film")
+        x0, y0, x1, y1 = engine._inside_turned(film, w / h, 3.0)
+        self.assertGreater((x1 - x0) * (y1 - y0), 0.8 * 0.6 * 0.7, "far smaller than the film at 3°")
+
+    def test_only_when_nothing_else_says_where_to_measure(self):
+        area = (0.3, 0.3, 0.6, 0.6)
+        for name, f, st in (("film fills the scan", test_file(border=False), engine.Settings(fine_rotation=2.0)),
+                            ("a crop", test_file(), engine.Settings(fine_rotation=2.0, crop=(0.2, 0.2, 0.8, 0.8))),
+                            ("not straightened", test_file(), engine.Settings())):
+            with self.subTest(name):
+                self.assertIsNone(engine.to_config(st, path=f).process.analysis_rect)
+        own = engine.to_config(engine.Settings(fine_rotation=2.0, analysis_rect=area), path=test_file())
+        self.assertEqual(tuple(own.process.analysis_rect), area)
+
+
 class RefineTest(unittest.TestCase):
     """Every Refine slider must change the picture (a slider doing nothing was reported)."""
 
