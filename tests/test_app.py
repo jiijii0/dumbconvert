@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 
+import numpy as np
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QCompleter
@@ -227,6 +228,50 @@ class SelectionTest(AppTestCase):
         idle(win)
         self.assertEqual(self.values("cyan")[:3], [1.0, 1.0, 1.0])
         self.assertTrue(win.autowb_btn.isEnabled())
+
+
+class HistogramTest(AppTestCase):
+    def test_counts(self):
+        img = np.zeros((10, 20, 3), np.uint8)
+        img[:, :10] = (255, 0, 0)                          # half pure red, half black
+        h = app.histogram(img)
+        self.assertEqual(h.shape, (4, 256))
+        self.assertTrue((h.sum(axis=1) == 200).all())
+        self.assertEqual((h[0, 255], h[0, 0], h[1, 0], h[2, 0]), (100, 100, 200, 200))
+        self.assertEqual(h[3, 0], 100)
+        self.assertEqual(h[3, 255 * 54 >> 8], 100)          # red is 54/256 of brightness
+        white = np.full((4, 4, 3), 255, np.uint8)
+        self.assertEqual(app.histogram(white)[3, 255], 16)  # the weights add up to exactly white
+
+    def test_a_spike_does_not_flatten_the_curve(self):
+        # A film border left in the picture is one huge bin: the rest must still fill the height
+        row = np.full(256, 100.0)
+        row[3] = 100_000
+        smooth = app.Histogram._smooth(row)
+        self.assertLess(app.Histogram.peak(smooth[None]), 200)
+
+    def test_follows_the_picture_and_remembers_the_mode(self):
+        win = self.open_frame()
+        np.testing.assert_array_equal(win.histogram.counts, app.histogram(shown_picture(win)))
+        before = win.histogram.counts.copy()
+        win.nudge("density", 4)
+        idle(win)
+        self.assertFalse((win.histogram.counts == before).all(), "the histogram missed the edit")
+        self.assertEqual(win.histogram.mode, "rgb")
+        btn = win.hist_mode_btn
+        btn.click()                                        # the dots merge: brightness only
+        self.assertEqual((win.histogram.mode, btn.mode), ("mono", "mono"))
+        idle(win)
+        pump(0.5)
+        self.assertEqual(btn.merged, 1.0)
+        btn.click()
+        self.assertEqual(win.histogram.mode, "rgb")
+        btn.click()
+        close(win)
+        self.win = window()                                # remembered, and shown merged without replaying
+        self.assertEqual((self.win.histogram.mode, self.win.hist_mode_btn.mode), ("mono", "mono"))
+        self.assertEqual(self.win.hist_mode_btn.merged, 1.0)
+        self.win.set_histogram_mode("rgb")                 # leave the shared settings as they were
 
 
 class LogTest(unittest.TestCase):
