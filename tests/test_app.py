@@ -77,6 +77,77 @@ class TypingTest(AppTestCase):
         self.assertGreater(win.current.settings.density, d)
 
 
+class MouseAdjustTest(AppTestCase):
+    """Hold an adjust key (Q W E / A S D) and move the mouse up or down: the same as ↑ / ↓."""
+
+    def setUp(self):
+        self.y = 500
+        test = self
+
+        class FakeCursor:                    # the offscreen platform has no pointer to move
+            @staticmethod
+            def pos():
+                return QPoint(300, test.y)
+        self._cursor = app.QCursor
+        app.QCursor = FakeCursor
+
+    def tearDown(self):
+        app.QCursor = self._cursor
+        super().tearDown()
+
+    def move(self, dy):
+        self.y += dy
+        pump(0.1)                            # the window polls the pointer while the key is held
+
+    def test_moving_the_mouse_steps_the_held_correction(self):
+        win = self.open_frame()
+        win.preview.setFocus()
+        fader = win.steppers["contrast"]
+        start = fader.steps()
+        QTest.keyPress(win.preview, Qt.Key_W)
+        self.move(-3 * app.MainWindow.MOUSE_ADJUST_PX)                   # up: more contrast
+        self.assertEqual(fader.steps(), start + 3)
+        self.move(app.MainWindow.MOUSE_ADJUST_PX - 1)                    # less than a step: nothing yet
+        self.assertEqual(fader.steps(), start + 3)
+        self.move(1 + 4 * app.MainWindow.MOUSE_ADJUST_PX)                # down: less contrast
+        self.assertEqual(fader.steps(), start - 2)
+        QTest.keyRelease(win.preview, Qt.Key_W)
+        self.move(-10 * app.MainWindow.MOUSE_ADJUST_PX)                  # key let go: the mouse is just a mouse
+        self.assertEqual(fader.steps(), start - 2)
+        self.assertEqual(win.steppers["density"].steps(), 0, "another correction moved")
+        idle(win)
+        self.assertEqual(win.current.settings.contrast, fader.value())
+
+    def test_turned_off_in_settings_the_mouse_changes_nothing(self):
+        win = self.open_frame()
+        win.preview.setFocus()
+        fader = win.steppers["contrast"]
+        start = fader.steps()
+        self.assertTrue(win.pref_mouse_adjust.isChecked(), "adjusting with the mouse should be on by default")
+        win.pref_mouse_adjust.click()                                    # Settings: Adjust with the mouse, off
+        self.addCleanup(app.set_pref, "mouse_adjust", True)
+        QTest.keyPress(win.preview, Qt.Key_W)
+        self.move(-5 * app.MainWindow.MOUSE_ADJUST_PX)
+        self.assertEqual(fader.steps(), start, "the mouse moved the correction while turned off")
+        self.assertNotIn("mouse", win.statusBar().currentMessage())
+        QTest.keyPress(win.preview, Qt.Key_Up)                           # the arrow keys still work
+        self.assertEqual(fader.steps(), start + 1)
+        QTest.keyRelease(win.preview, Qt.Key_W)
+        win.pref_mouse_adjust.click()                                    # and on again
+        QTest.keyPress(win.preview, Qt.Key_W)
+        self.move(-2 * app.MainWindow.MOUSE_ADJUST_PX)
+        self.assertEqual(fader.steps(), start + 3)
+        QTest.keyRelease(win.preview, Qt.Key_W)
+
+    def test_mouse_alone_changes_nothing(self):
+        win = self.open_frame()
+        before = win.current.settings.copy()
+        self.move(-20 * app.MainWindow.MOUSE_ADJUST_PX)
+        idle(win)
+        for f in ("density", "contrast", "saturation", "cyan", "magenta", "yellow"):
+            self.assertEqual(getattr(win.current.settings, f), getattr(before, f), f"the mouse moved {f}")
+
+
 class CropTest(AppTestCase):
     def auto_cropped(self, **kw):
         win = self.open_frame(**kw)

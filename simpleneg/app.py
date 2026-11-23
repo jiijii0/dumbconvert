@@ -395,7 +395,8 @@ def button(text: str, slot=None, name: str = "") -> QPushButton:
 
 # Preferences: the few choices that outlive a session (the Settings tab). Stored by macOS in
 # ~/Library/Preferences, next to the key bindings and the camera / lens presets.
-PREF_DEFAULTS = {"auto_crop_new": False, "scan_warnings": True, "flat_field": "", "export": "", "sheet": ""}
+PREF_DEFAULTS = {"auto_crop_new": False, "scan_warnings": True, "mouse_adjust": True, "flat_field": "", "export": "",
+                 "sheet": ""}
 
 
 def pref(key: str):
@@ -2175,6 +2176,11 @@ class MainWindow(QMainWindow):
         self._sync_base: engine.Settings | None = None    # for applying edits to selected frames
         self._show_before = False
         self._adjusting: str | None = None        # Settings field changed by ↑ / ↓ while its key is held
+        # ...and by moving the mouse up / down. Polled: Qt sends no mouse moves without a button
+        # pressed unless every widget under the pointer tracks the mouse.
+        self._mouse_adjust_timer = QTimer(interval=15)
+        self._mouse_adjust_timer.timeout.connect(self._mouse_adjust)
+        self._mouse_adjust_y = 0
         self._rendered_angle = 0.0                # fine rotation of the picture on screen
         self._request_angle: dict[int, float] = {}
         self._request_draft: dict[int, bool] = {}
@@ -2410,9 +2416,28 @@ class MainWindow(QMainWindow):
         if field_:
             self.steppers[field_].set_active(True)
             up, down = self.ADJUST_HINTS[field_]
-            self.statusBar().showMessage(f"{field_.capitalize()}:  ↑ {up}   ↓ {down}   (Shift: bigger steps)")
+            mouse = pref("mouse_adjust")              # can be turned off in Settings
+            self.statusBar().showMessage(f"{field_.capitalize()}:  ↑ {up}   ↓ {down}"
+                                         f"{'   or move the mouse' if mouse else ''}   (Shift: bigger steps)")
+            if mouse:
+                self._mouse_adjust_y = QCursor.pos().y()
+                self._mouse_adjust_timer.start()
         else:
+            self._mouse_adjust_timer.stop()
             self.statusBar().clearMessage()
+
+    MOUSE_ADJUST_PX = 8     # mouse travel for one step while an adjust key is held
+
+    def _mouse_adjust(self):
+        """Hold an adjust key and move the mouse: up is the same as ↑, down as ↓."""
+        if not self._adjusting:
+            self._mouse_adjust_timer.stop()
+            return
+        steps = int((self._mouse_adjust_y - QCursor.pos().y()) / self.MOUSE_ADJUST_PX)   # towards zero
+        if steps:
+            self._mouse_adjust_y -= steps * self.MOUSE_ADJUST_PX     # keep the rest for the next step
+            big = QApplication.keyboardModifiers() & Qt.ShiftModifier
+            self.nudge(self._adjusting, steps * (4 if big else 1))
 
     def nudge(self, field_: str, steps: int):
         if not self.current or self._typing():
@@ -2961,6 +2986,9 @@ class MainWindow(QMainWindow):
         lay = section("While working")
         self.pref_warnings = switch("scan_warnings", lambda _on: self.update_nav())
         row(lay, "Scan warnings", "Say so next to the file name when a scan is very dark or blown out.", self.pref_warnings)
+        self.pref_mouse_adjust = switch("mouse_adjust")
+        row(lay, "Adjust with the mouse", "While you hold a correction's key, moving the mouse up or down changes it "
+            "like ↑ / ↓.", self.pref_mouse_adjust)
 
         # Exif presets
         lay = section("Exif presets")
