@@ -395,7 +395,8 @@ def button(text: str, slot=None, name: str = "") -> QPushButton:
 
 # Preferences: the few choices that outlive a session (the Settings tab). Stored by macOS in
 # ~/Library/Preferences, next to the key bindings and the camera / lens presets.
-PREF_DEFAULTS = {"auto_crop_new": False, "scan_warnings": True, "flat_field": "", "export": "", "sheet": ""}
+PREF_DEFAULTS = {"auto_crop_new": False, "scan_warnings": True, "mouse_adjust": True, "flat_field": "", "export": "",
+                 "sheet": ""}
 
 
 def pref(key: str):
@@ -2415,10 +2416,12 @@ class MainWindow(QMainWindow):
         if field_:
             self.steppers[field_].set_active(True)
             up, down = self.ADJUST_HINTS[field_]
-            self.statusBar().showMessage(f"{field_.capitalize()}:  ↑ {up}   ↓ {down}   or move the mouse"
-                                         "   (Shift: bigger steps)")
-            self._mouse_adjust_y = QCursor.pos().y()
-            self._mouse_adjust_timer.start()
+            mouse = pref("mouse_adjust")              # can be turned off in Settings
+            self.statusBar().showMessage(f"{field_.capitalize()}:  ↑ {up}   ↓ {down}"
+                                         f"{'   or move the mouse' if mouse else ''}   (Shift: bigger steps)")
+            if mouse:
+                self._mouse_adjust_y = QCursor.pos().y()
+                self._mouse_adjust_timer.start()
         else:
             self._mouse_adjust_timer.stop()
             self.statusBar().clearMessage()
@@ -2983,6 +2986,9 @@ class MainWindow(QMainWindow):
         lay = section("While working")
         self.pref_warnings = switch("scan_warnings", lambda _on: self.update_nav())
         row(lay, "Scan warnings", "Say so next to the file name when a scan is very dark or blown out.", self.pref_warnings)
+        self.pref_mouse_adjust = switch("mouse_adjust")
+        row(lay, "Adjust with the mouse", "While you hold a correction's key, moving the mouse up or down changes it "
+            "like ↑ / ↓.", self.pref_mouse_adjust)
 
         # Exif presets
         lay = section("Exif presets")

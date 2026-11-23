@@ -118,6 +118,27 @@ class MouseAdjustTest(AppTestCase):
         idle(win)
         self.assertEqual(win.current.settings.contrast, fader.value())
 
+    def test_turned_off_in_settings_the_mouse_changes_nothing(self):
+        win = self.open_frame()
+        win.preview.setFocus()
+        fader = win.steppers["contrast"]
+        start = fader.steps()
+        self.assertTrue(win.pref_mouse_adjust.isChecked(), "adjusting with the mouse should be on by default")
+        win.pref_mouse_adjust.click()                                    # Settings: Adjust with the mouse, off
+        self.addCleanup(app.set_pref, "mouse_adjust", True)
+        QTest.keyPress(win.preview, Qt.Key_W)
+        self.move(-5 * app.MainWindow.MOUSE_ADJUST_PX)
+        self.assertEqual(fader.steps(), start, "the mouse moved the correction while turned off")
+        self.assertNotIn("mouse", win.statusBar().currentMessage())
+        QTest.keyPress(win.preview, Qt.Key_Up)                           # the arrow keys still work
+        self.assertEqual(fader.steps(), start + 1)
+        QTest.keyRelease(win.preview, Qt.Key_W)
+        win.pref_mouse_adjust.click()                                    # and on again
+        QTest.keyPress(win.preview, Qt.Key_W)
+        self.move(-2 * app.MainWindow.MOUSE_ADJUST_PX)
+        self.assertEqual(fader.steps(), start + 3)
+        QTest.keyRelease(win.preview, Qt.Key_W)
+
     def test_mouse_alone_changes_nothing(self):
         win = self.open_frame()
         before = win.current.settings.copy()

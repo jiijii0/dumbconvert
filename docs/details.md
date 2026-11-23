@@ -42,7 +42,7 @@ The defaults:
 | ↑ / ↓ | Previous / next roll |
 | **Hold Q, W or E, then ↑ / ↓** | Density (darker / lighter) · Contrast · Saturation |
 | **Hold A, S or D, then ↑ / ↓** | Cyan ↔ Red · Magenta ↔ Green · Yellow ↔ Blue |
-| Move the mouse up / down while holding | The same as ↑ / ↓, one step per 8 px |
+| Move the mouse up / down while holding | The same as ↑ / ↓, one step per 8 px (Settings ▸ Adjust with the mouse turns it off) |
 | Shift + ↑ / ↓ while holding | 4× step |
 | Z / X / C / V | Zoom · Crop · Auto crop · Auto straighten |
 | B (hold) / N / M | Before · Pick a neutral spot (then click it) · Mirror |
