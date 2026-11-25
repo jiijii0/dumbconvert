@@ -17,9 +17,9 @@
 <p align="center">
   <a href="https://github.com/jiijii0/dumbconvert/releases/tag/v0.1.0-beta.2"><b>macOS beta</b></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/jiijii0/dumbconvert/releases/tag/windows-linux-alpha.1"><b>Windows alpha</b></a>
+  <a href="https://github.com/jiijii0/dumbconvert/releases/tag/windows-linux-alpha.2"><b>Windows alpha</b></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/jiijii0/dumbconvert/releases/tag/windows-linux-alpha.1"><b>Linux alpha</b></a>
+  <a href="https://github.com/jiijii0/dumbconvert/releases/tag/windows-linux-alpha.2"><b>Linux alpha</b></a>
   <br>
   <sub>The Windows and Linux alphas have not been tested yet.</sub>
 </p>
@@ -47,7 +47,7 @@ Made for negatives scanned with a digital camera over a white light, colour or B
 1. Download the zip from the [macOS beta](https://github.com/jiijii0/dumbconvert/releases/tag/v0.1.0-beta.2) and unzip it.
 2. Move **DumbConvert** to Applications.
 
-Windows and Linux (Flatpak): see the [alpha release](https://github.com/jiijii0/dumbconvert/releases/tag/windows-linux-alpha.1)
+Windows and Linux (Flatpak): see the [alpha 2 release](https://github.com/jiijii0/dumbconvert/releases/tag/windows-linux-alpha.2)
 for the files and how to install them. These builds have not been tested yet.
 
 ### First launch
