@@ -1,0 +1,135 @@
+from collections.abc import Callable
+from typing import (
+    Protocol,
+    Optional,
+    Any,
+    Tuple,
+    ContextManager,
+    List,
+)
+from dataclasses import dataclass, field
+from negpy.domain.types import ImageBuffer, ROI, Dimensions
+from negpy.domain.models import WorkspaceConfig
+from negpy.features.process.models import ProcessMode
+
+
+@dataclass
+class PipelineContext:
+    """
+    Shared state passed through the pipeline.
+    """
+
+    original_size: Dimensions
+    scale_factor: float
+    process_mode: ProcessMode = ProcessMode.C41
+    active_roi: Optional[ROI] = None
+    metrics: dict[str, Any] = field(default_factory=dict)
+    # When set, the crop tool is active: the final crop slice and uv_grid are bypassed so the
+    # full uncropped frame is shown, while active_roi still scopes tone analysis.
+    crop_preview_full: bool = False
+    # Only the interactive preview needs the click-to-raw uv_grid. At export resolution it
+    # costs hundreds of MB of temporaries and is discarded.
+    wants_uv_grid: bool = True
+    # The decoder's XYZ-to-camera matrix (libraw rgb_xyz_matrix), as nested lists. Only the
+    # transparency transfer reads it. None means the source carries no camera matrix (scanner
+    # TIFF, JPEG) and is treated as already in the working space.
+    cam_xyz: Optional[list] = None
+    # As-shot WB multipliers, folded into the camera matrix when the buffer was decoded
+    # without white balance (Linear RAW). None when WB was applied at decode.
+    camera_wb: Optional[list] = None
+    cache_stages: bool = True
+    # Whether the caller reads the Analysis metrics back. A render that does not (a splash, a
+    # thumbnail, a test strip) skips measurements that only the Analysis panel shows.
+    readback_metrics: bool = True
+    # Whether the render stores the slide meter grid in the density channels (`transfer_grid`).
+    # Only Fade Estimate reads it, and it can cost a second pass over the frame.
+    wants_fade_grid: bool = False
+    # The source before geometry, for ProcessConfig.meter_as_loaded.
+    meter_source: Optional[ImageBuffer] = None
+
+
+class IImageSource(Protocol):
+    """
+    Interface for loading images.
+    """
+
+    def read(self) -> ImageBuffer: ...
+
+
+class IRepository(Protocol):
+    """
+    Persists application and image settings.
+    """
+
+    def save_file_settings(self, file_hash: str, settings: WorkspaceConfig, file_path: str = "") -> None: ...
+
+    def load_file_settings(self, file_hash: str) -> Optional[WorkspaceConfig]: ...
+
+    def load_file_settings_by_path(self, file_path: str) -> Optional[tuple[str, "WorkspaceConfig"]]: ...
+
+    def path_for_file_hash(self, file_hash: str) -> Optional[str]: ...
+
+    def rehome_file_settings(self, old_hash: str, new_hash: str, file_path: str) -> None: ...
+
+    def copy_file_edits(
+        self, old_hash: str, new_hash: str, file_path: str, transform: Callable[[WorkspaceConfig], WorkspaceConfig]
+    ) -> bool: ...
+
+    def delete_file_settings(self, file_hash: str) -> None: ...
+
+    def save_global_setting(self, key: str, value: Any) -> None: ...
+    def save_global_settings(self, settings: dict[str, Any]) -> None: ...
+    def get_global_setting(self, key: str, default: Any = None) -> Any: ...
+    def initialize(self) -> None: ...
+
+
+class IAssetStore(Protocol):
+    """
+    Manages physical assets (files, thumbnails).
+    """
+
+    def register_asset(self, source: Any, session_id: str) -> Optional[Tuple[str, str]]: ...
+
+    def get_thumbnail(self, file_hash: str) -> Optional[Any]: ...
+    def save_thumbnail(self, file_hash: str, image: Any, fingerprint: Optional[str] = None) -> None: ...
+    def get_thumbnail_fingerprint(self, file_hash: str) -> Optional[str]: ...
+
+    def remove(self, file_path: str) -> None: ...
+    def clear_session_assets(self, session_id: str) -> None: ...
+    def initialize(self) -> None: ...
+    def clear_all(self) -> None: ...
+
+
+class IImageLoader(Protocol):
+    """
+    Loads specific image formats. Returns (context, metadata).
+    """
+
+    def load(self, file_path: str) -> Tuple[ContextManager[Any], dict]: ...
+
+    def load_bounded_preview(
+        self,
+        file_path: str,
+        max_edge: int,
+        *,
+        fast_only: bool = False,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Any]:
+        """Return a bounded oriented RGB preview, or None.
+
+        This operation must keep source decoding bounded and must not run a full
+        camera RAW demosaic.
+        """
+        ...
+
+
+class IFilePicker(Protocol):
+    """
+    System file dialog wrapper.
+    """
+
+    def pick_files(self, initial_dir: Optional[str] = None) -> List[str]: ...
+
+    def pick_folder(self, initial_dir: Optional[str] = None) -> tuple[str, List[str]]: ...
+
+    def pick_export_folder(self, initial_dir: Optional[str] = None) -> str: ...

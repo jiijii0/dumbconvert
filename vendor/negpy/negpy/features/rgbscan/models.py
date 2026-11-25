@@ -1,0 +1,20 @@
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RgbScanConfig:
+    """Trichromatic (narrowband RGB) capture: one frame assembled from three exposures.
+
+    The red exposure is the primary source file (the asset itself); the green and
+    blue exposures ride along here, the same way the flat-field reference does.
+    """
+
+    enabled: bool = False
+    green_path: str = ""
+    blue_path: str = ""
+    align: bool = True  # sub-pixel registration of red/blue to the green exposure
+
+
+def is_rgb_triplet(config: RgbScanConfig) -> bool:
+    """The predicate the decode paths use to decide to merge a triplet."""
+    return bool(config.enabled and config.green_path and config.blue_path)

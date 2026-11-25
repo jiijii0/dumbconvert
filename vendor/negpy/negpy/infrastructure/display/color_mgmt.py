@@ -1,0 +1,209 @@
+import io
+import os
+import shutil
+from functools import lru_cache
+from typing import Any, Optional, Tuple
+
+import numpy as np
+from PIL import ImageCms
+from negpy.kernel.system.config import APP_CONFIG
+from negpy.kernel.system.paths import get_resource_path
+from negpy.kernel.system.logging import get_logger
+from negpy.domain.models import ColorSpace
+from negpy.infrastructure.display.color_spaces import ColorSpaceRegistry
+
+logger = get_logger(__name__)
+
+
+@lru_cache(maxsize=8)
+def open_profile_from_bytes(data: bytes) -> Any:
+    """Open an ICC profile from raw bytes (e.g. a monitor profile from Qt)."""
+    return ImageCms.getOpenProfile(io.BytesIO(data))
+
+
+def icc_bytes_for_space(cs_name: str) -> Optional[bytes]:
+    """Raw ICC bytes for a named color space's bundled profile, or None if missing.
+
+    Used to back a manual display-profile override with a common space.
+    """
+    path = ColorSpaceRegistry.get_icc_path(cs_name)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as e:
+        logger.warning("Failed to read ICC profile for %s", cs_name, exc_info=e)
+        return None
+
+
+def profile_description(data: Optional[bytes]) -> str:
+    """Human-readable description of a monitor ICC profile, for the UI.
+
+    ``None`` (no profile detected → sRGB assumed) returns a labelled fallback.
+    """
+    if not data:
+        return "sRGB fallback"
+    try:
+        return ImageCms.getProfileDescription(open_profile_from_bytes(data)).strip()
+    except Exception as e:
+        logger.debug("Could not read profile description: %s", e)
+        return "Unknown profile"
+
+
+@lru_cache(maxsize=16)
+def get_display_lut(
+    working_color_space: str,
+    dst_bytes: Optional[bytes] = None,
+    proof: Optional[Tuple[Optional[str], Optional[str]]] = None,
+) -> Optional[np.ndarray]:
+    """3D LUT converting the assumed source space (`WORKING_COLOR_SPACE`) to the
+    display profile.
+
+    ``proof`` is ``(input_icc_path, output_icc_path)`` when the preview soft-proofs;
+    the LUT then carries source→output-proof→display in one hop. Every consumer of a
+    rendered buffer must take the same LUT, or one frame shows two colors.
+
+    ``working_color_space`` is the profile the camera-native pipeline numbers are
+    *assumed* to be in (see `color_spaces.WORKING_COLOR_SPACE`), not a real working
+    space. When ``dst_bytes`` is ``None`` the destination is sRGB (legacy behaviour,
+    i.e. the display is assumed to be sRGB); otherwise it is the monitor's ICC
+    profile. Returns ``None`` only when the transform is a no-op (source is sRGB and
+    the display is sRGB), so callers can skip it. Cached per (source, display
+    profile). Used by both the CPU (`ImageConverter.to_qimage`) and GPU display paths.
+    """
+    if proof is not None:
+        # Deferred: image_processor owns the proof's branch selection and imports this module
+        # itself.
+        from negpy.services.rendering.image_processor import ImageProcessor, PROOF_LUT_SIZE
+
+        # A plain pair still works: the extra fields take the defaults that reproduce the
+        # behaviour from before they were controls.
+        rest = tuple(proof)[2:]
+        return ImageProcessor.soft_proof_lut(working_color_space, proof[0], proof[1], dst_bytes, PROOF_LUT_SIZE, *rest)
+    if working_color_space == ColorSpace.SRGB.value and dst_bytes is None:
+        return None
+    try:
+        from negpy.infrastructure.display.icc_lut import build_3d_lut
+
+        src = ColorService._get_profile(working_color_space)
+        dst: Any = open_profile_from_bytes(dst_bytes) if dst_bytes else ImageCms.createProfile("sRGB")
+        return build_3d_lut(
+            src,
+            dst,
+            ImageCms.Intent.RELATIVE_COLORIMETRIC,
+            ImageCms.Flags.BLACKPOINTCOMPENSATION,
+        )
+    except Exception as e:
+        logger.warning("Failed to build display LUT for %s", working_color_space, exc_info=e)
+        return None
+
+
+@lru_cache(maxsize=8)
+def get_gamut_lut(
+    working_color_space: str,
+    proof: Optional[Tuple[Optional[str], Optional[str]]] = None,
+) -> Optional[np.ndarray]:
+    """Boolean (N, N, N) grid of the colors the proof's output profile cannot print.
+
+    None when nothing is being proofed to, so the printability read-out stays off rather
+    than describing a gamut nobody asked about. Cached per profile pair, like the display
+    LUT: building it is an ICC round trip over the whole grid, not per-frame work.
+    """
+    if proof is None or not proof[1]:
+        return None
+    from negpy.services.rendering.image_processor import ImageProcessor
+
+    return ImageProcessor.gamut_lut(working_color_space, proof[0], proof[1])
+
+
+def apply_display_transform(
+    buffer: np.ndarray,
+    working_color_space: str,
+    dst_bytes: Optional[bytes] = None,
+    proof: Optional[Tuple[Optional[str], Optional[str]]] = None,
+) -> np.ndarray:
+    """Convert a float32 RGB buffer from the working space to the display profile.
+
+    No-op for non-RGB buffers (greyscale display stays neutral) or when the
+    transform is identity (sRGB working space on an sRGB display). ``dst_bytes`` is
+    the monitor's ICC profile; ``None`` falls back to sRGB. Used on the CPU display
+    path before quantizing to 8-bit.
+    """
+    if buffer.dtype != np.float32 or buffer.ndim != 3 or buffer.shape[2] != 3:
+        return buffer
+    lut = get_display_lut(working_color_space, dst_bytes, proof)
+    if lut is None:
+        return buffer
+    from negpy.infrastructure.display.icc_lut import apply_lut_f32
+
+    return apply_lut_f32(buffer, lut)
+
+
+class ColorService:
+    """
+    ICC profile application & soft-proofing.
+    """
+
+    @staticmethod
+    def _get_profile(cs_name: str) -> Any:
+        """
+        Helper to load profile for a named color space.
+        """
+        path = ColorSpaceRegistry.get_icc_path(cs_name)
+        if path and os.path.exists(path):
+            return ImageCms.getOpenProfile(path)
+
+        # Fallback to built-in if possible, else sRGB
+        if cs_name == ColorSpace.XYZ.value:
+            return ImageCms.createProfile("XYZ")
+
+        return ImageCms.createProfile("sRGB")
+
+    @staticmethod
+    def get_available_profiles() -> list[str]:
+        """
+        Returns list of available ICC profile paths.
+        """
+        icc_root = get_resource_path("icc")
+        built_in_icc = []
+        if os.path.exists(icc_root):
+            built_in_icc = [os.path.join(icc_root, f) for f in os.listdir(icc_root) if f.lower().endswith((".icc", ".icm"))]
+
+        user_icc = []
+        if os.path.exists(APP_CONFIG.user_icc_dir):
+            user_icc = [
+                os.path.join(APP_CONFIG.user_icc_dir, f)
+                for f in os.listdir(APP_CONFIG.user_icc_dir)
+                if f.lower().endswith((".icc", ".icm"))
+            ]
+        return sorted(built_in_icc + user_icc)
+
+
+def import_icc_profile(src_path: str, dest_dir: str) -> str:
+    """Copy a user-supplied ICC profile into *dest_dir* and return the stored path.
+
+    Raises ValueError when the file is not a profile lcms can open. A name already
+    taken by different bytes is stored beside it as "name (2).icc" rather than
+    overwriting; identical bytes reuse the file already there.
+    """
+    try:
+        ImageCms.getOpenProfile(src_path)
+    except Exception as e:
+        raise ValueError(f"Not a readable ICC profile: {e}") from e
+
+    with open(src_path, "rb") as f:
+        payload = f.read()
+
+    stem, ext = os.path.splitext(os.path.basename(src_path))
+    candidate = os.path.join(dest_dir, f"{stem}{ext}")
+    n = 2
+    while os.path.exists(candidate):
+        with open(candidate, "rb") as f:
+            if f.read() == payload:
+                return candidate
+        candidate = os.path.join(dest_dir, f"{stem} ({n}){ext}")
+        n += 1
+
+    shutil.copy2(src_path, candidate)
+    return candidate

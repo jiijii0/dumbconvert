@@ -40,7 +40,7 @@ FROM_ROLL = "  ·  from roll"
 PRESET_KINDS = {"camera_model": "cameras", "lens_model": "lenses"}
 PRESETS_KEY = "exif_presets_v2"     # {"cameras": ["Leica M6", ...], "lenses": [...]}
 
-MUTED, ACCENT = "#9a9aa0", "#2ee6ff"
+MUTED, ACCENT = "#85858a", "#7350c8"
 
 
 def flash(widget: QWidget, ms: int = 900):
@@ -103,7 +103,14 @@ class ChevronCombo(QComboBox):
 # Date
 # ---------------------------------------------------------------------------
 class DateField(QDateEdit):
-    """A date picker: type it or pick it from the calendar. "No date" is the empty state."""
+    """A date picker: type it or pick it from the calendar. "No date" is the empty state, shown faint."""
+
+    def _mark_empty(self, *_):
+        empty = self.date() == self.NONE
+        if self.property("empty") != empty:
+            self.setProperty("empty", empty)
+            self.style().unpolish(self)
+            self.style().polish(self)
 
     NONE = QDate(1900, 1, 1)
     changed_iso = Signal(str)                 # "YYYY-MM-DD", or "" for no date
@@ -115,7 +122,9 @@ class DateField(QDateEdit):
         self.setMinimumDate(self.NONE)
         self.setMaximumDate(QDate.currentDate())
         self.setSpecialValueText("No date")
+        self.dateChanged.connect(self._mark_empty)
         self.setDate(self.NONE)
+        self._mark_empty()
         self.setToolTip("When the film was shot. Delete clears it")
         self._loading = False
         # Saved at once: a picked date right away, a typed one when the typing ends (Return or
@@ -260,7 +269,7 @@ class LocationField(QLineEdit):
         for title, sub, data in rows:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, data)
-            label = QLabel(f"<span style='color:{'#e8e6e3' if data else MUTED}'>{title}</span>"
+            label = QLabel(f"<span style='color:{'#bdbdc1' if data else MUTED}'>{title}</span>"
                            + (f"<br><span style='color:{MUTED}; font-size:11px'>{sub}</span>" if sub else ""))
             label.setContentsMargins(10, 5, 10, 5)
             label.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -446,6 +455,7 @@ class PresetField(QLineEdit):
         comp.setFilterMode(Qt.MatchContains)              # "m6" finds "Leica M6"
         comp.setCaseSensitivity(Qt.CaseInsensitive)
         comp.activated[str].connect(lambda t: self._commit(t))
+        comp.popup().setObjectName("completer")           # styled as a solid list (app stylesheet)
         self.setCompleter(comp)
         presets().changed.connect(lambda: self._model.setStringList(presets().presets[kind]))
         menu_action = QAction(chevron_icon(), "Presets", self)

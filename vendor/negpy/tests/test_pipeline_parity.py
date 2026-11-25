@@ -1,0 +1,1176 @@
+"""
+CPU ↔ GPU pipeline parity tests.
+
+Validates that every WGSL shader and its corresponding CPU logic.py produce
+outputs within tolerance across representative configs.
+
+NOTE: Current tolerances are generous (atol=1.5e-1) because glow/halation use
+fundamentally different implementations between CPU (OpenCV) and GPU (custom
+WGSL filters). Sharpen and Chroma Denoise have converged (shared kernel taps)
+and are held to 5e-2 and 2e-3. Tighten the rest as they converge.
+
+These tests require a GPU adapter; they are skipped in CI environments
+where no GPU is available. For consistent parity validation, run these
+locally or in a nightly GPU-enabled CI job.
+"""
+
+import numpy as np
+import pytest
+from dataclasses import replace
+
+from negpy.domain.models import WorkspaceConfig
+from negpy.features.exposure import print_lut
+from negpy.features.exposure.models import ExposureConfig
+from negpy.features.exposure.papers import PAPER_PROFILES, PaperProfile
+from negpy.features.exposure.print_lut import DyeLut, load_print_lut, save_print_lut
+from negpy.features.lab.models import LabConfig
+from negpy.features.local.models import LocalAdjustmentsConfig, LocalMask
+from negpy.features.retouch.models import RetouchConfig
+from negpy.features.altprocess.models import AltProcess, AltProcessConfig, Sensitizer
+from negpy.features.toning.models import ToningConfig
+from negpy.features.geometry.models import GeometryConfig
+from negpy.features.process.models import ProcessConfig, ProcessMode
+from negpy.infrastructure.gpu.device import GPUDevice
+from negpy.services.rendering.engine import DarkroomEngine
+from negpy.services.rendering.gpu_engine import GPUEngine
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_image(seed: int = 42) -> np.ndarray:
+    """64x64 synthetic image: diagonal gradient + color patches."""
+    rng = np.random.default_rng(seed)
+    img = np.zeros((64, 64, 3), dtype=np.float32)
+    # Diagonal gradient (0.1 → 0.9)
+    for y in range(64):
+        for x in range(64):
+            img[y, x] = 0.1 + 0.8 * ((x + y) / 126.0)
+    # Color patches in corners
+    img[0:16, 0:16] = [0.9, 0.1, 0.1]  # red
+    img[0:16, 48:64] = [0.1, 0.9, 0.1]  # green
+    img[48:64, 0:16] = [0.1, 0.1, 0.9]  # blue
+    img[48:64, 48:64] = [0.9, 0.9, 0.1]  # yellow
+    # Add small noise
+    img += rng.normal(0, 0.005, img.shape).astype(np.float32)
+    return np.clip(img, 0.0, 1.0).astype(np.float32)
+
+
+def _make_speck_image() -> np.ndarray:
+    """Uniform mid field with isolated dark specks (bright outliers once the
+    negative is inverted). Uniform surround makes the heal value identical on
+    both paths regardless of perimeter-sampling radius."""
+    img = np.full((64, 64, 3), 0.5, dtype=np.float32)
+    for y, x in ((12, 20), (30, 45), (50, 14), (40, 40)):
+        img[y, x] = 0.02
+    return img
+
+
+def _make_identity_geometry() -> GeometryConfig:
+    """Geometry that does not transform the image (no crop, no rotation)."""
+    return GeometryConfig(
+        rotation=0,
+        fine_rotation=0.0,
+        flip_horizontal=False,
+        flip_vertical=False,
+        crop_rect=(0.0, 0.0, 1.0, 1.0),
+        autocrop_offset=0,
+    )
+
+
+def _make_curved_negative(h: int = 320, w: int = 320) -> np.ndarray:
+    """C-41 negative with a curved per-channel neutral axis + green-dominant block, so
+    Cast Removal produces a non-zero quadratic curvature — exercises the GPU `+c2·u²` term."""
+    E = np.linspace(0.0, 1.0, h, dtype=np.float32)
+    gamma, curv, mask = (0.66, 0.71, 0.68), (0.0, 0.30, 0.12), (0.0, -0.12, -0.22)
+    log = np.empty((h, w, 3), np.float32)
+    for ch in range(3):
+        log[:, :, ch] = (-0.2 + mask[ch] - gamma[ch] * E - curv[ch] * E * E)[:, None]
+    gx = slice(int(0.82 * w), w)
+    log[:, gx, 1], log[:, gx, 0], log[:, gx, 2] = -0.22, -0.42, -0.62
+    return (10.0**log).astype(np.float32)
+
+
+def _make_base_settings() -> WorkspaceConfig:
+    """WorkspaceConfig with identity geometry, no borders, no retouch, default other stages."""
+    return replace(
+        WorkspaceConfig(),
+        geometry=_make_identity_geometry(),
+        process=replace(
+            ProcessConfig(),
+            white_point_offset=0.0,
+            black_point_offset=0.0,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPU availability guard
+# ---------------------------------------------------------------------------
+
+
+def _gpu_available() -> bool:
+    gpu = GPUDevice.get()
+    return gpu.is_available
+
+
+def _assert_mostly_close(
+    cpu_result: np.ndarray, gpu_result: np.ndarray, atol: float, rtol: float, max_violation_frac: float = 0.001
+) -> None:
+    """
+    Parity check tolerant of isolated resampling outliers. CPU and GPU geometry
+    use different interpolation, so a handful of pixels on hard edges diverge;
+    a systematic shader mismatch violates tolerance across a large area instead.
+    """
+    violations = ~np.isclose(cpu_result, gpu_result, atol=atol, rtol=rtol)
+    frac = float(np.mean(violations))
+    assert frac < max_violation_frac, (
+        f"{int(np.sum(violations))} values ({frac:.4%}) outside tolerance; max diff: {np.max(np.abs(cpu_result - gpu_result)):.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test classes
+# ---------------------------------------------------------------------------
+
+
+class TestExposureParity:
+    """CPU vs GPU parity for the exposure H&D curve shader."""
+
+    @classmethod
+    def setup_class(cls):
+        if not _gpu_available():
+            import pytest
+
+            pytest.skip("GPU not available — cannot run parity tests")
+        cls.cpu = DarkroomEngine()
+        cls.gpu = GPUEngine()
+        cls.img = _make_synthetic_image()
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "gpu"):
+            cls.gpu.destroy_all()
+
+    def _run_and_compare(self, settings: WorkspaceConfig) -> None:
+        h, w = self.img.shape[:2]
+        scale = max(h, w) / 1024.0  # fixed render size for deterministic comparison
+
+        cpu_result = self.cpu.process(self.img, settings, "parity_test")
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=scale,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        # Both produce cropped content; shapes should match.
+        assert cpu_result.shape == gpu_result.shape, f"Shape mismatch: CPU {cpu_result.shape} vs GPU {gpu_result.shape}"
+        # 1% outlier budget: the scene-linear roundtrip amplifies CPU(cv2)↔GPU(bicubic)
+        # resampling at hard deep-shadow edges; smooth content matches tightly.
+        _assert_mostly_close(cpu_result, gpu_result, atol=1e-1, rtol=1e-1, max_violation_frac=0.01)
+
+    def test_default_config(self):
+        self._run_and_compare(_make_base_settings())
+
+    def _lut_stock(self, tmp_path, monkeypatch, key, tilt):
+        g = np.linspace(0.0, 3.0, 17)
+        c, m, y = np.meshgrid(g, g, g, indexing="ij")
+        d = np.stack([c + tilt * m, m + 0.10 * y + 0.05 * c, y + 0.08 * m], -1)
+        save_print_lut(tmp_path / f"{key}.npz", (10.0**-d).astype(np.float32), np.full(3, 3.0, np.float32), key)
+        monkeypatch.setattr(print_lut, "LUT_DIR", tmp_path)
+        load_print_lut.cache_clear()
+        monkeypatch.setitem(PAPER_PROFILES, key, PaperProfile(label=key, print_color=DyeLut(key)))
+        return replace(_make_base_settings(), exposure=replace(ExposureConfig(), paper_profile=key))
+
+    def _render_both(self, settings, img=None):
+        img = self.img if img is None else img
+        scale = max(img.shape[:2]) / 1024.0
+        cpu = self.cpu.process(img, settings, f"parity_lut_{settings.exposure.paper_profile}")
+        tex, _ = self.gpu.process_to_texture(img, settings, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        return cpu, self.gpu._readback_downsampled(tex)
+
+    def test_lut_stock_parity(self, tmp_path, monkeypatch):
+        s = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        cpu, gpu = self._render_both(s)
+        _assert_mostly_close(cpu, gpu, atol=1e-2, rtol=0.0, max_violation_frac=0.01)
+        digital = self.cpu.process(self.img, _make_base_settings(), "parity_lut_digital")
+        assert np.mean(np.abs(cpu - digital).max(axis=-1) > 0.01) > 0.01
+
+    def test_lut_stock_parity_paper_black(self, tmp_path, monkeypatch):
+        s = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        s = replace(s, exposure=replace(s.exposure, paper_black=True))
+        _assert_mostly_close(*self._render_both(s), atol=1e-2, rtol=0.0, max_violation_frac=0.01)
+
+    def test_lut_stock_parity_deep_toe(self, tmp_path, monkeypatch):
+        s = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        s = replace(s, exposure=replace(s.exposure, toe=-1.0, shadow_density=0.5))
+        _assert_mostly_close(*self._render_both(s), atol=1e-2, rtol=0.0, max_violation_frac=0.01)
+
+    def test_lut_texture_replacement_drops_bind_groups(self, tmp_path, monkeypatch):
+        # Bind groups are keyed by id() of the view: a destroyed LUT's id can come back on a new view.
+        self._render_both(self._lut_stock(tmp_path, monkeypatch, "lut_r", 0.10))
+        assert self.gpu._bind_group_cache
+        load_print_lut.cache_clear()
+        self.gpu._lut_texture(load_print_lut("lut_r"))
+        assert not self.gpu._bind_group_cache
+
+    def test_lut_stock_switch(self, tmp_path, monkeypatch):
+        a = self._lut_stock(tmp_path, monkeypatch, "lut_a", 0.10)
+        b = self._lut_stock(tmp_path, monkeypatch, "lut_b", 0.40)
+        first = self._render_both(a)[1]
+        other = self._render_both(b)[1]
+        again = self._render_both(a)[1]
+        np.testing.assert_allclose(again, first, atol=1e-6)
+        assert np.abs(other - first).max() > 0.01
+
+    def test_cast_removal_quadratic(self):
+        # Curved neutral axis -> 3-point Cast Removal emits a quadratic core; CPU and GPU
+        # must agree (validates the curvature uniform + shader term, not just the layout).
+        img = _make_curved_negative()
+        s = _make_base_settings()
+        scale = max(img.shape[:2]) / 1024.0
+        cpu = self.cpu.process(img, s, "parity_curved")
+        gpu_tex, _ = self.gpu.process_to_texture(img, s, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        gpu = self.gpu._readback_downsampled(gpu_tex)
+        assert cpu.shape == gpu.shape
+        _assert_mostly_close(cpu, gpu, atol=1e-1, rtol=1e-1, max_violation_frac=0.01)
+
+    def test_cast_average_pooled_axis(self):
+        # A pooled axis replaces the frame's own meter; CPU and GPU must both honour it.
+        from negpy.features.exposure.normalization import analyze_log_exposure_bounds, measure_neutral_axis
+
+        img = _make_curved_negative()
+        mid, shadow, highlight, conf = measure_neutral_axis(img, analyze_log_exposure_bounds(img))
+        # Weight 0.5: both engines meter the frame's own axis and blend it with the pool.
+        axis = ((mid[0] + 0.05, mid[1], mid[2] - 0.05), shadow, highlight, conf, 0.5)
+        s = _make_base_settings()
+        s = replace(s, process=replace(s.process, use_cast_average=True, locked_neutral_axis=axis))
+        scale = max(img.shape[:2]) / 1024.0
+        cpu = self.cpu.process(img, s, "parity_cast_average")
+        gpu_tex, _ = self.gpu.process_to_texture(img, s, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        gpu = self.gpu._readback_downsampled(gpu_tex)
+        assert cpu.shape == gpu.shape
+        _assert_mostly_close(cpu, gpu, atol=1e-1, rtol=1e-1, max_violation_frac=0.01)
+        own = self.cpu.process(img, _make_base_settings(), "parity_cast_average_own")
+        assert np.abs(cpu - own).max() > 1e-2
+
+    def test_extreme_exposure_dark(self):
+        s = replace(_make_base_settings(), exposure=ExposureConfig(density=-1.0, grade=2.0))
+        self._run_and_compare(s)
+
+    def test_extreme_exposure_bright(self):
+        s = replace(_make_base_settings(), exposure=ExposureConfig(density=1.0, grade=-1.0))
+        self._run_and_compare(s)
+
+    def test_toe_shoulder_heavy(self):
+        s = replace(
+            _make_base_settings(),
+            exposure=ExposureConfig(toe=1.0, toe_width=5.0, shoulder=1.0, shoulder_width=5.0),
+        )
+        self._run_and_compare(s)
+
+    def test_paper_dmin(self):
+        s = replace(_make_base_settings(), exposure=ExposureConfig(paper_dmin=True))
+        self._run_and_compare(s)
+
+    def test_cmy_offsets(self):
+        s = replace(
+            _make_base_settings(),
+            exposure=ExposureConfig(
+                wb_cyan=0.3,
+                wb_magenta=-0.2,
+                wb_yellow=0.5,
+                shadow_cyan=0.5,
+                shadow_magenta=0.3,
+                shadow_yellow=-0.4,
+                highlight_cyan=-0.3,
+                highlight_magenta=0.4,
+                highlight_yellow=-0.2,
+            ),
+        )
+        self._run_and_compare(s)
+
+    def test_auto_exposure(self):
+        s = replace(_make_base_settings(), exposure=ExposureConfig(auto_exposure=True))
+        self._run_and_compare(s)
+
+    def test_auto_contrast(self):
+        s = replace(_make_base_settings(), exposure=ExposureConfig(auto_normalize_contrast=True))
+        self._run_and_compare(s)
+
+    def test_auto_both(self):
+        s = replace(
+            _make_base_settings(),
+            exposure=ExposureConfig(auto_exposure=True, auto_normalize_contrast=True),
+        )
+        self._run_and_compare(s)
+
+    def test_shadow_hold_lift_matches(self):
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.exposure.logic import auto_shadow_from_metrics
+        from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+
+        s = replace(_make_base_settings(), exposure=ExposureConfig(auto_exposure=True, auto_normalize_contrast=True, grade=50.0))
+        h, w = self.img.shape[:2]
+        ctx = PipelineContext(scale_factor=1.0, original_size=(h, w), process_mode=s.process.process_mode)
+        DarkroomEngine().process(self.img, s, "parity_shadow_hold", ctx)
+        assert auto_shadow_from_metrics(s.exposure, s.process.process_mode, ctx.metrics) < -0.05
+
+        def both() -> tuple:
+            cpu = DarkroomEngine().process(self.img, s, "parity_shadow_hold")
+            tex, _ = self.gpu.process_to_texture(self.img, s, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False)
+            return cpu, self.gpu._readback_downsampled(tex)
+
+        cpu_on, gpu_on = both()
+        saved = EXPOSURE_CONSTANTS["shadow_hold_strength"]
+        EXPOSURE_CONSTANTS["shadow_hold_strength"] = 0.0
+        try:
+            self.gpu.destroy_all()
+            self.gpu = GPUEngine()
+            cpu_off, gpu_off = both()
+        finally:
+            EXPOSURE_CONSTANTS["shadow_hold_strength"] = saved
+        cpu_delta, gpu_delta = cpu_on - cpu_off, gpu_on - gpu_off
+        assert np.max(np.abs(cpu_delta)) > 0.02
+        _assert_mostly_close(cpu_delta, gpu_delta, atol=2e-2, rtol=0.0, max_violation_frac=0.01)
+
+    def test_paper_profile_ra4(self):
+        # A non-default RA4 profile changes per-channel slopes, tint, and the
+        # tonal curve constants — guards the new uniform/slope path's parity.
+        s = replace(
+            _make_base_settings(),
+            exposure=ExposureConfig(paper_profile="fuji_crystal", paper_dmin=True),
+        )
+        self._run_and_compare(s)
+
+    def test_capture_unmix(self):
+        # Capture-side dye unmix: CPU applies the matrix to img_log, the GPU via
+        # the normalization uniforms — both meters read the unmixed grid.
+        base = _make_base_settings()
+        s = replace(base, process=replace(base.process, crosstalk_strength=0.7))
+        self._run_and_compare(s)
+
+    @pytest.mark.parametrize("positive", [False, True])
+    def test_slide_filtration_at_another_grade(self, positive):
+        # Both engines divide the global filtration by the same post-auto contrast.
+        base = _make_base_settings()
+        process = replace(base.process, process_mode=ProcessMode.E6, positive_source=positive)
+        s = replace(base, process=process, exposure=ExposureConfig(grade=70.0, wb_cyan=0.3, wb_yellow=0.5))
+        cpu, gpu = self._render_both(s)
+        plain, _ = self._render_both(replace(s, exposure=ExposureConfig(grade=70.0)))
+        assert float(np.abs(cpu - plain).mean()) > 1e-3
+        _assert_mostly_close(cpu, gpu, atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+
+    @pytest.mark.parametrize("positive", [False, True])
+    def test_slide_fade_restoration(self, positive):
+        # Both engines compose the fade after the unmix; a fade one of them drops moves the render past this tolerance.
+        base = _make_base_settings()
+        fade = dict(fade_ratio_r=0.8, fade_ratio_g=0.7, fade_ratio_b=1.3)
+        s = replace(base, process=replace(base.process, process_mode=ProcessMode.E6, positive_source=positive, **fade))
+        cpu, gpu = self._render_both(s)
+        plain, _ = self._render_both(replace(s, process=replace(s.process, fade_ratio_r=1.0, fade_ratio_g=1.0, fade_ratio_b=1.0)))
+        assert float(np.abs(cpu - plain).mean()) > 0.02
+        _assert_mostly_close(cpu, gpu, atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+
+    @pytest.mark.parametrize("fade", [False, True])
+    def test_positive_source_primaries(self, fade):
+        # A Positive source's primaries ride the camera-matrix slot; with a fade both engines
+        # convert them after the density matrix, the GPU in the normalization shader.
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.process.capture_color import source_cam_xyz
+        from negpy.infrastructure.loaders.source_encoding import _SRGB_COLORANTS_D50, _to_working
+        from negpy.kernel.system.config import render_scale_factor
+
+        cam_xyz = source_cam_xyz(_to_working(_SRGB_COLORANTS_D50))
+        base = _make_base_settings()
+        ratios = dict(fade_ratio_r=0.5, fade_ratio_g=1.6, fade_ratio_b=1.3) if fade else {}
+        s = replace(base, process=replace(base.process, process_mode=ProcessMode.E6, positive_source=True, **ratios))
+        h, w = self.img.shape[:2]
+        ctx = PipelineContext(
+            original_size=(h, w), scale_factor=render_scale_factor(self.img.shape), process_mode=ProcessMode.E6, cam_xyz=cam_xyz
+        )
+        cpu = self.cpu.process(self.img, s, f"parity_positive_primaries_{fade}", ctx)
+        tex, _ = self.gpu.process_to_texture(
+            self.img, s, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False, cam_xyz=cam_xyz
+        )
+        _assert_mostly_close(cpu, self.gpu._readback_downsampled(tex), atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+
+    @pytest.mark.parametrize("positive", [False, True])
+    def test_camera_raw_split_at_the_white_balance_fold(self, positive):
+        # With a fade and Remove Stain, both engines apply a camera's white-balance gains before
+        # the log and its primaries after the density matrix.
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.kernel.system.config import render_scale_factor
+
+        cam_xyz = [[0.6722, -0.0635, -0.0963], [-0.4287, 1.246, 0.2046], [-0.0908, 0.2268, 0.5762]]
+        wb = [2.0, 1.0, 1.5, 1.0]
+        img = (self.img / np.asarray(wb[:3], dtype=np.float32)).astype(np.float32)
+        base = _make_base_settings()
+        fade = dict(
+            fade_ratio_r=0.6,
+            fade_ratio_g=1.4,
+            fade_ratio_b=1.2,
+            fade_white_anchor=True,
+            fade_white_r=-0.2,
+            fade_white_g=-0.1,
+            fade_white_b=-0.15,
+        )
+        s = replace(base, process=replace(base.process, process_mode=ProcessMode.E6, positive_source=positive, linear_raw=True, **fade))
+        h, w = img.shape[:2]
+        ctx = PipelineContext(
+            original_size=(h, w), scale_factor=render_scale_factor(img.shape), process_mode=ProcessMode.E6, cam_xyz=cam_xyz, camera_wb=wb
+        )
+        cpu = self.cpu.process(img, s, f"parity_raw_split_{positive}", ctx)
+        tex, _ = self.gpu.process_to_texture(
+            img, s, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False, cam_xyz=cam_xyz, camera_wb=wb
+        )
+        _assert_mostly_close(cpu, self.gpu._readback_downsampled(tex), atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+
+    @pytest.mark.parametrize("remove_stain", [False, True])
+    def test_reconstructed_highlight_through_the_fade(self, remove_stain):
+        # A blown highlight decoded neutral at full scale passes the fade's anchor unscaled on both engines.
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.process.fade import fade_white_space
+        from negpy.kernel.system.config import render_scale_factor
+
+        cam_xyz = [[0.6722, -0.0635, -0.0963], [-0.4287, 1.246, 0.2046], [-0.0908, 0.2268, 0.5762]]
+        wb = [2.0, 1.0, 1.5, 1.0]
+        img = self.img.copy()
+        img[20:44, 20:44] = 1.0
+        base = _make_base_settings()
+        white = dict(fade_white_r=-0.3, fade_white_g=-0.25, fade_white_b=-0.35, fade_white_space=fade_white_space(cam_xyz, wb))
+        fade = dict(fade_ratio_r=0.6, fade_ratio_g=1.4, fade_ratio_b=1.2, fade_white_anchor=remove_stain, **white)
+        p = replace(base.process, process_mode=ProcessMode.E6, positive_source=True, linear_raw=False, highlight_reconstruction=5, **fade)
+        s = replace(base, process=p)
+        h, w = img.shape[:2]
+        ctx = PipelineContext(
+            original_size=(h, w), scale_factor=render_scale_factor(img.shape), process_mode=ProcessMode.E6, cam_xyz=cam_xyz, camera_wb=wb
+        )
+        cpu = self.cpu.process(img, s, f"parity_raw_highlight_{remove_stain}", ctx)
+        tex, _ = self.gpu.process_to_texture(
+            img, s, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False, cam_xyz=cam_xyz, camera_wb=wb
+        )
+        gpu = self.gpu._readback_downsampled(tex)
+        _assert_mostly_close(cpu, gpu, atol=2e-2, rtol=2e-2, max_violation_frac=0.01)
+        patch = np.asarray(gpu)[24:40, 24:40, :3].reshape(-1, 3)
+        assert float(np.ptp(patch.mean(axis=0))) < 0.01
+
+
+class TestLabParity:
+    """CPU vs GPU parity for the lab color/sharpening shader."""
+
+    @classmethod
+    def setup_class(cls):
+        if not _gpu_available():
+            import pytest
+
+            pytest.skip("GPU not available — cannot run parity tests")
+        cls.cpu = DarkroomEngine()
+        cls.gpu = GPUEngine()
+        cls.img = _make_synthetic_image()
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "gpu"):
+            cls.gpu.destroy_all()
+
+    def _run_and_compare(self, settings: WorkspaceConfig, max_violation_frac: float = 0.001) -> None:
+        h, w = self.img.shape[:2]
+        scale = max(h, w) / 1024.0
+
+        cpu_result = self.cpu.process(self.img, settings, "parity_test")
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=scale,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        assert cpu_result.shape == gpu_result.shape, f"Shape mismatch: CPU {cpu_result.shape} vs GPU {gpu_result.shape}"
+        # TODO: tighten tolerance to 5e-2 after CPU/GPU lab implementations converge
+        _assert_mostly_close(cpu_result, gpu_result, atol=1.5e-1, rtol=1.5e-1, max_violation_frac=max_violation_frac)
+
+    def test_default_config(self):
+        self._run_and_compare(_make_base_settings())
+
+    def test_high_saturation(self):
+        # Isolate saturation: disable the sharpen default
+        s = replace(
+            _make_base_settings(),
+            lab=LabConfig(saturation=2.0, sharpen=0.0),
+        )
+        self._run_and_compare(s)
+
+    def test_saturation_gamut_aware_knee_tight_parity(self):
+        """Tight-tolerance guard for the Saturation gamut knee (oklab_chroma_block in
+        negpy_core and its lab.wgsl mirror). A wrong matrix direction in one engine's
+        gamut check gives a CPU/GPU max diff of about 0.06 on deeply saturated content,
+        invisible to this class's looser default tolerance (atol/rtol=1.5e-1). Uses a
+        strongly color-biased synthetic frame (unlike _make_synthetic_image's
+        gentler gradient) specifically to drive real pixels into the gamut-aware
+        knee, not just the byte-exact identity/no-knee fast path."""
+        rng = np.random.default_rng(5)
+        h, w = 64, 64
+        grad = np.linspace(0.05, 0.9, w, dtype=np.float32)
+        img = np.repeat(grad[None, :], h, axis=0)
+        img = np.stack([img, img * 0.3, img * 1.4], axis=-1)
+        img = np.ascontiguousarray(np.clip(img + rng.uniform(0, 0.02, img.shape).astype(np.float32), 0, 1))
+
+        s = replace(_make_base_settings(), lab=LabConfig(saturation=1.8, sharpen=0.0))
+        scale = max(h, w) / 1024.0
+
+        cpu_result = self.cpu.process(img, s, "parity_test_gamut_knee")
+        gpu_tex, _ = self.gpu.process_to_texture(img, s, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        cpu_arr = np.asarray(cpu_result)[..., :3].astype(np.float64)
+        gpu_arr = np.asarray(gpu_result)[..., :3].astype(np.float64)
+        mad = float(np.mean(np.abs(cpu_arr - gpu_arr)))
+        mx = float(np.max(np.abs(cpu_arr - gpu_arr)))
+        assert mad < 0.01, f"mean abs diff {mad:.4f}"
+        assert mx < 0.04, f"max abs diff {mx:.4f}"
+
+    def test_skin_protection_tight_parity(self):
+        """Skin chroma rein at Chroma 1.0 -- the path the saturation scale never
+        reaches, so this is the only cover for skin_weight/skin_chroma_rein's WGSL
+        mirror. Two neutral patches anchor the per-channel normalization (which
+        would otherwise flatten a uniform cast) so the six warm ones keep their
+        color and land inside the mask: 75% of the frame at weight > 0.3. The
+        no-op assertion below is what keeps this a real cover -- protection has to
+        move the CPU render by more than the parity tolerance it then checks."""
+        h, w = 64, 64
+        img = np.full((h, w, 3), 0.5, dtype=np.float32)
+        negatives = [
+            (0.08, 0.08, 0.08),
+            (0.92, 0.92, 0.92),
+            (0.30, 0.62, 0.70),
+            (0.34, 0.66, 0.72),
+            (0.28, 0.64, 0.68),
+            (0.32, 0.68, 0.74),
+            (0.36, 0.66, 0.70),
+            (0.30, 0.70, 0.66),
+        ]
+        for i, col in enumerate(negatives):
+            img[(i // 4) * 32 : (i // 4) * 32 + 32, (i % 4) * 16 : (i % 4) * 16 + 16] = col
+        img = np.ascontiguousarray(img)
+
+        s = replace(_make_base_settings(), lab=LabConfig(saturation=1.0, skin_protection=0.8, sharpen=0.0))
+        scale = max(h, w) / 1024.0
+
+        cpu_result = self.cpu.process(img, s, "parity_test_skin_rein")
+        gpu_tex, _ = self.gpu.process_to_texture(img, s, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        cpu_arr = np.asarray(cpu_result)[..., :3].astype(np.float64)
+        gpu_arr = np.asarray(gpu_result)[..., :3].astype(np.float64)
+
+        s_off = replace(s, lab=replace(s.lab, skin_protection=0.0))
+        cpu_off = np.asarray(self.cpu.process(img, s_off, "parity_test_skin_rein_off"))[..., :3].astype(np.float64)
+        moved = float(np.mean(np.abs(cpu_arr - cpu_off)))
+        assert moved > 0.01, f"protection barely moves this frame ({moved:.4f}) -- a dead mirror would pass"
+
+        mad = float(np.mean(np.abs(cpu_arr - gpu_arr)))
+        mx = float(np.max(np.abs(cpu_arr - gpu_arr)))
+        assert mad < 0.01, f"mean abs diff {mad:.4f}"
+        assert mx < 0.04, f"max abs diff {mx:.4f}"
+
+    def test_desaturation(self):
+        # Heavy desaturation (sat=0.2) shrinks chroma in CIELAB.
+        # CPU (OpenCV) and GPU (WGSL) LAB stacks diverge slightly on very pale,
+        # high-L* pixels — small upstream differences in the LAB roundtrip get
+        # amplified once chroma is small, producing larger absolute RGB diffs
+        # than the default LAB parity tolerance allows. Use a slightly looser
+        # tolerance here; tighten alongside the broader CPU/GPU LAB convergence
+        # TODO at the top of this class.
+        s = replace(_make_base_settings(), lab=LabConfig(saturation=0.2))
+        h, w = self.img.shape[:2]
+        scale = max(h, w) / 1024.0
+
+        cpu_result = self.cpu.process(self.img, s, "parity_test")
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            s,
+            scale_factor=scale,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        assert cpu_result.shape == gpu_result.shape
+        assert np.allclose(cpu_result, gpu_result, atol=0.5, rtol=0.2), f"Max diff: {np.max(np.abs(cpu_result - gpu_result)):.6f}"
+
+    def _chroma_denoise_renders(self, chroma_denoise: float, scale: float) -> tuple:
+        from negpy.domain.interfaces import PipelineContext
+
+        rng = np.random.default_rng(11)
+        img = np.ascontiguousarray(np.clip(self.img + rng.normal(0, 0.03, self.img.shape).astype(np.float32), 1e-4, 1.0))
+        s = replace(_make_base_settings(), lab=LabConfig(chroma_denoise=chroma_denoise, sharpen=0.0))
+        h, w = img.shape[:2]
+        ctx = PipelineContext(original_size=(h, w), scale_factor=scale, process_mode=s.process.process_mode)
+        cpu = np.asarray(self.cpu.process(img, s, f"parity_cdn_{chroma_denoise}_{scale}", context=ctx))[..., :3]
+        gpu_tex, _ = self.gpu.process_to_texture(img, s, scale_factor=scale, apply_layout=False, readback_metrics=False)
+        return cpu.astype(np.float64), np.asarray(self.gpu._readback_downsampled(gpu_tex))[..., :3].astype(np.float64)
+
+    def test_chroma_denoise(self):
+        """Both engines low-pass a*/b* with the same gaussian_kernel_1d taps and apply the same edge test."""
+        for scale in (1.0, 2.5):
+            cpu, gpu = self._chroma_denoise_renders(2.0, scale)
+            cpu_off, _ = self._chroma_denoise_renders(0.0, scale)
+            moved = float(np.mean(np.abs(cpu - cpu_off) > 2e-3))
+            assert moved > 0.02, f"denoise moves only {moved:.1%} of values past the tolerance -- a dead mirror would pass"
+            _assert_mostly_close(cpu, gpu, atol=2e-3, rtol=2e-3, max_violation_frac=0.001)
+
+    def _run_and_compare_sharpen(self, settings: WorkspaceConfig, scale: float) -> None:
+        """Sharpen-specific harness: both engines get the SAME explicit scale
+        factor (the shared _run_and_compare feeds CPU max/1600 vs GPU max/1024,
+        which at 64px degenerates the blur to identity and tests nothing), and
+        the tolerance is tight — both paths now convolve the same kernel taps."""
+        from negpy.domain.interfaces import PipelineContext
+
+        h, w = self.img.shape[:2]
+        ctx = PipelineContext(
+            original_size=(h, w),
+            scale_factor=scale,
+            process_mode=settings.process.process_mode,
+        )
+        cpu_result = self.cpu.process(self.img, settings, f"parity_sharpen_{scale}", context=ctx)
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=scale,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        assert cpu_result.shape == gpu_result.shape
+        _assert_mostly_close(cpu_result, gpu_result, atol=5e-2, rtol=5e-2, max_violation_frac=0.001)
+
+    def test_sharpen(self):
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.5))
+        self._run_and_compare_sharpen(s, scale=1.0)
+
+    def test_sharpen_radius(self):
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.7, sharpen_radius=2.5))
+        self._run_and_compare_sharpen(s, scale=1.0)
+
+    def test_sharpen_masking(self):
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.7, sharpen_masking=0.7))
+        self._run_and_compare_sharpen(s, scale=1.0)
+
+    def test_sharpen_export_scale(self):
+        """Regression for the old fixed-5x5 GPU kernel: at export scale factors
+        (full-res render, scale = long_edge/1600) the blur support must keep
+        tracking the CPU kernel instead of truncating."""
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.5))
+        self._run_and_compare_sharpen(s, scale=4.0)
+
+    def test_sharpen_rl(self):
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.8, sharpen_method="rl", sharpen_radius=1.2))
+        self._run_and_compare_sharpen(s, scale=1.0)
+
+    def test_sharpen_rl_masking(self):
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.8, sharpen_method="rl", sharpen_radius=1.2, sharpen_masking=0.7))
+        self._run_and_compare_sharpen(s, scale=1.0)
+
+    def _auto_masking_both(self, settings: WorkspaceConfig) -> tuple:
+        from negpy.domain.interfaces import PipelineContext
+
+        h, w = self.img.shape[:2]
+        ctx = PipelineContext(original_size=(h, w), scale_factor=1.0, process_mode=settings.process.process_mode)
+        cpu = self.cpu.process(self.img, settings, "parity_auto_masking", context=ctx)
+        tex, gpu_metrics = self.gpu.process_to_texture(self.img, settings, scale_factor=1.0, apply_layout=False, readback_metrics=True)
+        gpu = self.gpu._readback_downsampled(tex)
+        _assert_mostly_close(cpu, gpu, atol=5e-2, rtol=5e-2, max_violation_frac=0.001)
+        return ctx.metrics["auto_masking"], gpu_metrics["auto_masking"]
+
+    @pytest.mark.parametrize("method", ["usm", "rl"])
+    def test_sharpen_auto_masking(self, method):
+        lab = LabConfig(sharpen=0.8, sharpen_method=method, sharpen_auto_masking=True)
+        cpu_auto, gpu_auto = self._auto_masking_both(replace(_make_base_settings(), lab=lab))
+        assert gpu_auto == pytest.approx(cpu_auto, abs=0.01)
+        assert cpu_auto != LabConfig().sharpen_masking
+
+    def test_sharpen_auto_masking_offset(self):
+        lab = LabConfig(sharpen=0.8, sharpen_masking=0.3, sharpen_auto_masking=True)
+        self._auto_masking_both(replace(_make_base_settings(), lab=lab))
+
+    def test_sharpen_rl_export_scale(self):
+        s = replace(_make_base_settings(), lab=LabConfig(sharpen=0.8, sharpen_method="rl", sharpen_radius=1.0))
+        self._run_and_compare_sharpen(s, scale=4.0)
+
+    def test_glow(self):
+        s = replace(_make_base_settings(), lab=LabConfig(glow_amount=0.3))
+        self._run_and_compare(s)
+
+    def test_halation(self):
+        s = replace(_make_base_settings(), lab=LabConfig(halation_strength=0.3))
+        self._run_and_compare(s)
+
+
+@pytest.mark.skipif(not GPUDevice.get().is_available, reason="GPU not available")
+@pytest.mark.parametrize("mode", [ProcessMode.C41, ProcessMode.BW])
+@pytest.mark.parametrize("effect", ["glow_amount", "halation_strength"])
+def test_glow_and_halation_match_on_a_frame_they_span(mode, effect):
+    from negpy.services.rendering.image_processor import ImageProcessor
+
+    h, w = 800, 1200
+    neg = np.full((h, w, 3), 0.8, np.float32)
+    neg[300:500, 450:750] = 0.05
+    neg[100:140, 100:1100] = 0.3
+    base = WorkspaceConfig()
+    base = replace(
+        base,
+        process=replace(base.process, process_mode=mode),
+        exposure=replace(base.exposure, auto_exposure=False, auto_normalize_contrast=False),
+    )
+    processor = ImageProcessor()
+    out = {}
+    for strength in (0.0, 1.0):
+        settings = replace(base, lab=replace(LabConfig(), **{effect: strength}))
+        for gpu in (False, True):
+            res, _ = processor.run_pipeline(
+                neg.copy(), settings, f"{effect}{strength}{gpu}{mode}", render_size_ref=float(w), prefer_gpu=gpu, readback_metrics=False
+            )
+            arr = np.asarray(res.readback()) if hasattr(res, "readback") else np.asarray(res)
+            out[(strength, gpu)] = arr[..., :3].astype(np.float64)
+    assert np.abs(out[(1.0, False)] - out[(0.0, False)]).max() > 0.15
+    assert np.abs(out[(1.0, False)] - out[(1.0, True)]).max() < 0.04
+
+
+class TestToningParity:
+    """CPU vs GPU parity for the toning (paper/chemical/split) shader."""
+
+    @classmethod
+    def setup_class(cls):
+        if not _gpu_available():
+            import pytest
+
+            pytest.skip("GPU not available — cannot run parity tests")
+        cls.cpu = DarkroomEngine()
+        cls.gpu = GPUEngine()
+        cls.img = _make_synthetic_image()
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "gpu"):
+            cls.gpu.destroy_all()
+
+    def _run_and_compare(self, settings: WorkspaceConfig) -> None:
+        h, w = self.img.shape[:2]
+        scale = max(h, w) / 1024.0
+
+        cpu_result = self.cpu.process(self.img, settings, "parity_test")
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=scale,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        assert cpu_result.shape == gpu_result.shape, f"Shape mismatch: CPU {cpu_result.shape} vs GPU {gpu_result.shape}"
+        # 1% outlier budget: the scene-linear roundtrip amplifies CPU(cv2)↔GPU(bicubic)
+        # resampling at hard deep-shadow edges; smooth content matches tightly.
+        _assert_mostly_close(cpu_result, gpu_result, atol=1.5e-1, rtol=1.5e-1, max_violation_frac=0.01)
+
+    def test_default_config(self):
+        self._run_and_compare(_make_base_settings())
+
+    def test_split_toning_shadows(self):
+        s = replace(
+            _make_base_settings(),
+            toning=ToningConfig(shadow_tint_hue=210.0, shadow_tint_strength=0.5),
+        )
+        self._run_and_compare(s)
+
+    def test_split_toning_highlights(self):
+        s = replace(
+            _make_base_settings(),
+            toning=ToningConfig(highlight_tint_hue=45.0, highlight_tint_strength=0.5),
+        )
+        self._run_and_compare(s)
+
+    def test_split_toning_both(self):
+        s = replace(
+            _make_base_settings(),
+            toning=ToningConfig(
+                shadow_tint_hue=210.0,
+                shadow_tint_strength=0.3,
+                highlight_tint_hue=45.0,
+                highlight_tint_strength=0.4,
+            ),
+        )
+        self._run_and_compare(s)
+
+    def test_split_toning_tight_parity(self):
+        """A smooth ramp where the untoned engines agree exactly shows a mask mismatch the class tolerance absorbs."""
+        h, w = 64, 64
+        grad = np.linspace(0.05, 0.9, w, dtype=np.float32)
+        img = np.repeat(grad[None, :], h, axis=0)
+        img = np.ascontiguousarray(np.stack([img, img * 0.95, img * 0.9], axis=-1))
+        base = _make_base_settings()
+        s = replace(
+            base,
+            toning=ToningConfig(shadow_tint_hue=210.0, shadow_tint_strength=1.0, highlight_tint_hue=45.0, highlight_tint_strength=1.0),
+        )
+
+        cpu = np.asarray(self.cpu.process(img, s, "parity_split_tight"))[..., :3].astype(np.float64)
+        tex, _ = self.gpu.process_to_texture(img, s, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False)
+        gpu = np.asarray(self.gpu._readback_downsampled(tex))[..., :3].astype(np.float64)
+        untoned = np.asarray(self.cpu.process(img, base, "parity_split_tight_off"))[..., :3].astype(np.float64)
+
+        assert float(np.max(np.abs(cpu - untoned))) > 0.05, "split toning barely moves this ramp"
+        mx = float(np.max(np.abs(cpu - gpu)))
+        # The OETF compresses the highlight end, so a highlight-only mask mismatch moves RGB little.
+        assert mx < 2e-3, f"max abs diff {mx:.4f}"
+
+    def _bw_settings(self, **toning_kwargs) -> WorkspaceConfig:
+        base = _make_base_settings()
+        return replace(
+            base,
+            process=replace(base.process, process_mode=ProcessMode.BW),
+            toning=ToningConfig(**toning_kwargs),
+        )
+
+    def test_chemical_selenium(self):
+        self._run_and_compare(self._bw_settings(selenium_strength=0.8))
+
+    def test_chemical_sepia(self):
+        self._run_and_compare(self._bw_settings(sepia_strength=0.8))
+
+    def test_chemical_both(self):
+        self._run_and_compare(self._bw_settings(selenium_strength=0.5, sepia_strength=0.5))
+
+    def test_chemical_gold(self):
+        self._run_and_compare(self._bw_settings(gold_strength=0.8))
+
+    def test_chemical_gold_over_sepia(self):
+        self._run_and_compare(self._bw_settings(sepia_strength=0.5, gold_strength=0.8))
+
+    def test_bw_per_channel_trim_stays_neutral(self):
+        # Per-channel trims persist in configs even though the B&W UI hides
+        # them; the post-curve collapse must keep the print grey on both engines.
+        s = self._bw_settings()
+        s = replace(s, exposure=replace(s.exposure, toe_trim_red=0.3, midtone_gamma_trim_green=0.2))
+        self._run_and_compare(s)
+        gpu = self._gpu_result(s)
+        spread = np.abs(gpu - gpu.mean(axis=-1, keepdims=True)).max()
+        assert spread < 1e-3, f"B&W GPU render not neutral: channel spread {spread:.4f}"
+
+    def _gpu_result(self, settings: WorkspaceConfig):
+        h, w = self.img.shape[:2]
+        tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=max(h, w) / 1024.0,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        return self.gpu._readback_downsampled(tex)
+
+    # The shared parity tolerance is wider than a toner's linear-reflectance
+    # footprint, so also assert the strength uniform actually reaches the shader
+    # (catches uniform-pack/struct misalignment that parity alone would absorb).
+
+    def test_chemical_blue(self):
+        s = self._bw_settings(blue_strength=0.8)
+        self._run_and_compare(s)
+        diff = np.abs(self._gpu_result(s) - self._gpu_result(self._bw_settings()))
+        assert float(diff.max()) > 1e-3
+
+    def test_chemical_copper(self):
+        s = self._bw_settings(copper_strength=0.8)
+        self._run_and_compare(s)
+        diff = np.abs(self._gpu_result(s) - self._gpu_result(self._bw_settings()))
+        assert float(diff.max()) > 1e-3
+
+    def test_chemical_vanadium(self):
+        s = self._bw_settings(vanadium_strength=0.8)
+        self._run_and_compare(s)
+        diff = np.abs(self._gpu_result(s) - self._gpu_result(self._bw_settings()))
+        assert float(diff.max()) > 1e-3
+
+    def test_chemical_sepia_blue(self):
+        """Green two-bath split — exercises the ledger's depletion path."""
+        s = self._bw_settings(sepia_strength=1.0, blue_strength=1.0)
+        self._run_and_compare(s)
+        diff = np.abs(self._gpu_result(s) - self._gpu_result(self._bw_settings()))
+        assert float(diff.max()) > 1e-3
+
+    def test_chemical_all_toners_maxed(self):
+        """All six baths at 2.0 — stresses the a→0 exhaustion paths."""
+        s = self._bw_settings(
+            selenium_strength=2.0,
+            sepia_strength=2.0,
+            gold_strength=2.0,
+            blue_strength=2.0,
+            copper_strength=2.0,
+            vanadium_strength=2.0,
+        )
+        self._run_and_compare(s)
+        diff = np.abs(self._gpu_result(s) - self._gpu_result(self._bw_settings()))
+        assert float(diff.max()) > 1e-3
+
+
+class _AltProcessParity:
+    """Shared harness for the alternative-process shaders (lith, cyanotype)."""
+
+    @classmethod
+    def setup_class(cls):
+        if not _gpu_available():
+            import pytest
+
+            pytest.skip("GPU not available — cannot run parity tests")
+        cls.cpu = DarkroomEngine()
+        cls.gpu = GPUEngine()
+        cls.img = _make_synthetic_image()
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "gpu"):
+            cls.gpu.destroy_all()
+
+    def _settings(self, toning: ToningConfig | None = None, **alt_kwargs) -> WorkspaceConfig:
+        base = _make_base_settings()
+        return replace(
+            base,
+            process=replace(base.process, process_mode=ProcessMode.BW),
+            altproc=AltProcessConfig(**alt_kwargs),
+            toning=toning or ToningConfig(),
+        )
+
+    def _run_and_compare(self, settings: WorkspaceConfig) -> None:
+        h, w = self.img.shape[:2]
+        cpu_result = self.cpu.process(self.img, settings, "altproc_parity")
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=max(h, w) / 1024.0,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+        assert cpu_result.shape == gpu_result.shape
+        _assert_mostly_close(cpu_result, gpu_result, atol=1.5e-1, rtol=1.5e-1, max_violation_frac=0.01)
+
+    def _gpu_result(self, settings: WorkspaceConfig):
+        h, w = self.img.shape[:2]
+        tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=max(h, w) / 1024.0,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        return self.gpu._readback_downsampled(tex)
+
+    def _assert_did_something(self, settings: WorkspaceConfig, against: WorkspaceConfig) -> None:
+        """The parity tolerance is wider than a stage's footprint, so a dead uniform
+        binding would pass parity trivially. Pin that the pass changed the pixels."""
+        assert float(np.abs(self._gpu_result(settings) - self._gpu_result(against)).max()) > 1e-3
+
+
+class TestNoAltProcessParity(_AltProcessParity):
+    def test_disabled(self):
+        self._run_and_compare(self._settings())
+
+
+class TestLithParity(_AltProcessParity):
+    """CPU vs GPU parity for the lith (infectious development) shader."""
+
+    def test_enabled(self):
+        s = self._settings(alt_process=AltProcess.LITH)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings())
+
+    def test_snatch_and_abruptness(self):
+        self._run_and_compare(self._settings(alt_process=AltProcess.LITH, lith_snatch=0.85, lith_abruptness=1.0))
+
+    def test_lith_selenium(self):
+        """Selenium switches to the lith constant set — parity must follow."""
+        s = self._settings(ToningConfig(selenium_strength=0.8), alt_process=AltProcess.LITH)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.LITH))
+
+    def test_lith_gold(self):
+        s = self._settings(ToningConfig(gold_strength=0.8), alt_process=AltProcess.LITH)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.LITH))
+
+
+class TestSabattierParity(_AltProcessParity):
+    """CPU vs GPU parity for the Sabattier passes: the fold, and the Mackie-line blur that
+    pass 1 and pass 2 split between them."""
+
+    def test_enabled(self):
+        s = self._settings(alt_process=AltProcess.SABATTIER)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings())
+
+    def test_no_lines_and_a_hard_fold(self):
+        self._run_and_compare(self._settings(alt_process=AltProcess.SABATTIER, sabattier_agitation=1.0, sabattier_strength=1.4))
+
+    def test_wide_lines(self):
+        s = self._settings(alt_process=AltProcess.SABATTIER, sabattier_agitation=0.0)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.SABATTIER, sabattier_agitation=1.0))
+
+    def test_sabattier_selenium(self):
+        s = self._settings(ToningConfig(selenium_strength=0.8), alt_process=AltProcess.SABATTIER)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.SABATTIER))
+
+
+class TestCyanotypeParity(_AltProcessParity):
+    """CPU vs GPU parity for the cyanotype shader."""
+
+    def test_enabled(self):
+        s = self._settings(alt_process=AltProcess.CYANOTYPE)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings())
+
+    def test_sensitizer(self):
+        s = self._settings(alt_process=AltProcess.CYANOTYPE, cyano_sensitizer=Sensitizer.NEW)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.CYANOTYPE))
+
+    def test_exposure_and_scale(self):
+        s = self._settings(alt_process=AltProcess.CYANOTYPE, cyano_exposure=1.5, cyano_scale=2.4)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.CYANOTYPE))
+
+    def test_bleach_and_tannin(self):
+        s = self._settings(alt_process=AltProcess.CYANOTYPE, cyano_bleach=0.5, cyano_tannin=0.8)
+        self._run_and_compare(s)
+        self._assert_did_something(s, self._settings(alt_process=AltProcess.CYANOTYPE))
+
+    def test_chemical_toners_are_inert(self):
+        """No silver in a cyanotype — the six baths must be skipped on both engines."""
+        toned = self._settings(ToningConfig(selenium_strength=1.0, gold_strength=1.0), alt_process=AltProcess.CYANOTYPE)
+        self._run_and_compare(toned)
+        plain = self._settings(alt_process=AltProcess.CYANOTYPE)
+        assert float(np.abs(self._gpu_result(toned) - self._gpu_result(plain)).max()) < 1e-5
+
+
+class TestRetouchParity:
+    """Defect repairs are baked into the source ahead of both engines now, so neither
+    reads RetouchConfig at all. Parity is structural — this pins that: an engine that
+    grew a retouch stage back would diverge from the other the moment it did."""
+
+    @classmethod
+    def setup_class(cls):
+        if not _gpu_available():
+            import pytest
+
+            pytest.skip("GPU not available — cannot run parity tests")
+        cls.cpu = DarkroomEngine()
+        cls.gpu = GPUEngine()
+        cls.img = _make_speck_image()
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "gpu"):
+            cls.gpu.destroy_all()
+
+    def _gpu(self, settings: WorkspaceConfig) -> np.ndarray:
+        h, w = self.img.shape[:2]
+        tex, _ = self.gpu.process_to_texture(
+            self.img, settings, scale_factor=max(h, w) / 1024.0, apply_layout=False, readback_metrics=False
+        )
+        return self.gpu._readback_downsampled(tex)
+
+    def test_both_engines_are_inert_to_retouch_config(self):
+        base = _make_base_settings()
+        healed = replace(
+            base,
+            retouch=RetouchConfig(
+                dust_remove=True,
+                manual_dust_spots=[(45.5 / 64.0, 30.5 / 64.0, 80.0)],
+                manual_heal_strokes=[([[0.3, 0.3], [40.5 / 64.0, 40.5 / 64.0]], 64.0, 0.0, 0.3)],
+            ),
+        )
+        np.testing.assert_array_equal(self.cpu.process(self.img, base, "a"), self.cpu.process(self.img, healed, "b"))
+        np.testing.assert_allclose(self._gpu(base), self._gpu(healed), atol=1e-6)
+
+
+class TestLocalParity:
+    """CPU vs GPU parity for the dodge/burn local shader.
+
+    The factor map is rasterised on the CPU and shared by both paths, so parity
+    is tight — only the final GPU multiply/clamp differs from numpy.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        if not _gpu_available():
+            import pytest
+
+            pytest.skip("GPU not available — cannot run parity tests")
+        cls.cpu = DarkroomEngine()
+        cls.gpu = GPUEngine()
+        cls.img = _make_synthetic_image()
+
+    @classmethod
+    def teardown_class(cls):
+        if hasattr(cls, "gpu"):
+            cls.gpu.destroy_all()
+
+    def _run_and_compare(self, settings: WorkspaceConfig) -> None:
+        h, w = self.img.shape[:2]
+        scale = max(h, w) / 1024.0
+
+        cpu_result = self.cpu.process(self.img, settings, "parity_test")
+        gpu_tex, _ = self.gpu.process_to_texture(
+            self.img,
+            settings,
+            scale_factor=scale,
+            apply_layout=False,
+            readback_metrics=False,
+        )
+        gpu_result = self.gpu._readback_downsampled(gpu_tex)
+
+        assert cpu_result.shape == gpu_result.shape, f"Shape mismatch: CPU {cpu_result.shape} vs GPU {gpu_result.shape}"
+        # Tolerance matches the other parity classes; the shared CPU-rasterised
+        # factor map adds no divergence beyond the existing pipeline baseline
+        # (verified by test_no_masks), bar a few mask-edge resampling outliers.
+        _assert_mostly_close(cpu_result, gpu_result, atol=1.5e-1, rtol=1.5e-1, max_violation_frac=0.01)
+
+    @staticmethod
+    def _mask(stops: float, feather: float = 0.0) -> LocalMask:
+        """Print exposure in stops: positive burns, negative dodges."""
+        return LocalMask(
+            vertices=((0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)),
+            stops=stops,
+            feather=feather,
+        )
+
+    def test_no_masks(self):
+        self._run_and_compare(_make_base_settings())
+
+    def test_dodge(self):
+        s = replace(_make_base_settings(), local=LocalAdjustmentsConfig(masks=(self._mask(-1.0),)))
+        self._run_and_compare(s)
+
+    def test_burn(self):
+        s = replace(_make_base_settings(), local=LocalAdjustmentsConfig(masks=(self._mask(1.0),)))
+        self._run_and_compare(s)
+
+    def test_feathered(self):
+        s = replace(_make_base_settings(), local=LocalAdjustmentsConfig(masks=(self._mask(0.8, feather=0.06),)))
+        self._run_and_compare(s)
+
+    def test_multiple_masks(self):
+        masks = (
+            LocalMask(vertices=((0.1, 0.1), (0.45, 0.1), (0.45, 0.45), (0.1, 0.45)), stops=-1.0),
+            LocalMask(vertices=((0.55, 0.55), (0.9, 0.55), (0.9, 0.9), (0.55, 0.9)), stops=1.0),
+        )
+        s = replace(_make_base_settings(), local=LocalAdjustmentsConfig(masks=masks))
+        self._run_and_compare(s)

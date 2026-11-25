@@ -1,0 +1,606 @@
+"""Analysis-panel histogram/zone math. Pure NumPy/OpenCV, no Qt."""
+
+from functools import lru_cache
+from typing import Any, List, Optional, Sequence, Tuple
+
+import negpy_core
+import numpy as np
+
+from negpy.kernel.image.logic import (
+    _LAB_EPS,
+    _LAB_KAPPA,
+    _WORKING_GAMMA,
+    _WORKING_TO_XYZ,
+    _WORKING_WHITE,
+    get_luminance,
+    rgb_to_lab_working,
+    working_oetf_decode,
+    working_oetf_encode,
+)
+
+# Mirrored by the chart's x-range (PhotometricCurveWidget._X_MIN/_X_MAX) and the WGSL
+# literals in shaders/density_hist.wgsl. Keep them in lock step.
+DENSITY_HIST_BINS = 120
+DENSITY_HIST_RANGE = (-0.1, 1.1)
+
+# Mirrors metrics.wgsl / HISTOGRAM_BINS in gpu_engine.py.
+OUTPUT_HIST_BINS = 256
+
+# Joint RGB histogram: 32 bins per axis, mirrored as the array length and BINS constant
+# in color_hist.wgsl. A color is in or out of gamut as a triple rather than per channel,
+# which is what the marginal RGBL histogram cannot answer.
+COLOR_HIST_BINS = 32
+
+# Scan parade axis in density (-log10 of the linear scan): 0 = sensor full scale, the top edge
+# bin; past 3.0 (1/1000 of full scale) a scan holds little but noise. Mirrored by SCAN_D_MIN / SCAN_D_SPAN in density_hist.wgsl.
+SCAN_DENSITY_RANGE = (0.0, 3.0)
+
+# Waveform: print luma per image column, (bins, cols) with row 0 = black. waveform.wgsl mirrors this.
+WAVEFORM_COLS = 256
+WAVEFORM_BINS = 128
+# Per-cell R, G, B sums are fixed point (u32 atomics on the GPU): encoded value x this scale.
+WAVEFORM_COLOR_SCALE = 1023
+
+# Vectorscope: CIELAB a*b* in hue x log-chroma bins, so linear and log displays read one
+# histogram; the last chroma bin holds all past SCOPE_MAX_CHROMA. vectorscope.wgsl mirrors this.
+SCOPE_HUE_BINS = 180
+SCOPE_CHROMA_BINS = 64
+SCOPE_MAX_CHROMA = 60.0
+SCOPE_LOG_KNEE = 4.0  # chroma where the log axis turns from linear to compressed
+# The scope reads a distribution, so the CPU twin bins a strided sample.
+_SCOPE_MAX_SAMPLES = 262_144
+
+# Full-res exports run through the same normalization stage, so cap the cost.
+_MAX_HIST_SAMPLES = 2_000_000
+
+
+def _frame_step(shape: Tuple[int, ...], max_samples: int) -> int:
+    """The stride that keeps a whole frame near `max_samples` samples."""
+    return max(1, round(np.sqrt(shape[0] * shape[1] / max_samples)))
+
+
+def output_histogram(buffer: Any) -> Optional[np.ndarray]:
+    """(4, 256) [R, G, B, L] counts from a (4, 256) bin array or an H×W×3 encoded buffer. An
+    8-bit frame (the camera live view) bins by value: the same bins as the float path's
+    floor(v / 255 * 256)."""
+    if buffer is None:
+        return None
+    buffer = np.asarray(buffer)
+    if buffer.ndim == 2 and buffer.shape == (4, OUTPUT_HIST_BINS):
+        return buffer.astype(float)
+    if buffer.ndim != 3 or buffer.shape[-1] != 3 or min(buffer.shape[:2]) < 1:
+        return None
+    dtype = np.uint8 if buffer.dtype == np.uint8 else np.float32
+    return negpy_core.output_histogram(np.ascontiguousarray(buffer, dtype=dtype), _frame_step(buffer.shape, _MAX_HIST_SAMPLES))
+
+
+def color_histogram(buffer: Any) -> Optional[np.ndarray]:
+    """(32, 32, 32) joint RGB counts from an H×W×3 encoded buffer, or a ready grid
+    passed through. CPU counterpart of color_hist.wgsl."""
+    if buffer is None:
+        return None
+    buffer = np.asarray(buffer)
+    if buffer.ndim == 3 and buffer.shape == (COLOR_HIST_BINS,) * 3:
+        return buffer.astype(float)
+    if buffer.ndim != 3 or buffer.shape[-1] != 3 or min(buffer.shape[:2]) < 1:
+        return None
+    return negpy_core.color_histogram(np.ascontiguousarray(buffer, dtype=np.float32), _frame_step(buffer.shape, _MAX_HIST_SAMPLES))
+
+
+def gamut_fraction(color_hist: Any, out_of_gamut: Any) -> Optional[float]:
+    """Share of the frame the output profile cannot print, from the joint histogram and a
+    boolean (32, 32, 32) gamut mask. None when either is missing.
+
+    Quantized to the histogram grid, so a color one bin inside the boundary counts as
+    printable. It answers "how much of this frame", not "is this pixel".
+    """
+    if color_hist is None or out_of_gamut is None:
+        return None
+    hist = np.asarray(color_hist, dtype=np.float64)
+    mask = np.asarray(out_of_gamut, dtype=bool)
+    if hist.shape != mask.shape:
+        return None
+    total = float(hist.sum())
+    return float(hist[mask].sum() / total) if total > 0 else None
+
+
+def _waveform(buffer: Any, kind: str) -> Optional[np.ndarray]:
+    """The waveform counts or sums of an H×W×3 encoded buffer, binned by float32 luma or channel."""
+    if buffer is None:
+        return None
+    buffer = np.asarray(buffer)
+    if buffer.ndim != 3 or buffer.shape[-1] < 3 or min(buffer.shape[:2]) < 1:
+        return None
+    return negpy_core.waveform(np.ascontiguousarray(buffer, dtype=np.float32), _frame_step(buffer.shape, _MAX_HIST_SAMPLES), kind)
+
+
+def waveform(buffer: Any) -> Optional[np.ndarray]:
+    """(WAVEFORM_BINS, WAVEFORM_COLS) luma counts per image column of an H×W×3 encoded
+    buffer. CPU counterpart of waveform.wgsl."""
+    return _waveform(buffer, "luma")
+
+
+def waveform_color(buffer: Any) -> Optional[np.ndarray]:
+    """(3, WAVEFORM_BINS, WAVEFORM_COLS) fixed-point sums of the encoded R, G, B in each
+    waveform cell. CPU counterpart of the sums in waveform.wgsl."""
+    return _waveform(buffer, "color")
+
+
+def waveform_parade(buffer: Any) -> Optional[np.ndarray]:
+    """(3, WAVEFORM_BINS, WAVEFORM_COLS) counts of each encoded channel per image column: the
+    RGB parade. CPU counterpart of the parade counts in waveform.wgsl."""
+    return _waveform(buffer, "parade")
+
+
+def scope_radius(chroma: Any, log: bool) -> Any:
+    """Chroma -> 0..1 of the scope's radius (unclipped)."""
+    c = np.asarray(chroma, dtype=np.float64)
+    if log:
+        return np.log1p(c / SCOPE_LOG_KNEE) / np.log1p(SCOPE_MAX_CHROMA / SCOPE_LOG_KNEE)
+    return c / SCOPE_MAX_CHROMA
+
+
+def scope_chroma(radius: Any, log: bool) -> Any:
+    """Exact inverse of scope_radius."""
+    r = np.asarray(radius, dtype=np.float64)
+    if log:
+        return np.expm1(r * np.log1p(SCOPE_MAX_CHROMA / SCOPE_LOG_KNEE)) * SCOPE_LOG_KNEE
+    return r * SCOPE_MAX_CHROMA
+
+
+def vectorscope_histogram(buffer: Any) -> Optional[np.ndarray]:
+    """(SCOPE_HUE_BINS, SCOPE_CHROMA_BINS) a*b* counts of an H×W×3 encoded buffer. CPU
+    counterpart of vectorscope.wgsl."""
+    if buffer is None:
+        return None
+    buffer = np.asarray(buffer)
+    if buffer.ndim != 3 or buffer.shape[-1] < 3 or min(buffer.shape[:2]) < 1:
+        return None
+    step = max(1, round(np.sqrt(buffer.shape[0] * buffer.shape[1] / _SCOPE_MAX_SAMPLES)))
+    return negpy_core.vectorscope_histogram(
+        np.ascontiguousarray(buffer, dtype=np.float32),
+        step,
+        _WORKING_TO_XYZ,
+        _WORKING_WHITE,
+        np.float32(_LAB_EPS),
+        np.float32(_LAB_KAPPA),
+        np.float32(_WORKING_GAMMA),
+    )
+
+
+def scope_point(rgb: Sequence[float]) -> Tuple[float, float, float]:
+    """(luma, a*, b*) of one display-encoded pixel: where it lands on the waveform and the vectorscope."""
+    encoded = np.clip(np.asarray([rgb], dtype=np.float32), 0.0, 1.0)
+    luma = float(get_luminance(encoded)[0])
+    lab = rgb_to_lab_working(np.asarray(working_oetf_decode(encoded)))[0]
+    return luma, float(lab[1]), float(lab[2])
+
+
+@lru_cache(maxsize=4)
+def _scope_lookup(size: int, log: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Polar bin of each display pixel (-1 outside the disc), each bin's pixel count, and for
+    the bins no pixel samples (near neutral, finer than a pixel) the flat pixel they fold into."""
+    return negpy_core.scope_lookup(int(size), bool(log))
+
+
+def vectorscope_density(counts: Any, size: int, log: bool) -> np.ndarray:
+    """(size, size) pixels per display pixel, +a right and +b up. Each polar bin's count is
+    spread over the display pixels it covers, so a bin's on-screen area does not change its brightness."""
+    flat = np.ascontiguousarray(np.asarray(counts, dtype=float).ravel())
+    return negpy_core.vectorscope_density(flat, *_scope_lookup(size, log))
+
+
+def output_clip_fractions(bins: np.ndarray) -> Tuple[float, float]:
+    """Worst-channel share of the black / white bin (shadow, highlight clipping)."""
+    bins = np.asarray(bins, dtype=float)
+    totals = np.maximum(bins[:3].sum(axis=1), 1.0)
+    return float((bins[:3, 0] / totals).max()), float((bins[:3, -1] / totals).max())
+
+
+# The zone ruler is piecewise-linear in encoded space (0 = black, V = 18% gray,
+# X = white), because stops-per-zone cannot reach the top zones on a print.
+ZONE_COUNT = 10
+ZONE_MID_REFLECTANCE = 0.18
+ZONE_EMPTY = 0.005
+ZONE_LOADED = 0.02
+
+
+@lru_cache(maxsize=1)
+def _mid_gray_encoded() -> float:
+    return float(working_oetf_encode(np.asarray([ZONE_MID_REFLECTANCE], dtype=np.float32))[0])
+
+
+def zone_of_encoded(enc: Any) -> Any:
+    """Print zone (0..10) of a display-encoded lightness; scalar or ndarray."""
+    enc = np.clip(enc, 0.0, 1.0)
+    mid = _mid_gray_encoded()
+    return np.where(enc <= mid, 5.0 * enc / mid, 5.0 + 5.0 * (enc - mid) / (1.0 - mid))
+
+
+def encoded_of_zone(zone: float) -> float:
+    """Exact inverse of zone_of_encoded; kept beside it so the ruler can't fork."""
+    z = min(max(float(zone), 0.0), 10.0)
+    mid = _mid_gray_encoded()
+    if z <= 5.0:
+        return mid * z / 5.0
+    return mid + (1.0 - mid) * (z - 5.0) / 5.0
+
+
+def zone_occupancy(l_bins: np.ndarray) -> np.ndarray:
+    """Fold display-encoded luma histogram bins into the share of each zone 0..X, rounded to the
+    nearest zone as zone_field rounds, so the strip and the Zone Overlay count alike."""
+    return negpy_core.zone_occupancy(np.ascontiguousarray(l_bins, dtype=np.float64).ravel(), _mid_gray_encoded())
+
+
+def zone_warnings(occ: np.ndarray) -> Tuple[bool, bool]:
+    """(shadow, highlight): a texture zone pair is empty while its extreme pair holds mass."""
+    shadow = float(occ[2] + occ[3]) < ZONE_EMPTY and float(occ[0] + occ[1]) > ZONE_LOADED
+    highlight = float(occ[7] + occ[8]) < ZONE_EMPTY and float(occ[9] + occ[10]) > ZONE_LOADED
+    return shadow, highlight
+
+
+MASK_MAX_EDGE = 1024  # canvas masks are drawn scaled to the view, so finer adds nothing
+
+
+def _mask_preview(rgb: Any, max_edge: int) -> Optional[np.ndarray]:
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[-1] < 3 or min(rgb.shape[:2]) < 1:
+        return None
+    step = max(1, -(-max(rgb.shape[:2]) // max_edge))
+    return np.ascontiguousarray(rgb[::step, ::step, :3], dtype=np.float32)
+
+
+def clip_masks(rgb: Any, max_edge: int = MASK_MAX_EDGE) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """(shadow, highlight): pixels with any channel in the output histogram's black or white
+    bin, the bins the Clipping row and the chart's clip marks count."""
+    small = _mask_preview(rgb, max_edge)
+    if small is None:
+        return None
+    edge = 1.0 / OUTPUT_HIST_BINS
+    return np.any(small < edge, axis=-1), np.any(small >= 1.0 - edge, axis=-1)
+
+
+ZONE_GRID_CELLS = 24  # cells along the frame's long edge
+
+
+def zone_grid(rgb: Any, cells: int = ZONE_GRID_CELLS) -> Optional[np.ndarray]:
+    """Integer Adams zone (0..10) per cell of a fixed grid over a display-encoded H×W×3
+    frame; None if the frame isn't one. Cells are square-ish whatever the aspect, and the
+    area-average over a cell is what damps grain — no extra smoothing needed.
+
+    The frame is sRGB- rather than Adobe-RGB-encoded on the soft-proof/splash path; the
+    ruler hinge differs by ~0.04 zone there, under the rounding step, so we don't branch.
+    """
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[-1] < 3 or min(rgb.shape[:2]) < 2:
+        return None
+    return negpy_core.zone_grid(np.ascontiguousarray(rgb, dtype=np.float32), int(cells), _mid_gray_encoded())
+
+
+def zone_region_labels(zones: np.ndarray) -> List[Tuple[int, int, int]]:
+    """One label anchor per contiguous same-zone region: [(col, row, zone)].
+
+    Anchors are snapped to a cell the region actually owns, so a concave region's numeral
+    can't land outside it (its centroid can).
+    """
+    return negpy_core.zone_region_labels(np.ascontiguousarray(zones, dtype=np.int32))
+
+
+ZONE_FIELD_MAX_EDGE = 768  # drawn scaled to the view; finer only sharpens grain
+
+
+def zone_field(rgb: Any, max_edge: int = ZONE_FIELD_MAX_EDGE) -> Optional[np.ndarray]:
+    """Integer Adams zone (0..10) per pixel of a display-encoded H×W×3 frame, at most
+    `max_edge` on the long side; None if the frame isn't one. Smoothed first, so grain
+    does not split one tone into speckled zones."""
+    rgb = np.asarray(rgb)
+    if rgb.ndim != 3 or rgb.shape[-1] < 3 or min(rgb.shape[:2]) < 2:
+        return None
+    return negpy_core.zone_field(np.ascontiguousarray(rgb, dtype=np.float32), int(max_edge), _mid_gray_encoded())
+
+
+def zone_shares(zones: np.ndarray) -> np.ndarray:
+    """Fraction of the frame in each zone 0..10."""
+    return negpy_core.zone_shares(np.ascontiguousarray(zones, dtype=np.uint8))
+
+
+def zone_anchors(zones: np.ndarray, min_share: float = 0.01) -> List[Tuple[int, int, int, float]]:
+    """(x, y, zone, inset) per region holding at least `min_share` of the frame, at its most
+    interior pixel; `inset` is that pixel's distance to the region's edge. The frame edge
+    counts as an edge, so a numeral never sits half off the picture."""
+    return negpy_core.zone_anchors(np.ascontiguousarray(zones, dtype=np.uint8), float(min_share))
+
+
+# Absolute ladders, centred on the defaults and inside the sliders' travel (density 0-2,
+# grade R50-R180). Named strip_*, not test_strip_*: pytest collects any test_-prefixed
+# callable a test module imports.
+STRIP_DENSITIES = (0.4, 0.7, 1.0, 1.3, 1.6)
+STRIP_GRADES = (75.0, 95.0, 115.0, 135.0, 155.0)
+
+
+STRIP_GRID = (len(STRIP_GRADES), len(STRIP_DENSITIES))  # (rows, cols)
+
+# Ring-around rungs: absolute filtration centred on neutral, like the strip's ladders, so
+# a ring printed off one frame is comparable to the next and the mosaic is invariant to
+# the filtration in force. 1.0 slider = 20cc (see filtration_offsets), so the step is 2cc
+# and the outer rung 4cc. Calibration knobs.
+RING_CC_STEP = 0.1
+RING_CC_PER_UNIT = 20.0
+RING_GRID = (5, 5)
+
+
+def strip_center() -> Tuple[float, float]:
+    """(density, grade) of the middle patch; a proof's memo key pins these, so the mosaic is one cache entry."""
+    return STRIP_DENSITIES[len(STRIP_DENSITIES) // 2], STRIP_GRADES[len(STRIP_GRADES) // 2]
+
+
+def strip_cells() -> List[Tuple[int, int, float, float]]:
+    """(row, col, density, grade) for every patch, row-major."""
+    return [(r, c, d, g) for r, g in enumerate(STRIP_GRADES) for c, d in enumerate(STRIP_DENSITIES)]
+
+
+def strip_overrides() -> List[dict]:
+    """ExposureConfig field overrides per patch, row-major over STRIP_GRID."""
+    return [{"density": d, "grade": g} for _, _, d, g in strip_cells()]
+
+
+def ring_rungs() -> Tuple[float, ...]:
+    """The absolute wb values one axis steps through, centred on neutral."""
+    mid = RING_GRID[0] // 2
+    return tuple(round((i - mid) * RING_CC_STEP, 6) for i in range(RING_GRID[0]))
+
+
+def ring_cells() -> List[Tuple[int, int, float, float]]:
+    """(row, col, wb_magenta, wb_yellow) row-major. Rows step magenta, columns yellow, cyan
+    stays 0. Absolute, so the centre patch is neutral rather than whatever is dialled in."""
+    rungs = ring_rungs()
+    rows, cols = RING_GRID
+    return [(r, c, rungs[r], rungs[c]) for r in range(rows) for c in range(cols)]
+
+
+def ring_overrides() -> List[dict]:
+    """Per-patch ExposureConfig overrides. Only the two color-head fields, so a replace()
+    built from these cannot disturb density, grade or cyan."""
+    return [{"wb_magenta": m, "wb_yellow": y} for _, _, m, y in ring_cells()]
+
+
+def ring_cc(index: int) -> float:
+    """A rung's filtration in cc, as the axis labels show it."""
+    return ring_rungs()[index] * RING_CC_PER_UNIT
+
+
+def ring_nearest_cell(magenta: float, yellow: float) -> Tuple[int, int]:
+    """(row, col) of the patch closest to the filtration in force."""
+    rungs = ring_rungs()
+    return (
+        int(np.argmin([abs(m - magenta) for m in rungs])),
+        int(np.argmin([abs(y - yellow) for y in rungs])),
+    )
+
+
+def _strip_bounds(extent: int, divisions: int, index: int) -> Tuple[int, int]:
+    return round(extent * index / divisions), round(extent * (index + 1) / divisions)
+
+
+def strip_mosaic(tiles: List[np.ndarray], grid: Tuple[int, int]) -> np.ndarray:
+    """One frame assembled from row-major renders over `grid`, each contributing only its own
+    patch. Both sides of a seam round the same fraction, so patches tile exactly."""
+    rows, cols = grid
+    if len(tiles) != rows * cols:
+        raise ValueError(f"expected {rows * cols} tiles, got {len(tiles)}")
+    out = np.empty_like(tiles[0])
+    h, w = out.shape[:2]
+    for i, tile in enumerate(tiles):
+        if tile.shape != out.shape:
+            raise ValueError(f"tile shape {tile.shape} != {out.shape}")
+        row, col = divmod(i, cols)
+        y0, y1 = _strip_bounds(h, rows, row)
+        x0, x1 = _strip_bounds(w, cols, col)
+        out[y0:y1, x0:x1] = tile[y0:y1, x0:x1]
+    return out
+
+
+# Calibration knob: past this many columns per row, an even grid draws the papers smaller than
+# a near-square one with a short last row.
+PAPER_GRID_MAX_RATIO = 3
+
+
+def paper_grid(count: int) -> Tuple[int, int]:
+    """(rows, cols) of the paper strip's grid layout: the even grid nearest square, else near square."""
+    for rows in range(int(np.sqrt(count)), 0, -1):
+        if count % rows == 0 and count // rows <= PAPER_GRID_MAX_RATIO * rows:
+            return rows, count // rows
+    cols = int(np.ceil(np.sqrt(count)))
+    return -(-count // cols), cols
+
+
+def paper_grid_cells(count: int) -> List[Tuple[float, float, float, float]]:
+    """(x0, y0, x1, y1) of each paper's cell as fractions of the frame, row-major. Cells are
+    frame-shaped, so a render fills its cell; the block and a short last row are centered."""
+    rows, cols = paper_grid(count)
+    size = 1.0 / max(rows, cols)
+    top = (1.0 - rows * size) / 2
+    cells = []
+    for i in range(count):
+        row, col = divmod(i, cols)
+        x0 = (1.0 - min(cols, count - row * cols) * size) / 2 + col * size
+        y0 = top + row * size
+        cells.append((x0, y0, x0 + size, y0 + size))
+    return cells
+
+
+def paper_grid_mosaic(tiles: Sequence[np.ndarray]) -> np.ndarray:
+    """One frame holding every render whole, each scaled into its `paper_grid_cells` cell; the
+    frame around the block stays black."""
+    out = np.zeros_like(tiles[0])
+    h, w = out.shape[:2]
+    for tile, (x0, y0, x1, y1) in zip(tiles, paper_grid_cells(len(tiles))):
+        top, bottom, left, right = round(y0 * h), round(y1 * h), round(x0 * w), round(x1 * w)
+        out[top:bottom, left:right] = negpy_core.resize_area(np.ascontiguousarray(tile, dtype=np.float32), (right - left, bottom - top))
+    return out
+
+
+def strip_patch_rect(h: int, w: int, row: int, col: int, grid: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """(x0, y0, x1, y1) of one patch inside an h×w frame — the bounds `strip_mosaic` filled."""
+    rows, cols = grid
+    y0, y1 = _strip_bounds(h, rows, row)
+    x0, x1 = _strip_bounds(w, cols, col)
+    return x0, y0, x1, y1
+
+
+def strip_cell_at(nx: float, ny: float, grid: Tuple[int, int]) -> Tuple[int, int]:
+    """Content-normalized position (0..1) -> (row, col)."""
+    rows, cols = grid
+    return (
+        int(np.clip(int(ny * rows), 0, rows - 1)),
+        int(np.clip(int(nx * cols), 0, cols - 1)),
+    )
+
+
+def strip_nearest_cell(density: float, grade: float) -> Tuple[int, int]:
+    """(row, col) of the patch closest to the settings currently in force."""
+    col = int(np.argmin([abs(d - density) for d in STRIP_DENSITIES]))
+    row = int(np.argmin([abs(g - grade) for g in STRIP_GRADES]))
+    return row, col
+
+
+def _rotation_index(grid: Tuple[int, int], rotation: int) -> np.ndarray:
+    """Row-major indices of `grid` after `rotation` quarter-turns CCW."""
+    rows, cols = grid
+    return np.rot90(np.arange(rows * cols).reshape(rows, cols), rotation % 4)
+
+
+def proof_grid(grid: Tuple[int, int], rotation: int) -> Tuple[int, int]:
+    """(rows, cols) after `rotation` quarter-turns. Both ladders are square today, so this only
+    bites if one changes length."""
+    rows, cols = grid
+    return (cols, rows) if rotation % 2 else (rows, cols)
+
+
+def rotate_grid(items: Sequence[Any], grid: Tuple[int, int], rotation: int) -> List[Any]:
+    """Row-major `items` re-placed by `rotation` quarter-turns CCW — np.rot90's k, the same
+    convention as GeometryConfig.rotation."""
+    return [items[i] for i in _rotation_index(grid, rotation).ravel()]
+
+
+def rotated_cell(base: Tuple[int, int], grid: Tuple[int, int], rotation: int) -> Tuple[int, int]:
+    """Where a base (row, col) lands after the rotation."""
+    flat = _rotation_index(grid, rotation).ravel()
+    pos = int(np.flatnonzero(flat == base[0] * grid[1] + base[1])[0])
+    return divmod(pos, proof_grid(grid, rotation)[1])
+
+
+# Stouffer T2115: 21 steps 0.15 D apart, so 20 intervals and 3.00 D total, which is
+# exactly the val domain's [0,1] on a scan whose density range is 3.0. The geometry is
+# absolute like the test strip's ladders, so two frames' wedges compare. The physical
+# truth rides in the labels, which report this scan's own density per step.
+WEDGE_STEPS = 21
+WEDGE_STEP_DENSITY = 0.15
+WEDGE_SEPARATION = 0.004  # encoded delta below which neighbouring patches read as one tone
+
+
+def wedge_vals() -> np.ndarray:
+    """The 21 steps as val-domain log exposures: clear step (prints paper black) first,
+    densest step (prints paper white) last — the Analysis chart's x-axis direction."""
+    return np.linspace(1.0, 0.0, WEDGE_STEPS)
+
+
+def wedge_step_density(norm_density_range: Optional[float]) -> float:
+    """Density per step on this scan: its range spread over the 20 intervals. Falls back to
+    the nominal T2115 increment when the range hasn't been measured yet."""
+    if not norm_density_range:
+        return WEDGE_STEP_DENSITY
+    return abs(float(norm_density_range)) / (WEDGE_STEPS - 1)
+
+
+def wedge_usable_span(enc: Any) -> Optional[Tuple[int, int]]:
+    """(first, last) step still separating from its neighbour — the paper's usable scale.
+    None when the whole wedge reads as one tone.
+
+    Read off the patches themselves rather than from d_max_eff, so toe and shoulder lift,
+    black-point compensation, the paper profile and split grade are all accounted for
+    without a second model to keep in sync.
+    """
+    idx = np.flatnonzero(np.abs(np.diff(np.asarray(enc, dtype=float))) > WEDGE_SEPARATION)
+    return (int(idx[0]), int(idx[-1] + 1)) if idx.size else None
+
+
+def loupe_acutance(patch: Any) -> float:
+    """Edge energy of a display-encoded H×W×3 patch: RMS Laplacian of its luma, ×100.
+
+    A Laplacian rather than a plain standard deviation — σ reads *high* on a smooth gradient,
+    which is the opposite of sharp, so a σ-based figure calls a soft ramp crisp. Resolution
+    dependent by nature: compare regions of one frame, not one frame against another.
+    """
+    patch = np.asarray(patch)
+    if patch.ndim != 3 or patch.shape[-1] < 3 or min(patch.shape[:2]) < 3:
+        return 0.0
+    return negpy_core.loupe_acutance(np.ascontiguousarray(patch, dtype=np.float32))
+
+
+def density_histogram(normalized_log: np.ndarray, roi: Optional[Tuple[int, int, int, int]] = None) -> np.ndarray:
+    """(4, DENSITY_HIST_BINS) [R, G, B, L] val-domain occupancy; out-of-range mass lands in
+    the edge bins. `roi` is the crop rect (y1, y2, x1, x2) in the same frame as `normalized_log`."""
+    crop = _sample_crop(normalized_log.shape, roi)
+    if crop is None:
+        return np.zeros((4, DENSITY_HIST_BINS))
+    return negpy_core.density_histogram(np.ascontiguousarray(normalized_log, dtype=np.float32), *crop)
+
+
+def scan_density_axis(density: Any) -> Any:
+    """Scan density -> 0..1 up the scan parade, SCAN_DENSITY_RANGE's dense end at 0 (unclipped)."""
+    lo, hi = SCAN_DENSITY_RANGE
+    return (hi - np.asarray(density, dtype=np.float64)) / (hi - lo)
+
+
+def scan_density_of_val(val: Any, bounds: Any) -> np.ndarray:
+    """Per-channel scan density of a normalized val triplet: the stretch inverted with its bounds."""
+    floors = np.asarray(bounds.floors, dtype=np.float64)[:3]
+    ceils = np.asarray(bounds.ceils, dtype=np.float64)[:3]
+    return -(floors + np.asarray(val, dtype=np.float64)[:3] * (ceils - floors))
+
+
+def _sample_crop(shape: Tuple[int, ...], roi: Optional[Tuple[int, int, int, int]]) -> Optional[Tuple[Tuple[int, int, int, int], int]]:
+    """The crop (y1, y2, x1, x2) as numpy slicing clamps it, and the stride that keeps it near
+    _MAX_HIST_SAMPLES samples; None for an empty crop."""
+    h, w = shape[:2]
+    y1, y2, x1, x2 = roi if roi is not None else (0, h, 0, w)
+    y1, y2, _ = slice(y1, y2).indices(h)
+    x1, x2, _ = slice(x1, x2).indices(w)
+    if y2 <= y1 or x2 <= x1:
+        return None
+    return (y1, y2, x1, x2), _frame_step((y2 - y1, x2 - x1), _MAX_HIST_SAMPLES)
+
+
+def density_parade(img_log: Any, roi: Optional[Tuple[int, int, int, int]] = None) -> Optional[np.ndarray]:
+    """(3, WAVEFORM_BINS, WAVEFORM_COLS) counts of each channel's scan density (-log10 of the
+    linear scan, after any crosstalk unmix: the log the stretch reads) per image column of the
+    crop, on SCAN_DENSITY_RANGE; out-of-range mass lands in the edge bins. CPU counterpart of the
+    parade in density_hist.wgsl."""
+    if img_log is None:
+        return None
+    img = np.asarray(img_log)
+    if img.ndim != 3 or img.shape[-1] < 3:
+        return None
+    crop = _sample_crop(img.shape, roi)
+    if crop is None:
+        return None
+    return negpy_core.density_parade(np.ascontiguousarray(img, dtype=np.float32), *crop)
+
+
+def scan_full_scale_columns(image: Any, roi: Optional[Tuple[int, int, int, int]] = None) -> Optional[np.ndarray]:
+    """(3, WAVEFORM_COLS) counts of linear scan pixels at or above the sensor clip level, per
+    parade column. Read before the crosstalk unmix, which can move a clipped channel off full
+    scale on the parade. CPU counterpart of the clip count in density_hist.wgsl."""
+    from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+
+    if image is None:
+        return None
+    img = np.asarray(image)
+    if img.ndim != 3 or img.shape[-1] < 3:
+        return None
+    crop = _sample_crop(img.shape, roi)
+    if crop is None:
+        return None
+    level = float(EXPOSURE_CONSTANTS["scan_clip_level"])
+    return negpy_core.scan_full_scale_columns(np.ascontiguousarray(img, dtype=np.float32), *crop, level)

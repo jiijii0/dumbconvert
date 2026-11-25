@@ -1,0 +1,104 @@
+"""The meter's percentile and log-density shortcuts must be bit-exact, not close.
+
+Both replace numpy expressions whose exact output is baked into every golden, so these
+assert `==`, never approx.
+"""
+
+import unittest
+
+import numpy as np
+
+from negpy.features.exposure.normalization import (
+    analyze_log_exposure_bounds_from_log,
+    percentile_from_sorted,
+    prefilter_log_grid,
+    sorted_channel_grid,
+    to_log_density,
+)
+
+_QS = [0.0, 1e-5, 0.05, 0.35, 1.0, 2.5, 10.0, 33.3333, 49.999, 50.0, 66.6, 90.0, 99.65, 99.99999, 100.0]
+
+
+def _grid(shape, seed=0, scale=1.0):
+    return ((np.random.default_rng(seed).random(shape).astype(np.float32) - 0.5) * scale).copy()
+
+
+class TestPercentileFromSorted(unittest.TestCase):
+    def test_matches_numpy_for_python_and_numpy_quantiles(self):
+        """numpy interpolates in float32 for a plain float q and float64 for np.float64;
+        both kinds of caller exist in the meters, so both must land on the same bits."""
+        for shape in ((533, 800, 3), (37, 41, 3), (2, 3, 3), (1, 1, 3), (4, 4, 3)):
+            for scale in (1.0, 1e-3, 1e3):
+                g = _grid(shape, scale=scale)
+                srt = sorted_channel_grid(g)
+                for q in _QS:
+                    for qq in (q, np.float64(q)):
+                        got = percentile_from_sorted(srt, qq)
+                        for ch in range(3):
+                            self.assertEqual(
+                                float(np.percentile(g[:, :, ch], qq)),
+                                float(got[ch]),
+                                msg=f"shape={shape} scale={scale} q={q!r} ({type(qq).__name__}) ch={ch}",
+                            )
+
+
+class TestSortedGridMeters(unittest.TestCase):
+    def test_bounds_identical_with_and_without_the_sort(self):
+        g = prefilter_log_grid(np.clip(_grid((600, 900, 3), seed=3, scale=0.4) + 0.5, 1e-4, 1.0), None, 0.0)
+        srt = sorted_channel_grid(g)
+        for luma_clip in (-0.5, 0.0, 0.35, 2.5):
+            for color_clip in (0.0, 0.35, 5.0):
+                slow = analyze_log_exposure_bounds_from_log(g, None, 0.0, percentile_clip=luma_clip, color_clip=color_clip)
+                fast = analyze_log_exposure_bounds_from_log(g, None, 0.0, percentile_clip=luma_clip, color_clip=color_clip, sorted_grid=srt)
+                self.assertEqual(slow.floors, fast.floors)
+                self.assertEqual(slow.ceils, fast.ceils)
+
+    def test_sorted_grid_is_ignored_when_a_roi_still_has_to_be_applied(self):
+        """The sort describes the whole grid, so a caller that still crops must not use it."""
+        g = prefilter_log_grid(np.clip(_grid((600, 900, 3), seed=4, scale=0.4) + 0.5, 1e-4, 1.0), None, 0.0)
+        roi = (10, 300, 20, 400)
+        wrong = sorted_channel_grid(g)
+        slow = analyze_log_exposure_bounds_from_log(g, roi, 0.0, percentile_clip=0.35, color_clip=0.35)
+        fast = analyze_log_exposure_bounds_from_log(g, roi, 0.0, percentile_clip=0.35, color_clip=0.35, sorted_grid=wrong)
+        self.assertEqual((slow.floors, slow.ceils), (fast.floors, fast.ceils))
+
+
+class TestToLogDensity(unittest.TestCase):
+    def test_is_the_correctly_rounded_log_of_the_clamped_value(self):
+        eps = 1e-6
+        x = (np.random.default_rng(1).random((97, 89, 3)) * 1.4 - 0.2).astype(np.float32)
+        x[:8, :8] = np.array([np.nan, np.inf, -np.inf, 0.0, 1.0, eps, -5.0, 1e30], dtype=np.float32)[:, None, None]
+        clamped = np.clip(np.nan_to_num(x, nan=eps, posinf=1.0, neginf=eps), np.float32(eps), 1.0)
+        expected = np.log10(clamped.astype(np.float64)).astype(np.float32)
+        got = to_log_density(x)
+        self.assertEqual(got.dtype, np.float32)
+        self.assertTrue(np.array_equal(expected, got))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestBorderlessLayoutEarlyOut(unittest.TestCase):
+    """A borderless layout must return exactly what the padded path built."""
+
+    def test_no_border_returns_the_scaled_content_itself(self):
+        from negpy.domain.models import AspectRatio, ExportConfig, ExportResolutionMode
+        from negpy.services.export.print import PrintService
+
+        img = _grid((120, 180, 3), seed=7, scale=0.5) + 0.5
+        export = ExportConfig(export_resolution_mode=ExportResolutionMode.ORIGINAL, paper_aspect_ratio=AspectRatio.ORIGINAL)
+        out, rect = PrintService.apply_layout(img, export, border_size=0.0)
+        self.assertEqual(rect, (0, 0, 180, 120))
+        self.assertTrue(np.array_equal(out, img))
+
+    def test_a_border_still_pads(self):
+        from negpy.domain.models import AspectRatio, ExportConfig, ExportResolutionMode
+        from negpy.services.export.print import PrintService
+
+        img = _grid((120, 180, 3), seed=7, scale=0.5) + 0.5
+        export = ExportConfig(export_resolution_mode=ExportResolutionMode.ORIGINAL, paper_aspect_ratio=AspectRatio.ORIGINAL)
+        out, (ox, oy, w, h) = PrintService.apply_layout(img, export, border_size=1.0, border_color="#000000")
+        self.assertGreater(out.shape[0], img.shape[0])
+        self.assertGreater(out.shape[1], img.shape[1])
+        self.assertTrue(np.array_equal(out[oy : oy + h, ox : ox + w], img))

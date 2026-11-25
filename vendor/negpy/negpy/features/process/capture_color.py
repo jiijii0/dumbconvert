@@ -1,0 +1,186 @@
+"""
+Capture colorimetry: the camera's own color matrix.
+
+RAW is decoded `output_color=raw` (sensor-native RGB), so a buffer arriving in the
+pipeline is in the camera's primaries, not the working space. The print path never
+needed the distinction — it derives color from measured film density and a paper
+model — but a transparency transfer does: without this matrix a slide renders in
+sensor primaries and no raw converter agrees with it.
+
+The construction follows dcraw/libraw `cam_xyz_coeff`: build the *working->cam*
+matrix, row-normalize it so each camera channel answers 1 to a neutral, and only
+then invert. The white balance owns the grey point, not this matrix.
+
+The order matters, and reversing it is not a subtle error. Normalizing the rows of
+the already-inverted matrix also sends neutral to neutral -- so greys, and any
+near-neutral frame, look right either way -- but it is a different transform for
+everything else, and the error grows with saturation. Measured against libraw's own
+cam->sRGB on a saturated sunset it doubled both R/G and B/G, which renders as a
+magenta cast that reads like wildly excessive saturation.
+"""
+
+from typing import Optional, Sequence, Tuple
+
+import negpy_core
+import numpy as np
+
+# Adobe RGB (1998) D65, the working space (see infrastructure.display.color_spaces).
+_XYZ_TO_WORKING = np.array(
+    [
+        [2.0413690, -0.5649464, -0.3446944],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0134474, -0.1183897, 1.0154096],
+    ],
+    dtype=np.float64,
+)
+_WORKING_TO_XYZ = np.linalg.inv(_XYZ_TO_WORKING)
+
+
+def _primaries(cam_xyz: Optional[Sequence[Sequence[float]]]) -> Optional[np.ndarray]:
+    """The float64 working-from-camera primaries mix without the white-balance fold, or None."""
+    if cam_xyz is None:
+        return None
+    m = np.asarray(cam_xyz, dtype=np.float64)
+    if m.ndim != 2 or m.shape[1] != 3 or m.shape[0] < 3:
+        return None
+    m = m[:3, :]
+    if not np.all(np.isfinite(m)) or abs(float(np.linalg.det(m))) < 1e-9:
+        return None
+
+    # Normalize the forward (working to cam) rows, then invert, which is dcraw's order. The
+    # other way round distorts every non-neutral color; see the module docstring.
+    forward = m @ _WORKING_TO_XYZ
+    sums = forward.sum(axis=1, keepdims=True)
+    if not np.all(np.isfinite(sums)) or np.any(np.abs(sums) < 1e-9):
+        return None
+    out = np.linalg.pinv(forward / sums)
+    if not np.all(np.isfinite(out)):
+        return None
+    return out
+
+
+def _wb_gains(camera_wb: Optional[Sequence[float]]) -> Optional[np.ndarray]:
+    """The as-shot multipliers normalized to green, or None when they are missing or invalid.
+    Green is libraw's own scaling reference, so only the channel ratios apply and exposure stays."""
+    if camera_wb is None:
+        return None
+    wb = np.asarray(camera_wb, dtype=np.float64).reshape(-1)[:3]
+    if wb.shape[0] == 3 and np.all(np.isfinite(wb)) and float(wb.min()) > 0.0 and float(wb[1]) > 0.0:
+        return wb / wb[1]
+    return None
+
+
+def camera_to_working_matrix(
+    cam_xyz: Optional[Sequence[Sequence[float]]],
+    camera_wb: Optional[Sequence[float]] = None,
+) -> Optional[np.ndarray]:
+    """
+    Working-space-from-camera 3x3 for a camera's XYZ->cam matrix (libraw's
+    `rgb_xyz_matrix`, whose 4th row is the unused CMYG slot).
+
+    `camera_wb` folds the as-shot multipliers in, for buffers decoded WITHOUT white
+    balance (Linear RAW). The row normalization below makes this matrix assume a
+    neutral camera signal, so an unbalanced one renders with a heavy cast — a typical
+    2:1 raw green-to-red ratio is a green frame, not a subtle shift. Folding the
+    multipliers in reconstructs the signal the matrix expects, which makes the render
+    independent of how the buffer was decoded. Pass None when white balance was applied
+    at decode.
+
+    None when no matrix is available (a scanner TIFF, a JPEG) or when it is
+    singular/degenerate — the caller then treats the buffer as already in the
+    working space, which is the correct reading for a profiled source.
+    """
+    out = _primaries(cam_xyz)
+    if out is None:
+        return None
+    gains = _wb_gains(camera_wb)
+    if gains is not None:
+        out = out @ np.diag(gains)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def camera_matrix_parts(
+    cam_xyz: Optional[Sequence[Sequence[float]]],
+    camera_wb: Optional[Sequence[float]] = None,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """(gains, primaries): `camera_to_working_matrix` split at the white-balance fold, so that
+    matrix is `primaries @ gains`. `gains` is the diagonal fold, None without one; `primaries`
+    mixes the channels and keeps a neutral neutral. Both None when there is no matrix."""
+    out = _primaries(cam_xyz)
+    if out is None:
+        return None, None
+    gains = _wb_gains(camera_wb)
+    return (
+        None if gains is None else np.ascontiguousarray(np.diag(gains), dtype=np.float32),
+        np.ascontiguousarray(out, dtype=np.float32),
+    )
+
+
+def wb_only_cam_xyz(cam_xyz: Optional[Sequence[Sequence[float]]]) -> Optional[list]:
+    """A stand-in `cam_xyz` for a profiled source (a custom Input ICC in play): the
+    decode still skips the as-shot white balance and relies on `camera_to_working_matrix`
+    to fold it back in, but the ICC supplies its own primaries rotation, so the camera's
+    own must come out as identity. `_XYZ_TO_WORKING` sent through that function's own
+    forward/normalize/invert steps yields exactly identity, leaving only the fold. None
+    when there is no matrix to begin with — nothing to fold WB into.
+    """
+    if cam_xyz is None:
+        return None
+    return _XYZ_TO_WORKING.tolist()
+
+
+class SourcePrimaries(tuple):
+    """The `cam_xyz` rows of a Positive source decoded in its own primaries. The type marks it, so
+    it never reads as a camera's; a copy that rebuilds it as a list loses the mark."""
+
+
+def source_cam_xyz(to_working: Optional[np.ndarray]) -> Optional[SourcePrimaries]:
+    """The `cam_xyz` of a Positive source decoded in its own primaries: the one that
+    `camera_to_working_matrix` turns into *to_working*, the profile's source-to-working 3x3. The
+    engines apply it like a camera's, so the density stage can act on the source channels first."""
+    if to_working is None:
+        return None
+    rows = np.linalg.inv(np.asarray(to_working, dtype=np.float64)) @ _XYZ_TO_WORKING
+    return SourcePrimaries(tuple(float(v) for v in row) for row in rows)
+
+
+def is_source_profile(cam_xyz: Optional[Sequence[Sequence[float]]]) -> bool:
+    """True when *cam_xyz* came from a source profile (`source_cam_xyz`), not from a camera."""
+    return isinstance(cam_xyz, SourcePrimaries)
+
+
+def apply_camera_matrix(img: np.ndarray, matrix: Optional[np.ndarray]) -> np.ndarray:
+    """
+    Camera primaries -> working space. A None matrix passes the buffer through.
+
+    Negatives are kept: they are real out-of-gamut colors, and clipping here
+    would bake a hue shift into the transfer before any tone curve sees it.
+    """
+    if matrix is None:
+        return img
+    return negpy_core.matmul_3x3(np.ascontiguousarray(img, dtype=np.float32), np.asarray(matrix, dtype=np.float32))
+
+
+# Percentile of the whole frame taken as the light, and where it lands in the working
+# space. The high percentile, not the maximum, so a specular or a hot pixel does not set
+# the level.
+_LIGHTBOX_PCT = 99.5
+_LIGHTBOX_TARGET = 0.95
+
+
+def lightbox_level(img: np.ndarray, matrix: Optional[np.ndarray]) -> Optional[float]:
+    """Scalar gain that puts the frame's brightest tone on the display.
+
+    A raw decode has no auto-brightness, so a dense scan reads as a flat dark frame. Scalar,
+    not per-channel: a per-channel reference neutralizes whatever it lands on, which on a scan
+    with no bare light around the rebate is the film base, and that renders an orange mask
+    olive. ``img`` is the whole frame before ``matrix`` and before any crop, so framing does
+    not move the reference. None when there is no signal.
+    """
+    flat = np.ascontiguousarray(img, dtype=np.float32).reshape(-1, 1, 3)
+    step = max(1, flat.shape[0] // 200_000)
+    m = None if matrix is None else np.asarray(matrix, dtype=np.float64).reshape(3, 3).tolist()
+    white = negpy_core.lightbox_white(flat, step, m, _LIGHTBOX_PCT)
+    if not np.isfinite(white) or white <= 1e-6:
+        return None
+    return _LIGHTBOX_TARGET / white

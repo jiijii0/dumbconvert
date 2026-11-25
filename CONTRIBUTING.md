@@ -9,7 +9,7 @@ whether it fits (use the "Idea" form in Issues).
 Needs Python 3.13+ and Rust (`brew install rust` on a Mac, [rustup](https://rustup.rs) elsewhere).
 
 ```sh
-git clone --recurse-submodules https://github.com/jiijii0/dumbconvert.git
+git clone https://github.com/jiijii0/dumbconvert.git
 cd dumbconvert
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
@@ -17,6 +17,10 @@ python3 -m venv .venv
 .venv/bin/pip install --no-deps -e ./vendor/negpy
 ./run.command
 ```
+
+`run.command` starts the app on a Mac. On Linux, start it with `.venv/bin/python -m simpleneg`.
+On Windows, use `.venv\Scripts\` wherever these steps say `.venv/bin/`, and start the app with
+`.venv\Scripts\python -m simpleneg`.
 
 ## Before you open a pull request
 
@@ -42,8 +46,9 @@ The same tests run automatically on macOS, Windows and Linux for every pull requ
   `tests/golden/colours.json`. If your change is *meant* to change colours, update the reference
   (`DUMBCONVERT_UPDATE_GOLDEN=1` in front of the test command) and explain why in the pull request,
   with a before / after of a real scan.
-- **Leave NegPy alone.** `vendor/negpy` is NegPy, unmodified, as a git submodule. A bug in the
-  conversion engine itself belongs in [NegPy](https://github.com/marcinz606/NegPy).
+- **NegPy is part of this repository.** `vendor/negpy` is a copy of [NegPy](https://github.com/marcinz606/NegPy)
+  with a few changes of DumbConvert's own. Fix a conversion bug where it is, NegPy included, and keep
+  the change as small as the fix.
 - **No scans or sample packs in the repository**, not even small ones. Use `tests/support.py` to make
   what a test needs.
 - **AI help is fine**, as long as you have read the change, tested it, and can explain it.

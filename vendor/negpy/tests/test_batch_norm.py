@@ -1,0 +1,144 @@
+import unittest
+import numpy as np
+from dataclasses import replace
+from negpy.domain.models import WorkspaceConfig
+from negpy.features.exposure.normalization import analyze_log_exposure_bounds
+from negpy.features.exposure.processor import NormalizationProcessor, PhotometricProcessor
+from negpy.domain.interfaces import PipelineContext
+from negpy.features.process.models import ProcessMode
+
+
+class TestBatchNormalization(unittest.TestCase):
+    def setUp(self):
+        self.config = WorkspaceConfig()
+        self.context = PipelineContext(scale_factor=1.0, original_size=(100, 100), process_mode=ProcessMode.C41)
+
+    def test_normalization_processor_uses_locked_values(self):
+        """
+        Verify that NormalizationProcessor ignores local analysis when both roll averages are ON.
+        """
+        # Set specific locked values
+        locked_floors = (-0.5, -0.5, -0.5)
+        locked_ceils = (-0.1, -0.1, -0.1)
+
+        new_process = replace(
+            self.config.process,
+            use_luma_average=True,
+            use_color_average=True,
+            locked_floors=locked_floors,
+            locked_ceils=locked_ceils,
+        )
+        processor = NormalizationProcessor(new_process)
+
+        img_val = 10**-0.3
+        img = np.full((10, 10, 3), img_val, dtype=np.float32)
+
+        res = processor.process(img, self.context)
+        self.assertAlmostEqual(res[0, 0, 0], 0.5, places=5)
+
+    def test_white_black_point_offsets(self):
+        img_val = 10**-0.5
+        img = np.full((10, 10, 3), img_val, dtype=np.float32)
+
+        p_neutral = replace(self.config.process, local_floors=(-0.8, -0.8, -0.8), local_ceils=(-0.2, -0.2, -0.2))
+        res_neutral = NormalizationProcessor(p_neutral).process(img, self.context)
+
+        self.assertAlmostEqual(float(np.mean(res_neutral)), 0.5, places=5)
+
+        p_wp = replace(p_neutral, white_point_offset=0.1)
+        res_wp = NormalizationProcessor(p_wp).process(img, self.context)
+
+        self.assertLess(float(np.mean(res_wp)), float(np.mean(res_neutral)))
+
+    def _neutral_process(self):
+        return replace(self.config.process, local_floors=(-0.8, -0.8, -0.8), local_ceils=(-0.2, -0.2, -0.2))
+
+    def test_white_point_trim_moves_channel_only(self):
+        img = np.full((10, 10, 3), 10**-0.5, dtype=np.float32)
+        p_neutral = self._neutral_process()
+        res_neutral = NormalizationProcessor(p_neutral).process(img, self.context)
+
+        p_trim = replace(p_neutral, white_point_trim_red=0.1)
+        res_trim = NormalizationProcessor(p_trim).process(img, self.context)
+
+        self.assertLess(float(np.mean(res_trim[..., 0])), float(np.mean(res_neutral[..., 0])))
+        np.testing.assert_allclose(res_trim[..., 1:], res_neutral[..., 1:], atol=1e-7)
+
+    def test_black_point_trim_moves_channel_only(self):
+        img = np.full((10, 10, 3), 10**-0.5, dtype=np.float32)
+        p_neutral = self._neutral_process()
+        res_neutral = NormalizationProcessor(p_neutral).process(img, self.context)
+
+        p_trim = replace(p_neutral, black_point_trim_blue=0.1)
+        res_trim = NormalizationProcessor(p_trim).process(img, self.context)
+
+        # Raising the ceil widens the span -> the blue value drops.
+        self.assertLess(float(np.mean(res_trim[..., 2])), float(np.mean(res_neutral[..., 2])))
+        np.testing.assert_allclose(res_trim[..., :2], res_neutral[..., :2], atol=1e-7)
+
+    def test_trim_stacks_with_global_offset(self):
+        img = np.full((10, 10, 3), 10**-0.5, dtype=np.float32)
+        p_combined = replace(self._neutral_process(), white_point_offset=0.05, white_point_trim_red=0.05)
+        p_equivalent = replace(self._neutral_process(), white_point_trim_red=0.1)
+        res_a = NormalizationProcessor(p_combined).process(img, self.context)
+        res_b = NormalizationProcessor(p_equivalent).process(img, self.context)
+        np.testing.assert_allclose(res_a[..., 0], res_b[..., 0], atol=1e-7)
+
+    def test_a_slide_negates_trims(self):
+        from negpy.features.process.models import per_channel_point_offsets
+        from negpy.features.transparency.logic import transfer_point_offsets
+
+        p_trim = replace(self._neutral_process(), process_mode=ProcessMode.E6, white_point_trim_red=0.1, black_point_trim_blue=0.05)
+        wp3, bp3 = per_channel_point_offsets(p_trim)
+        self.assertEqual(transfer_point_offsets(p_trim), (tuple(-v for v in wp3), tuple(-v for v in bp3)))
+        self.assertGreater(wp3[0], 0.0)
+
+    def test_photometric_processor_is_independent_of_roll_average(self):
+        """
+        Verify that PhotometricProcessor no longer applies extra shifts in roll average mode.
+        """
+        user_shifts = (0.05, 0.05)
+
+        new_exposure = replace(
+            self.config.exposure,
+            wb_magenta=user_shifts[0],
+            wb_yellow=user_shifts[1],
+        )
+
+        processor = PhotometricProcessor(new_exposure)
+
+        img = np.full((10, 10, 3), 0.5, dtype=np.float32)
+        res_batch = processor.process(img, self.context)
+
+        processor_manual = PhotometricProcessor(new_exposure)
+        res_manual = processor_manual.process(img, self.context)
+
+        np.testing.assert_array_almost_equal(res_batch, res_manual)
+
+
+class TestAnalyzeBoundsROI(unittest.TestCase):
+    """
+    Black borders surrounding a negative skew percentile-based bounds.
+    Passing the ROI of the negative area must remove that skew.
+    """
+
+    def test_roi_excludes_border_pixels(self):
+        # Image where the inner 50x50 region has C41-ish negative density
+        # (low log10 values, e.g. ~10^-1) and the outer border is near-black (~10^-5)
+        h, w = 200, 200
+        img = np.full((h, w, 3), 1e-5, dtype=np.float32)
+        roi_val = 10**-0.5
+        img[75:125, 75:125, :] = roi_val
+
+        no_roi = analyze_log_exposure_bounds(img, percentile_clip=0.5)
+        with_roi = analyze_log_exposure_bounds(img, roi=(75, 125, 75, 125), percentile_clip=0.5)
+
+        # Without ROI the borders pull the floors very low (near -5)
+        # With ROI the floors hug the negative density (near -0.5)
+        for ch in range(3):
+            self.assertLess(no_roi.floors[ch], -3.0)
+            self.assertGreater(with_roi.floors[ch], -1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

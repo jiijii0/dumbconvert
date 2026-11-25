@@ -13,12 +13,17 @@ How it fits together:
 """
 
 import json
+import sys
 from dataclasses import dataclass
 
 from PySide6.QtCore import QRectF, QSettings, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QSizePolicy,
                                QVBoxLayout, QWidget)
+
+# The command key and the Return key as this system names them, for anything shown to the user.
+MOD = "Cmd" if sys.platform == "darwin" else "Ctrl"
+RETURN = "Return" if sys.platform == "darwin" else "Enter"
 
 
 @dataclass(frozen=True)
@@ -75,12 +80,16 @@ ACTIONS = [
     Action("crop", "Edit crop / apply crop", "Crop", "geometry"),
     Action("heal", "Heal dust: click specks (H again to finish)", "Heal", "geometry"),
     Action("heal_area", "Clean area: draw around dust or scratches (A again to finish)", "Area", "geometry"),
-    Action("zoom", "Zoom: fit ↔ 100% (also click, pinch or Cmd+scroll)", "Zoom", "view"),
+    Action("zoom", f"Zoom: fit ↔ 100% (also click, pinch or {MOD}+scroll)", "Zoom", "view"),
     Action("fullscreen", "Full screen: only the photo (again, or Esc, to leave)", "Full", "view"),
     Action("auto_crop", "Auto crop on / off", "A.Crop", "geometry"),
+    Action("auto_crop_refresh", "Auto crop: find the picture edges again", "Re-crop", "geometry"),
     Action("before", "Before (hold): the automatic conversion", "Before", "view", hold=True),
+    Action("border", "White border on / off", "Border", "view"),
+    Action("original", "Original scan (before conversion) on / off", "Orig.", "view"),
     Action("copy", "Copy settings", "Copy", "other"),
     Action("paste", "Paste settings to selected frames", "Paste", "other"),
+    Action("sync_roll", "Sync Roll: send this frame's edits to the whole group", "Sync", "other"),
     Action("undo", "Undo", "Undo", "other", repeat=True),
     Action("redo", "Redo", "Redo", "other", repeat=True),
     Action("export", "Export…", "Export", "other"),
@@ -92,7 +101,7 @@ ACTION_BY_ID = {a.id: a for a in ACTIONS}
 GROUP_NAMES = {"frames": "Frames", "density": "Density", "cyan": "Colour", "magenta": "Colour",
                "yellow": "Colour", "tone": "Tone", "geometry": "Geometry", "view": "View", "other": "Other"}
 GROUP_COLORS = {"frames": "#1b8796", "density": "#77797f", "cyan": "#1c8fc0", "magenta": "#c4196a",
-                "yellow": "#d9c400", "tone": "#5b5e66", "geometry": "#2f8f5b", "view": "#7a52b8",
+                "yellow": "#d9c400", "tone": "#5b5e66", "geometry": "#2f8f5b", "view": "#6b7d8f",
                 "other": "#4a4c52"}
 
 # The six corrections sit under the left hand and never make it move: hold one of them and press
@@ -101,7 +110,7 @@ GROUP_COLORS = {"frames": "#1b8796", "density": "#77797f", "cyan": "#1c8fc0", "m
 #     Q  W  E        Density · Contrast · Saturation        (hold, then up / down)
 #     A  S  D        Cyan · Magenta · Yellow                (hold, then up / down)
 #     Z  X  C  V  B  N  M      zoom · crop · auto crop · level · before (hold) · pick neutral · mirror
-#     F full screen · J rotate left · K auto WB · L rotate right · U heal · I clean area · P sheet
+#     R auto crop again · Y sync roll · O white border · T original scan · F full screen · J rotate left · K auto WB · L rotate right · U heal · I clean area · P sheet
 #
 # The one-step actions (cyan_up, ...) still exist; they are just not on a key by default.
 DEFAULT_BINDINGS = {
@@ -110,15 +119,16 @@ DEFAULT_BINDINGS = {
     "Q": "adjust_density", "W": "adjust_contrast", "E": "adjust_saturation",
     "A": "adjust_cyan", "S": "adjust_magenta", "D": "adjust_yellow",
     "Z": "zoom", "X": "crop", "C": "auto_crop", "V": "auto_straighten", "B": "before", "N": "pick_wb", "M": "mirror",
-    "F": "fullscreen", "J": "rotate_left", "K": "auto_wb", "L": "rotate_right",
+    "R": "auto_crop_refresh", "Y": "sync_roll", "O": "border", "T": "original", "F": "fullscreen", "J": "rotate_left", "K": "auto_wb", "L": "rotate_right",
     "U": "heal", "I": "heal_area", "P": "contact_sheet",
     ",": "tilt_left", ".": "tilt_right", "0": "auto_wb", "Backspace": "reset", "F1": "keys",
 }
 
-# Always the same, so they are not on the drawing's menu (Cmd is shown as Ctrl in Qt on a Mac).
-FIXED = [("Cmd+Z / Cmd+Shift+Z", "Undo / redo"), ("Cmd+C / Cmd+V", "Copy settings / paste to selected"),
-         ("Cmd+A", "Select every frame (then any correction changes them all)"),
-         ("Cmd+E", "Export…"), ("Esc", "Leave a text field, cancel the crop, leave full screen")]
+# Always the same, so they are not on the drawing's menu.
+FIXED = [(f"{MOD}+Z / {MOD}+Shift+Z", "Undo / redo"), (f"{MOD}+C / {MOD}+V", "Copy settings / paste to selected"),
+         (f"{MOD}+A", "Select every frame (then any correction changes them all)"),
+         (f"{MOD}+E", "Export…"), (f"{MOD}+S", "Save this session (offered back at the next start)"),
+         ("Esc", "Leave a text field, cancel the crop, leave full screen")]
 
 # The drawing: rows of (label on the cap, key name or None if it can't be bound, width in key units)
 _F = [("esc", None, 1.5)] + [(f"F{i}", f"F{i}", 1.125) for i in range(1, 13)]
@@ -136,7 +146,7 @@ MODIFIERS = {Qt.Key_Shift, Qt.Key_Control, Qt.Key_Meta, Qt.Key_Alt, Qt.Key_AltGr
              Qt.Key_Tab, Qt.Key_Escape, Qt.Key_unknown}
 
 
-NEW_ACTIONS: set = set()           # actions added after v4 layouts were saved (see load)
+NEW_ACTIONS: set = {"auto_crop_refresh", "sync_roll", "border", "original"}   # actions added after v4 layouts were saved (see load)
 SETTINGS_KEY = "key_bindings_v4"   # v4: the corrections on Q W E / A S D, held (older saved layouts are not reused)
 
 
@@ -241,7 +251,7 @@ class KeyboardView(QWidget):
             p.drawText(rect.adjusted(unit * 0.11, unit * 0.07, 0, 0), Qt.AlignLeft | Qt.AlignTop, label)
             if action and rect.height() > unit * 0.45:
                 p.setFont(big)
-                p.setPen(QColor("#000000" if selected else "#e8e6e3"))
+                p.setPen(QColor("#000000" if selected else "#bdbdc1"))
                 p.drawText(rect.adjusted(2, unit * 0.16, -2, 0), Qt.AlignCenter, action.short)
         p.end()
 

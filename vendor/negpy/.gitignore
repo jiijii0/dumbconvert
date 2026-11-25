@@ -1,0 +1,48 @@
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.python-version
+.vscode
+.coverage
+
+
+# Electron & Packaging
+node_modules/
+dist/
+build/
+desktop/bin/
+*.spec
+.DS_Store
+build.log
+appimagetool-x86_64.AppImage
+
+# user settings
+user/
+debug/
+# per-developer make settings (NEGPY_USER_DIR, ...), and the copies made while editing it
+.env.local*
+
+# Virtual Environment
+venv/
+.venv
+*.egg-info/
+
+__pycache__
+VERSION
+# metrics artifacts
+metrics.json
+# llm stuff
+plans/
+.superpowers/
+*superpowers
+.serena/
+.claude/*
+!.claude/skills/
+
+# debug stuff
+samples/
+
+# nix build output symlink
+result
+result-*

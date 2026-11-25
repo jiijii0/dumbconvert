@@ -1,0 +1,390 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+from negpy.services.rendering.gpu_engine import GPUEngine, TILING_THRESHOLD_PX
+from negpy.domain.models import WorkspaceConfig
+from negpy.infrastructure.gpu.device import GPUDevice
+
+
+class TestGPUEngine(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.gpu = GPUDevice.get()
+        if cls.gpu.is_available:
+            cls.engine = GPUEngine()
+        else:
+            cls.engine = None
+
+    def setUp(self):
+        if self.engine is None:
+            self.skipTest("GPU not available")
+
+    def test_gpu_process_smoke(self):
+        """Basic GPU processing smoke test."""
+        img = np.random.rand(100, 100, 3).astype(np.float32)
+        settings = WorkspaceConfig()
+
+        res, metrics = self.engine.process(img, settings)
+
+        self.assertEqual(res.ndim, 3)
+        self.assertEqual(res.shape[2], 3)
+        self.assertIn("active_roi", metrics)
+        self.assertIn("histogram_raw", metrics)
+        self.assertEqual(metrics["histogram_raw"].shape, (4, 256))
+
+    def test_gpu_metrics_export_cast_refs(self):
+        """The chart re-solves the render's cast curves from metrics — the GPU
+        path must export the raw refs like the CPU path does."""
+        rng = np.random.default_rng(3)
+        img = (rng.random((100, 100, 3), dtype=np.float32) * 0.5 + 0.2).astype(np.float32)
+        _, metrics = self.engine.process(img, WorkspaceConfig())
+
+        self.assertIn("neutral_axis_refs", metrics)
+
+    def test_gpu_process_to_texture(self):
+        """Verify process_to_texture returns a GPUTexture."""
+        from negpy.infrastructure.gpu.resources import GPUTexture
+
+        img = np.random.rand(64, 64, 3).astype(np.float32)
+        settings = WorkspaceConfig()
+
+        tex, metrics = self.engine.process_to_texture(img, settings)
+
+        self.assertIsInstance(tex, GPUTexture)
+        self.assertEqual(tex.width, metrics["base_positive"].width)
+
+    def test_gpu_engine_cleanup(self):
+        """Verify cleanup releases resources."""
+        img = np.random.rand(64, 64, 3).astype(np.float32)
+        settings = WorkspaceConfig()
+
+        # Run once to populate cache
+        self.engine.process_to_texture(img, settings)
+        self.assertTrue(len(self.engine._tex_cache) > 0)
+
+        self.engine.cleanup()
+        self.assertEqual(len(self.engine._tex_cache), 0)
+        self.assertIsNone(self.engine._uv_grid_cache)
+
+    def test_cleanup_spares_the_retained_texture(self):
+        """The navigate-back memo keeps the displayed frame across a file switch."""
+        img = np.random.rand(64, 64, 3).astype(np.float32)
+        tex, _ = self.engine.process_to_texture(img, WorkspaceConfig())
+
+        self.engine.cleanup(retain=tex)
+        self.assertIsNotNone(tex.texture, "the memo owns it now")
+        self.assertEqual(len(self.engine._tex_cache), 0, "its pool key goes with it")
+
+        # The next render must not paint over pixels the memo owns.
+        again, _ = self.engine.process_to_texture(img, WorkspaceConfig())
+        self.assertIsNot(again, tex)
+        tex.destroy()
+
+    def test_uv_grid_cached_across_frames(self):
+        """Same geometry -> reused grid object; geometry change -> rebuilt."""
+        from dataclasses import replace
+
+        img = np.random.rand(64, 64, 3).astype(np.float32)
+        settings = WorkspaceConfig()
+
+        _, m1 = self.engine.process_to_texture(img, settings)
+        _, m2 = self.engine.process_to_texture(img, settings)
+        self.assertIs(m2["uv_grid"], m1["uv_grid"])
+
+        rotated = replace(settings, geometry=replace(settings.geometry, rotation=1))
+        _, m3 = self.engine.process_to_texture(img, rotated)
+        self.assertIsNot(m3["uv_grid"], m1["uv_grid"])
+
+    def test_gpu_tiled_processing(self):
+        """Verify tiled processing for large images."""
+        h = w = 100
+        img = np.random.rand(h, w, 3).astype(np.float32)
+        settings = WorkspaceConfig()
+
+        with patch("negpy.services.rendering.gpu_engine.TILING_THRESHOLD_PX", 1):
+            res, metrics = self.engine.process(img, settings)
+
+        # Check if result matches expected aspect ratio or similar
+        self.assertIsNotNone(res)
+        self.assertTrue(res.shape[0] > 0)
+
+    def test_gpu_engine_destroy_all(self):
+        """Verify destroy_all clears persistent resources."""
+        self.engine._init_resources()
+        self.assertTrue(len(self._engine_buffers_count()) > 0)
+
+        self.engine.destroy_all()
+        self.assertEqual(len(self._engine_buffers_count()), 0)
+        self.assertEqual(len(self.engine._pipelines), 0)
+
+    def _engine_buffers_count(self):
+        return self.engine._buffers
+
+    def test_gpu_tiled_crosstalk_matches_untiled(self):
+        """Tiled export metered bounds from the raw image, skipping the crosstalk
+        unmix the untiled/preview path always applies — diverged when Separation > 0."""
+        from negpy.features.process.models import ProcessMode
+        from dataclasses import replace
+
+        h, w = 128, 2200  # spans the TILE_SIZE=2048 boundary
+        rng = np.random.default_rng(2)
+        img = np.empty((h, w, 3), dtype=np.float32)
+        img[..., 0] = rng.random((h, w), dtype=np.float32) * 0.15 + 0.55
+        img[..., 1] = rng.random((h, w), dtype=np.float32) * 0.15 + 0.35
+        img[..., 2] = rng.random((h, w), dtype=np.float32) * 0.15 + 0.15
+
+        base = WorkspaceConfig()
+        settings = replace(
+            base,
+            process=replace(base.process, process_mode=ProcessMode.C41, crosstalk_strength=1.0),
+            export=replace(base.export, export_resolution_mode="original"),
+        )
+
+        res_tiled, _ = self.engine._process_tiled(img, settings, scale_factor=1.0)
+        tex, _ = self.engine.process_to_texture(img, settings, scale_factor=1.0, apply_layout=False)
+        res_direct = self.engine._readback_downsampled(tex)
+
+        self.assertEqual(res_tiled.shape, res_direct.shape)
+        diff = float(np.abs(res_tiled - res_direct).max())
+        self.assertLess(diff, 0.05, "Tiled export ignored Separation (crosstalk) when metering global bounds")
+
+    def test_gpu_tiled_global_meter_stays_lazy_when_unused(self):
+        """Locked bounds + no auto refs/anchor/textural: the meter buffer must not build."""
+        from negpy.features.process.models import ProcessMode
+        from dataclasses import replace
+        from unittest.mock import patch
+        import negpy.services.rendering.gpu_engine as gpu_engine_module
+
+        img = np.random.rand(96, 96, 3).astype(np.float32)
+        base = WorkspaceConfig()
+        settings = replace(
+            base,
+            process=replace(
+                base.process,
+                process_mode=ProcessMode.C41,
+                crosstalk_strength=1.0,
+                lock_bounds=True,
+                locked_floors=(-1.0, -1.0, -1.0),
+                locked_ceils=(-0.2, -0.2, -0.2),
+                use_luma_average=True,
+                use_color_average=True,
+            ),
+            exposure=replace(
+                base.exposure,
+                auto_exposure=False,
+                auto_normalize_contrast=False,
+                cast_removal_strength=0.0,
+            ),
+        )
+
+        # CDF priming already calls prefilter_log_grid once (unrelated); wrap it so
+        # that still works, and assert the meter block under test adds no calls.
+        real_prefilter = gpu_engine_module.prefilter_log_grid
+        with patch.object(gpu_engine_module, "prefilter_log_grid", wraps=real_prefilter) as mock_prefilter:
+            self.engine._process_tiled(img, settings, scale_factor=1.0)
+            self.assertEqual(mock_prefilter.call_count, 1, "Global crosstalk meter built even though nothing needed it")
+
+    def test_gpu_tiled_export_honours_freehand_analysis_rect(self):
+        """Tiled export must meter the drawn analysis_rect, not the centered default."""
+        from negpy.features.process.models import ProcessMode
+        from dataclasses import replace
+
+        h, w = 128, 256
+        img = np.empty((h, w, 3), dtype=np.float32)
+        img[:, : w // 2] = (0.15, 0.05, 0.05)  # left: dark, red-cast
+        img[:, w // 2 :] = (0.85, 0.85, 0.85)  # right: bright, neutral
+
+        base = WorkspaceConfig()
+
+        def _settings(rect):
+            return replace(base, process=replace(base.process, process_mode=ProcessMode.C41, analysis_rect=rect))
+
+        res_left, _ = self.engine._process_tiled(img, _settings((0.0, 0.0, 0.5, 1.0)), scale_factor=1.0)
+        res_right, _ = self.engine._process_tiled(img, _settings((0.5, 0.0, 1.0, 1.0)), scale_factor=1.0)
+
+        diff = float(np.abs(res_left - res_right).max())
+        self.assertGreater(diff, 0.05, "Tiled export ignored freehand analysis_rect — output identical either way")
+
+    def _holder_settings(self, **process):
+        from dataclasses import replace
+
+        base = WorkspaceConfig()
+        return replace(base, process=replace(base.process, analysis_buffer=0.0, **process))
+
+    def test_gpu_meters_the_meter_rect_on_a_frame_with_no_crop(self):
+        """Direct and tiled renders both meter the picture box, as a freehand region over it would."""
+        from tests.test_analysis_region import _PICTURE, _holder_frame
+
+        img = _holder_frame()
+        for run in (lambda s: self.engine.process(img, s), lambda s: self.engine._process_tiled(img, s, scale_factor=1.0)):
+            metered, _ = run(self._holder_settings(meter_rect=_PICTURE))
+            freehand, _ = run(self._holder_settings(analysis_rect=_PICTURE))
+            whole, _ = run(self._holder_settings())
+            np.testing.assert_allclose(metered, freehand, atol=1e-5)
+            self.assertGreater(float(np.abs(metered - whole).max()), 0.05)
+
+    def test_gpu_meter_rect_yields_to_a_crop(self):
+        from dataclasses import replace
+
+        from tests.test_analysis_region import _PICTURE, _holder_frame
+
+        img = _holder_frame()
+        cropped = self._holder_settings(meter_rect=_PICTURE)
+        cropped = replace(cropped, geometry=replace(cropped.geometry, crop_rect=(0.1, 0.1, 0.9, 0.9)))
+        plain = replace(cropped, process=replace(cropped.process, meter_rect=None))
+        np.testing.assert_allclose(self.engine.process(img, cropped)[0], self.engine.process(img, plain)[0], atol=1e-6)
+
+    def test_gpu_tiled_export_stale_auto_flags_are_inert(self):
+        """Every retouch field reaching the engine (direct calls, old sessions) must be an
+        inert no-op, not a crash — detection and repair both live upstream of it now."""
+        from negpy.features.retouch.models import RetouchConfig
+        from dataclasses import replace
+
+        img = np.random.rand(96, 96, 3).astype(np.float32)
+        settings = replace(
+            WorkspaceConfig(),
+            retouch=RetouchConfig(dust_remove=True, ir_dust_remove=True, manual_heal_strokes=[([[0.5, 0.5]], 60.0, 0.0, 0.0)]),
+        )
+        settings_off = replace(WorkspaceConfig(), retouch=RetouchConfig())
+        res, _ = self.engine._process_tiled(img, settings, scale_factor=1.0)
+        res_off, _ = self.engine._process_tiled(img, settings_off, scale_factor=1.0)
+        np.testing.assert_allclose(res, res_off, atol=1e-6)
+
+    def test_histogram_unaffected_by_border(self):
+        """Border pixels must not skew the histogram — metrics are computed on content only."""
+        from dataclasses import replace
+        from negpy.domain.models import ExportConfig
+
+        img = np.random.rand(120, 120, 3).astype(np.float32)
+        base_settings = WorkspaceConfig()
+
+        _, metrics_no_border = self.engine.process(img, base_settings)
+        hist_no_border = metrics_no_border["histogram_raw"].copy()
+
+        black_border_export = ExportConfig()
+        settings_black = replace(base_settings, export=black_border_export)
+        _, metrics_black = self.engine.process(img, settings_black)
+        hist_black = metrics_black["histogram_raw"].copy()
+
+        white_border_export = ExportConfig()
+        settings_white = replace(base_settings, export=white_border_export)
+        _, metrics_white = self.engine.process(img, settings_white)
+        hist_white = metrics_white["histogram_raw"].copy()
+
+        np.testing.assert_array_equal(hist_no_border, hist_black, err_msg="Black border pixels skewed the histogram")
+        np.testing.assert_array_equal(hist_no_border, hist_white, err_msg="White border pixels skewed the histogram")
+
+    def test_readback_after_destroy_returns_zeros(self):
+        """A destroyed texture must answer readbacks with zeros, never touch dead wgpu objects."""
+        from negpy.infrastructure.gpu.resources import GPUTexture
+
+        tex = GPUTexture(16, 16)
+        tex.upload(np.random.rand(16, 16, 4).astype(np.float32))
+        tex.readback_region(0, 0, 1, 1)  # allocate the staging buffer pre-destroy
+        tex.destroy()
+        np.testing.assert_array_equal(tex.readback_region(0, 0, 1, 1), np.zeros((1, 1, 4), dtype=np.float32))
+        np.testing.assert_array_equal(tex.readback(), np.zeros((16, 16, 4), dtype=np.float32))
+
+    def test_concurrent_readback_and_destroy(self):
+        """UI-thread readbacks racing a worker-thread destroy must serialize, not panic.
+
+        Regression: the densitometer's hover readback overlapped the render worker's
+        engine cleanup; destroying the mapped staging buffer aborted the process
+        inside wgpu-native (uncatchable Rust panic)."""
+        import threading
+
+        from negpy.infrastructure.gpu.resources import GPUTexture
+
+        for _ in range(20):
+            tex = GPUTexture(64, 64)
+            tex.upload(np.random.rand(64, 64, 4).astype(np.float32))
+            start = threading.Barrier(2)
+
+            def probe(t=tex, s=start):
+                s.wait()
+                for _ in range(10):
+                    t.readback_region(3, 3, 1, 1)
+
+            def kill(t=tex, s=start):
+                s.wait()
+                t.destroy()
+
+            threads = [threading.Thread(target=probe), threading.Thread(target=kill)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=30)
+            self.assertFalse(any(th.is_alive() for th in threads), "readback/destroy deadlocked")
+
+
+class TestGpuTilingPolicy(unittest.TestCase):
+    def _engine(self, max_texture: int = 8192) -> GPUEngine:
+        engine = GPUEngine.__new__(GPUEngine)
+        engine.gpu = SimpleNamespace(limits={"max_texture_dimension_2d": max_texture})
+        return engine
+
+    def test_complete_texture_chain_has_a_pixel_budget(self):
+        engine = self._engine()
+        settings = WorkspaceConfig()
+        height = 2000
+        under = SimpleNamespace(shape=(height, TILING_THRESHOLD_PX // height, 3))
+        over = SimpleNamespace(shape=(height, TILING_THRESHOLD_PX // height + 1, 3))
+
+        self.assertFalse(engine.requires_tiling(under, settings))
+        self.assertTrue(engine.requires_tiling(over, settings))
+
+    def test_device_dimension_limit_still_applies_after_rotation(self):
+        from dataclasses import replace
+
+        engine = self._engine(max_texture=1024)
+        settings = WorkspaceConfig()
+        rotated = replace(settings, geometry=replace(settings.geometry, rotation=1))
+
+        self.assertTrue(engine.requires_tiling(SimpleNamespace(shape=(900, 1100, 3)), settings))
+        self.assertTrue(engine.requires_tiling(SimpleNamespace(shape=(1100, 900, 3)), rotated))
+
+    def test_configured_texture_cap_triggers_tiling(self):
+        engine = self._engine(max_texture=8192)
+
+        with patch("negpy.services.rendering.gpu_engine.APP_CONFIG.max_texture_size", 1024):
+            self.assertTrue(engine.requires_tiling(SimpleNamespace(shape=(900, 1100, 3)), WorkspaceConfig()))
+
+    def test_export_paper_over_texture_cap_tiles(self):
+        from dataclasses import replace
+
+        engine = self._engine(max_texture=8192)
+        settings = WorkspaceConfig()
+        pixels = replace(settings, export=replace(settings.export, export_resolution_mode="target_px", export_target_long_edge_px=6000))
+        small = SimpleNamespace(shape=(1000, 1500, 3))
+
+        with patch("negpy.services.rendering.gpu_engine.APP_CONFIG.max_texture_size", 4096):
+            self.assertTrue(engine.requires_tiling(small, pixels))
+            self.assertFalse(engine.requires_tiling(small, settings))
+            # A preview paper is capped in its own layout instead.
+            self.assertFalse(engine.requires_tiling(small, pixels, render_size_ref=1600.0))
+
+    def test_releasing_pool_destroys_every_texture_except_retained(self):
+        engine = GPUEngine.__new__(GPUEngine)
+        kept = MagicMock()
+        dropped = MagicMock()
+        engine._tex_cache = {("kept",): kept, ("dropped",): dropped}
+        engine._tex_gen = {("kept",): 1, ("dropped",): 1}
+        engine._bind_group_cache = {("bind",): object()}
+        engine._current_source_hash = "source"
+        engine._last_settings = WorkspaceConfig()
+        engine._local_ev_key = ("map",)
+        engine._mask_tex_key = ("mask",)
+
+        engine._release_texture_pool(retain=kept)
+
+        kept.destroy.assert_not_called()
+        dropped.destroy.assert_called_once()
+        self.assertEqual(engine._tex_cache, {})
+        self.assertEqual(engine._bind_group_cache, {})
+        self.assertIsNone(engine._last_settings)
+
+
+if __name__ == "__main__":
+    unittest.main()

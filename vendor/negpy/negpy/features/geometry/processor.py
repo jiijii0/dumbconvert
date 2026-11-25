@@ -1,0 +1,88 @@
+from negpy.domain.interfaces import PipelineContext
+from negpy.domain.types import ImageBuffer
+from negpy.features.geometry.models import GeometryConfig
+from negpy.kernel.image.logic import apply_geometry_orientation
+from negpy.features.geometry.logic import (
+    apply_fine_rotation,
+    apply_keystone,
+    apply_margin_to_roi,
+    apply_radial_distortion,
+    compute_geometry_crop_rect,
+    get_manual_rect_coords,
+)
+
+
+class GeometryProcessor:
+    """
+    Rotates and detects crop.
+    """
+
+    def __init__(self, config: GeometryConfig):
+        self.config = config
+
+    def process(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
+        img = image
+
+        img = apply_geometry_orientation(img, self.config.rotation, self.config.flip_horizontal, self.config.flip_vertical)
+
+        if self.config.fine_rotation != 0.0:
+            img = apply_fine_rotation(img, self.config.fine_rotation)
+
+        if self.config.distortion_k1 != 0.0:
+            img = apply_radial_distortion(img, self.config.distortion_k1)
+
+        # Last in the forward chain: a plane projectivity cannot be fitted to a frame that
+        # still carries barrel distortion.
+        img = apply_keystone(img, self.config.converge_v, self.config.converge_h)
+
+        context.metrics["geometry_params"] = {
+            "rotation": self.config.rotation,
+            "fine_rotation": self.config.fine_rotation,
+            "flip_horizontal": self.config.flip_horizontal,
+            "flip_vertical": self.config.flip_vertical,
+            "converge_v": self.config.converge_v,
+            "converge_h": self.config.converge_h,
+        }
+        # Downstream coordinate mappers (retouch/local) need the same correction.
+        context.metrics["distortion_k1"] = self.config.distortion_k1
+
+        # Drawn or detected, the rect is already in crop_rect: ImageProcessor resolves
+        # detection before the engines, never here.
+        if self.config.crop_rect:
+            roi = get_manual_rect_coords(
+                img,
+                self.config.crop_rect,
+                offset_px=self.config.autocrop_offset,
+                scale_factor=context.scale_factor,
+            )
+            context.active_roi = roi
+        elif self.config.crop_to_valid and not self.config.crop_from_auto:
+            h_img, w_img = img.shape[:2]
+            valid_rect = compute_geometry_crop_rect(self.config.fine_rotation, self.config.converge_v, self.config.converge_h, w_img, h_img)
+            context.active_roi = get_manual_rect_coords(
+                img, valid_rect, offset_px=self.config.autocrop_offset, scale_factor=context.scale_factor
+            )
+        elif self.config.autocrop_offset > 0:
+            h_img, w_img = img.shape[:2]
+            margin = self.config.autocrop_offset * context.scale_factor
+            context.active_roi = apply_margin_to_roi((0, h_img, 0, w_img), h_img, w_img, margin)
+        else:
+            context.active_roi = None
+
+        context.metrics["active_roi"] = context.active_roi
+        return img
+
+
+class CropProcessor:
+    """
+    Executes final crop.
+    """
+
+    def __init__(self, config: GeometryConfig):
+        self.config = config
+
+    def process(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
+        if context.active_roi:
+            y1, y2, x1, x2 = context.active_roi
+            return image[y1:y2, x1:x2]
+        return image

@@ -1,0 +1,3342 @@
+import gc
+import math
+import os
+import struct
+import time
+from dataclasses import replace
+from typing import Any, Dict, Optional, Tuple
+
+import negpy_core
+import numpy as np
+import wgpu  # type: ignore
+
+from negpy.features.lab.logic import wb_gains
+from negpy.features.lab.models import hsl_active
+from negpy.domain.models import AspectRatio, ExportResolutionMode, WorkspaceConfig
+from negpy.features.exposure.analysis import (
+    COLOR_HIST_BINS,
+    DENSITY_HIST_BINS,
+    SCOPE_CHROMA_BINS,
+    SCOPE_HUE_BINS,
+    WAVEFORM_BINS,
+    WAVEFORM_COLS,
+)
+from negpy.features.finish.logic import carrier_profiles, linear_carrier_tone
+from negpy.features.finish.processor import carrier_width_px, rebate_tone
+from negpy.features.exposure import models as exposure_models
+from negpy.features.exposure.normalization import (
+    LogNegativeBounds,
+    analyze_log_exposure_bounds_from_log,
+    blend_neutral_axis,
+    contrast_mask_plane,
+    diffusion_grid,
+    diffusion_plane,
+    geometry_kwargs,
+    luma_source_bounds,
+    normalized_roi,
+    base_scan_density,
+    density_above_base,
+    luminance_density_range,
+    measure_anchor_from_log,
+    measure_clip_fractions,
+    measure_neutral_axis_from_log,
+    unmix_log_image,
+    measure_highlight_point_from_log,
+    measure_shadow_point_from_log,
+    measure_textural_range_from_log,
+    prefilter_log_grid,
+    resolve_analysis_region,
+    _rect_roi,
+    resolve_bounds_detailed,
+    sorted_channel_grid,
+)
+from negpy.features.geometry.logic import (
+    apply_fine_rotation,
+    apply_keystone,
+    keystone_inverse_normalized,
+    apply_margin_to_roi,
+    apply_radial_distortion,
+    compute_distortion_scale,
+    compute_geometry_crop_rect,
+    get_manual_rect_coords,
+)
+from negpy.features.geometry.models import GeometryConfig, crops_frame
+from negpy.features.lab.logic import (
+    GLOW_AMOUNT_MAX,
+    chroma_denoise_radius,
+    chroma_denoise_sigma,
+    gaussian_kernel_1d,
+    glow_reach_px,
+    halation_amounts,
+    halation_reach_px,
+    rl_iterations,
+)
+from negpy.features.lab.models import SharpenMethod
+from negpy.features.altprocess.models import AltProcess
+from negpy.features.cyanotype.logic import CYANOTYPE_CONSTANTS, sensitizer_constants
+from negpy.features.lith.logic import LITH_CONSTANTS
+from negpy.features.sabattier.logic import SABATTIER_CONSTANTS, line_sigma_px
+from negpy.features.exposure.logic import black_density_rgb, diffusion_mix
+from negpy.features.exposure.print_lut import PrintLut, lut_black_luminance
+from negpy.features.exposure.placement import limited_mask_params
+from negpy.features.local.logic import compute_local_maps, limited_masks
+from negpy.features.local.models import MAX_KEYED_MASKS
+from negpy.features.transparency.logic import (
+    contrast_free_cmy,
+    slide_exposure,
+    slide_mono_weights,
+    density_stage,
+    density_stage_grid,
+    faded_stage_grid,
+    fade_white_grid,
+    TRANSFER_CONSTANTS,
+    ZONE_BLACK_TAPER,
+    TRANSFER_DENSITY_RANGE,
+    measure_transfer_neutral_axis,
+    transfer_assumed_anchor,
+    transfer_auto_terms,
+    transfer_bounds,
+    transfer_cast_affine,
+    transfer_point_offsets,
+    transfer_curve_params,
+    transfer_widths,
+    wb_split_geometry,
+    zone_geometry,
+)
+from negpy.features.process.fade import (
+    FadeDensity,
+    crossover_offsets,
+    crossover_space,
+    crossover_uniform,
+    fade_density,
+    fade_white_stale,
+    fade_white_target,
+    render_white_space,
+    resolve_crossover,
+    resolve_fade_white,
+    with_fade_crossover,
+    with_fade_white,
+)
+from negpy.features.exposure.bw_filter import collapse_weights, plane_weights, printed_exposure
+from negpy.features.process.models import FADE_METER_FIELDS, FADE_RENDER_FIELDS, ProcessMode, per_channel_point_offsets, pooled_neutral_axis
+from negpy.features.process.path import RenderPath, is_mono, render_path
+from negpy.infrastructure.gpu.device import GPUDevice
+from negpy.infrastructure.gpu.resources import GPUBuffer, GPUTexture
+from negpy.infrastructure.gpu.shader_loader import ShaderLoader
+from negpy.kernel.image.logic import apply_geometry_orientation, rgba_to_rgb_into, working_oetf_decode
+from negpy.kernel.system.config import APP_CONFIG
+from negpy.kernel.system.logging import get_logger
+from negpy.kernel.system.paths import get_resource_path
+from negpy.kernel.system import timing
+from negpy.services.rendering.base_read import NOT_READ, base_log_for, cached_base_log
+from negpy.services.export.print import PrintService
+from negpy.services.view.coordinate_mapping import CoordinateMapping
+
+logger = get_logger(__name__)
+
+# Mirrors ToningUniforms.alt_mode in toning.wgsl.
+# Toning's view of the print: a Sabattier print is plain silver, so it reads as none.
+_ALT_MODE = {AltProcess.NONE: 0, AltProcess.LITH: 1, AltProcess.CYANOTYPE: 2, AltProcess.SABATTIER: 0}
+# One pass each, pointwise; Sabattier's three passes are dispatched on their own.
+_ALT_SHADER = {AltProcess.LITH: "lith", AltProcess.CYANOTYPE: "cyanotype"}
+
+# Hardware constants
+UNIFORM_ALIGNMENT_DEFAULT = 256
+TILE_SIZE = 2048
+# Some GPUs -- typically an older or memory-constrained integrated one, sharing system
+# RAM as VRAM with no submittable-memory query available up front -- can have a tight
+# enough budget that a full-size 2048px tile's intermediate textures blow it and take
+# the whole process down via wgpu-native's panic-on-device-lost (uncatchable across the
+# FFI boundary). Halving the tile roughly quarters the live per-tile texture footprint.
+# Gated behind AppConfig.low_vram_export_tiling (Preferences/override.toml) rather than
+# GPUDevice.is_integrated: plenty of integrated GPUs (Apple Silicon, AMD's higher-end
+# APUs) have ample real VRAM and don't need -- or want -- the export slowed down for it.
+TILE_SIZE_LOW_VRAM = 1024
+TILE_HALO = 32
+# A direct frame keeps an image-size rgba32float texture chain for stage resume.
+# Above this pixel count, tiling bounds the complete working set.
+TILING_THRESHOLD_PX = 12_000_000
+HISTOGRAM_BINS = 256
+# Metrics buffer in u32 words: RGBL output and density histograms, joint RGB histogram, luma waveform, a*b* vectorscope,
+# waveform RGB sums, RGB parade, scan-side density parade, scan full-scale columns. 256 B-aligned offsets, mirrored as WGSL array lengths. Append-only.
+_METRICS_HIST_WORDS = HISTOGRAM_BINS * 4
+_METRICS_DENSITY_BASE = 1024
+_METRICS_DENSITY_WORDS = DENSITY_HIST_BINS * 4  # R, G, B, Luma
+_METRICS_COLOR_BASE = 1536  # first 256 B-aligned word past the density slice
+_METRICS_COLOR_WORDS = COLOR_HIST_BINS**3
+_METRICS_WAVE_BASE = _METRICS_COLOR_BASE + _METRICS_COLOR_WORDS
+_METRICS_WAVE_WORDS = WAVEFORM_BINS * WAVEFORM_COLS
+_METRICS_SCOPE_BASE = _METRICS_WAVE_BASE + _METRICS_WAVE_WORDS
+_METRICS_SCOPE_WORDS = SCOPE_HUE_BINS * SCOPE_CHROMA_BINS
+_METRICS_WAVE_RGB_BASE = _METRICS_SCOPE_BASE + _METRICS_SCOPE_WORDS
+_METRICS_WAVE_RGB_WORDS = 3 * WAVEFORM_BINS * WAVEFORM_COLS
+_METRICS_PARADE_BASE = _METRICS_WAVE_RGB_BASE + _METRICS_WAVE_RGB_WORDS
+_METRICS_PARADE_WORDS = 3 * WAVEFORM_BINS * WAVEFORM_COLS
+_METRICS_DENSITY_PARADE_BASE = _METRICS_PARADE_BASE + _METRICS_PARADE_WORDS
+_METRICS_DENSITY_PARADE_WORDS = 3 * WAVEFORM_BINS * WAVEFORM_COLS
+_METRICS_FULL_SCALE_BASE = _METRICS_DENSITY_PARADE_BASE + _METRICS_DENSITY_PARADE_WORDS
+_METRICS_FULL_SCALE_WORDS = 3 * WAVEFORM_COLS
+# Auto Masking's share, the f32 bits of the auto_mask buffer's word 1.
+_METRICS_AUTO_MASK_BASE = _METRICS_FULL_SCALE_BASE + _METRICS_FULL_SCALE_WORDS
+METRICS_BUFFER_SIZE = (_METRICS_AUTO_MASK_BASE + 1) * 4
+
+# Per-frame metrics clear; write_buffer copies at call time, so sharing is safe.
+_METRICS_ZEROS = np.zeros(METRICS_BUFFER_SIZE // 4, dtype=np.uint32)
+
+
+def _downsample_for_analysis(img: np.ndarray, max_size: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    scale = min(1.0, max_size / max(h, w))
+    if scale >= 1.0:
+        return img
+    return negpy_core.resize_area(np.ascontiguousarray(img, dtype=np.float32), (int(w * scale), int(h * scale)))
+
+
+def _build_analysis_source(
+    img: np.ndarray,
+    geometry: GeometryConfig,
+    roi: Optional[Tuple[int, int, int, int]],
+    analysis_buffer: float,
+    analysis_rect: Optional[tuple],
+    tiling_mode: bool,
+    max_size: int,
+    meter_rect: Optional[tuple] = None,
+    as_loaded: bool = False,
+) -> Tuple[np.ndarray, float]:
+    """The shared meter grid's own buffer: oriented, downsampled (only a meter reads it), warped and sliced once for every
+    meter reading it. The whole frame is warped before the ROI is cut, as on the CPU and in the print stage: a crop rotated
+    about its own center is a different region. `as_loaded` (ProcessConfig.meter_as_loaded): the scan as loaded instead,
+    inside the meter rect found on it, as NormalizationProcessor reads it."""
+    if as_loaded and analysis_rect is None and not tiling_mode:
+        source = _downsample_for_analysis(np.ascontiguousarray(img), max_size)
+        roi = _rect_roi(source.shape, meter_rect) if meter_rect is not None else None
+        if roi is not None:
+            y1, y2, x1, x2 = roi
+            source = np.ascontiguousarray(source[y1:y2, x1:x2])
+        return source, analysis_buffer
+    analysis_source = apply_geometry_orientation(img, geometry.rotation, geometry.flip_horizontal, geometry.flip_vertical)
+    full_h, full_w = analysis_source.shape[:2]
+    analysis_source = _downsample_for_analysis(np.ascontiguousarray(analysis_source), max_size)
+    if geometry.fine_rotation != 0.0:
+        analysis_source = apply_fine_rotation(analysis_source, geometry.fine_rotation)
+    if geometry.distortion_k1 != 0.0:
+        analysis_source = apply_radial_distortion(analysis_source, geometry.distortion_k1)
+    analysis_source = apply_keystone(analysis_source, geometry.converge_v, geometry.converge_h)
+    # A freehand analysis_rect overrides the crop ROI and centered buffer, like the
+    # CPU path. Tiled export uses explicit overrides, so it stays on the ROI.
+    base_roi = None
+    if roi is not None and not tiling_mode:
+        sy, sx = analysis_source.shape[0] / full_h, analysis_source.shape[1] / full_w
+        y1, y2, x1, x2 = roi
+        base_roi = (round(y1 * sy), round(y2 * sy), round(x1 * sx), round(x2 * sx))
+    meter_rect = meter_rect if not tiling_mode else None
+    analysis_roi, an_buffer = resolve_analysis_region(
+        analysis_source.shape,
+        None if meter_rect is not None else base_roi,
+        analysis_buffer,
+        analysis_rect if not tiling_mode else None,
+        meter_rect,
+    )
+    if analysis_roi is not None:
+        ay1, ay2, ax1, ax2 = analysis_roi
+        analysis_source = np.ascontiguousarray(analysis_source[ay1:ay2, ax1:ax2])
+    return analysis_source, an_buffer
+
+
+def _binding_identity(idx: int, res: Any) -> tuple:
+    """Hashable identity for the bind-group cache. Pooled views/persistent buffers keep the
+    same object across frames, so id() is stable."""
+    if isinstance(res, dict) and "buffer" in res:
+        return (idx, id(res["buffer"]), res.get("offset", 0), res.get("size"))
+    if isinstance(res, GPUBuffer):
+        return (idx, id(res.buffer))
+    return (idx, id(res))
+
+
+def _keystone_inverse_bytes(converge_v: float, converge_h: float) -> bytes:
+    """The keystone inverse packed as two vec4s: (h00, h01, h02, h10), (h11, h12, h20, h21).
+    h22 is 1 by construction, so the shader supplies it."""
+    m = keystone_inverse_normalized(converge_v, converge_h)
+    return struct.pack("ffff", m[0, 0], m[0, 1], m[0, 2], m[1, 0]) + struct.pack("ffff", m[1, 1], m[1, 2], m[2, 0], m[2, 1])
+
+
+def _analysis_cache_key(settings: WorkspaceConfig, analysis_source_hash: str, film_base: Optional[tuple] = None) -> tuple:
+    """Identity of the auto-exposure analysis: only the fields the meter reads, including every geometry field that moves
+    which pixels land in the metered region. White/black point offsets and trims apply downstream as uniforms and must not
+    invalidate it. The roll's film base is in it because the cached densities are read above it."""
+    e = settings.exposure
+    p = settings.process
+    g = settings.geometry
+    return (
+        analysis_source_hash,
+        film_base,
+        p.process_mode,
+        p.positive_source,
+        p.analysis_buffer,
+        p.analysis_rect,
+        p.meter_rect,
+        p.luma_range_clip,
+        p.color_range_clip,
+        p.use_luma_average,
+        p.use_color_average,
+        p.locked_floors,
+        p.locked_ceils,
+        p.locked_slope,
+        p.local_floors,
+        p.local_ceils,
+        p.manual_dmin,
+        p.manual_dmax,
+        p.crosstalk_strength,
+        p.crosstalk_matrix,
+        p.crosstalk_process,
+        p.use_cast_average,
+        p.locked_neutral_axis,
+        *(getattr(p, f) for f in FADE_RENDER_FIELDS),
+        g.rotation,
+        g.flip_horizontal,
+        g.flip_vertical,
+        g.crop_rect,
+        g.autocrop_offset,
+        g.fine_rotation,
+        g.converge_v,
+        g.converge_h,
+        g.distortion_k1,
+        g.crop_to_valid,
+        g.crop_from_auto,
+        e.cast_removal_strength > 0.0,
+        e.auto_exposure,
+        e.auto_normalize_contrast,
+        exposure_models.TARGETS_REVISION,
+    )
+
+
+def _fill_analysis_overrides(cache, key, bounds, anchor, textural, neutral, shadow, highlight, density=None):
+    """Fill the None overrides from the cache when its key matches; caller overrides win."""
+    if cache is None or cache[0] != key:
+        return bounds, anchor, textural, neutral, shadow, highlight, density
+    _, cb, ca, ct, cn, cs, ch, cd = cache
+    return (
+        bounds if bounds is not None else cb,
+        anchor if anchor is not None else ca,
+        textural if textural is not None else ct,
+        neutral if neutral is not None else cn,
+        shadow if shadow is not None else cs,
+        highlight if highlight is not None else ch,
+        density if density is not None else cd,
+    )
+
+
+def _update_analysis_cache(cache, key, bounds, anchor, textural, neutral, shadow, highlight, density=None):
+    """Store the resolved analysis under key, merging (a frame may compute only a subset)."""
+    if cache is None or cache[0] != key:
+        cb = ca = ct = cn = cs = ch = cd = None
+    else:
+        _, cb, ca, ct, cn, cs, ch, cd = cache
+    return (
+        key,
+        bounds if bounds is not None else cb,
+        anchor if anchor is not None else ca,
+        textural if textural is not None else ct,
+        neutral if neutral is not None else cn,
+        shadow if shadow is not None else cs,
+        highlight if highlight is not None else ch,
+        density if density is not None else cd,
+    )
+
+
+class GPUEngine:
+    """
+    Core GPU orchestration engine using WebGPU.
+    Manages a 10-stage compute pipeline with unified memory and texture pooling.
+    """
+
+    def __init__(self) -> None:
+        self.gpu = GPUDevice.get()
+        self._shaders = {
+            "geometry": get_resource_path(os.path.join("negpy", "features", "geometry", "shaders", "transform.wgsl")),
+            "normalization": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "normalization.wgsl")),
+            "exposure": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "exposure.wgsl")),
+            "transfer": get_resource_path(os.path.join("negpy", "features", "transparency", "shaders", "transfer.wgsl")),
+            "output_encode": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "output_encode.wgsl")),
+            "autocrop": get_resource_path(os.path.join("negpy", "features", "geometry", "shaders", "autocrop.wgsl")),
+            "clahe_hist": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_hist.wgsl")),
+            "clahe_cdf": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_cdf.wgsl")),
+            "clahe_apply": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "clahe_apply.wgsl")),
+            "lab_sharpen_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab_sharpen_h.wgsl")),
+            "lab_sharpen_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab_sharpen_v.wgsl")),
+            "sharpen_grain_hist": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "sharpen_grain_hist.wgsl")),
+            "sharpen_grain_pick": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "sharpen_grain_pick.wgsl")),
+            "chroma_lowpass_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "chroma_lowpass_h.wgsl")),
+            "chroma_lowpass_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "chroma_lowpass_v.wgsl")),
+            "rl_init": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_init.wgsl")),
+            "rl_blur_h": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_blur_h.wgsl")),
+            "rl_div_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_div_v.wgsl")),
+            "rl_mult_v": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "rl_mult_v.wgsl")),
+            "lab": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab.wgsl")),
+            "lith": get_resource_path(os.path.join("negpy", "features", "lith", "shaders", "lith.wgsl")),
+            "cyanotype": get_resource_path(os.path.join("negpy", "features", "cyanotype", "shaders", "cyanotype.wgsl")),
+            "sabattier_mask": get_resource_path(os.path.join("negpy", "features", "sabattier", "shaders", "sabattier_mask.wgsl")),
+            "sabattier_h": get_resource_path(os.path.join("negpy", "features", "sabattier", "shaders", "sabattier_h.wgsl")),
+            "sabattier_v": get_resource_path(os.path.join("negpy", "features", "sabattier", "shaders", "sabattier_v.wgsl")),
+            "toning": get_resource_path(os.path.join("negpy", "features", "toning", "shaders", "toning.wgsl")),
+            "finish": get_resource_path(os.path.join("negpy", "features", "finish", "shaders", "finish.wgsl")),
+            "metrics": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "metrics.wgsl")),
+            "density_hist": get_resource_path(os.path.join("negpy", "features", "exposure", "shaders", "density_hist.wgsl")),
+            "color_hist": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "color_hist.wgsl")),
+            "waveform": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "waveform.wgsl")),
+            "vectorscope": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "vectorscope.wgsl")),
+            "layout": get_resource_path(os.path.join("negpy", "features", "toning", "shaders", "layout.wgsl")),
+        }
+        self._pipelines: Dict[str, Any] = {}
+        self._buffers: Dict[str, GPUBuffer] = {}
+        self._sampler: Optional[Any] = None
+        self._tex_cache: Dict[Tuple[int, int, int, str], GPUTexture] = {}
+        # Print-stock LUTs by key, outside the pool: a stock's LUT outlives the frames that use it.
+        self._lut_textures: Dict[str, Tuple[Any, GPUTexture]] = {}
+        self._exposure_lut: Optional[PrintLut] = None
+        self._tex_gen: Dict[Tuple[int, int, int, str], int] = {}
+        self._render_gen: int = 0
+
+        self._uniform_names = [
+            "geometry",
+            "normalization",
+            "exposure",
+            "transfer",
+            "clahe_u",
+            "lab",
+            "lith",
+            "cyanotype",
+            "sabattier",
+            "toning",
+            "finish",
+            "layout",
+            "density_hist",
+        ]
+        # Packed byte size per stage. A stage that exceeds the 256B dynamic-offset
+        # alignment (exposure) occupies multiple aligned slots.
+        self._uniform_sizes = {
+            "geometry": 64,
+            "normalization": 1264,
+            "exposure": 480,
+            "transfer": 240,
+            "clahe_u": 32,
+            "lab": 208,
+            "lith": 64,
+            "cyanotype": 64,
+            "sabattier": 32,
+            "toning": 64,
+            "finish": 60,
+            "layout": 48,
+            "density_hist": 48,
+        }
+        self._alignment = UNIFORM_ALIGNMENT_DEFAULT
+        self._current_source_hash: Optional[str] = None
+        # Once-per-source guard so the analysis timing log fires on load, not every slider.
+        self._analysis_timing_hash: Optional[str] = None
+        # (key, bounds, metered_anchor, textural_range, neutral_axis, shadow_point,
+        # highlight_point): the per-source meter cache, so creative-slider previews skip the analysis.
+        self._analysis_cache: Optional[tuple] = None
+        # (analysis_key, per-channel clipped fractions) for the scan-exposure warning.
+        self._clip_cache: Optional[tuple] = None
+        # (key, prefiltered grid, clip fractions), keyed without the clip sliders.
+        self._prefilter_cache: Optional[tuple] = None
+        # (key, white) of the last fade white measured for a stale one, so drag ticks reuse it.
+        self._fade_white_cache: Optional[Tuple[Any, Any]] = None
+        self._crossover_cache: Optional[Tuple[Any, Any]] = None
+        self._last_settings: Optional[WorkspaceConfig] = None
+        self._last_targets_rev: int = -1
+        self._last_scale_factor: float = 1.0
+        # No config field carries render_size_ref, so a size-only change would
+        # otherwise resume past the layout pass.
+        self._last_render_size_ref: Optional[float] = None
+        self._last_full_frame: bool = False
+        # (radius, scale_factor) of the sharpen taps currently in sharpen_k.
+        self._sharpen_kernel_key: Optional[tuple] = None
+        # The sigma of the Mackie-line taps currently in sabattier_k.
+        self._sabattier_kernel_key: Optional[float] = None
+        # (method, radius, dims) of the blur state in the sharpen textures; None once their input moved.
+        self._sharpen_state_key: Optional[tuple] = None
+        # The sigma of the Chroma Denoise taps currently in chroma_k.
+        self._chroma_kernel_key: Optional[float] = None
+        # (sigma, dims) of the low-pass in the chroma textures; None once their input moved.
+        self._chroma_state_key: Optional[tuple] = None
+
+        # Bind groups reference resources, not contents, so they survive across frames.
+        # Cache and reuse them (cleared in cleanup()): about 28 fewer wgpu calls per frame.
+        self._bind_group_cache: Dict[Tuple, Any] = {}
+        self._bind_layout_cache: Dict[str, Any] = {}
+
+        # Persistent staging buffers, so no create_buffer() per readback
+        self._metrics_staging: Optional[Any] = None
+        # slot -> (prb, height, buffer): the tiled path alternates two slots.
+        self._downsample_staging: Dict[int, Tuple[int, int, Any]] = {}
+
+        # (key, grid): a pure function of geometry, reused across settled frames
+        self._uv_grid_cache: Optional[Tuple[Tuple, np.ndarray]] = None
+        # Identity of the dodge/burn EV map currently sitting in the local_ev texture.
+        self._local_ev_key: Optional[Tuple] = None
+        # (key, maps): mask raster, keyed without grade; grade only rescales plane 1 at upload.
+        self._local_maps_cache: Optional[Tuple[Tuple, Optional[np.ndarray]]] = None
+        self._mask_plane: Optional[Tuple[Tuple, np.ndarray, float]] = None
+        self._diffusion_grid: Optional[Tuple[Tuple, np.ndarray]] = None
+        self._diffusion_plane: Optional[Tuple[Tuple, Optional[np.ndarray]]] = None
+        # Identity of the plane currently sitting in the contrast_mask texture.
+        self._mask_tex_key: Optional[Tuple] = None
+
+    def _detect_invalidated_stage(
+        self, settings: WorkspaceConfig, scale_factor: float, render_size_ref: Optional[float] = None, full_frame: bool = False
+    ) -> int:
+        """
+        Determines the earliest pipeline stage that needs re-running.
+        Returns stage index (5 unused — dodge/burn lives in the exposure pass):
+        0: Geometry (Source/Transform)
+        1: Exposure (Normalization/Grading/Dodge & Burn)
+        2: CLAHE (Adaptive Hist)
+        3: Retouch (Healing)
+        4: Lab (Color/Sharpen)
+        6: Toning (Paper/Split)
+        7: Finish (Vignette)
+        8: Layout (Final compositing)
+        """
+        if (
+            self._last_settings is None
+            or self._last_scale_factor != scale_factor
+            or self._last_render_size_ref != render_size_ref
+            or self._last_settings.process.process_mode != settings.process.process_mode
+            # The crop tool resizes every texture from toning on, so nothing cached survives a toggle.
+            or self._last_full_frame != full_frame
+        ):
+            return 0
+
+        last = self._last_settings
+        if last.geometry != settings.geometry:
+            return 0
+        if last.flatfield.apply != settings.flatfield.apply:
+            return 0
+        if last.process != settings.process or last.exposure != settings.exposure:
+            return 1
+        # Retuned Auto Density/Grade targets live in EXPOSURE_CONSTANTS, invisible to the
+        # config diff, but they reshape the print curve in the exposure pass.
+        if self._last_targets_rev != exposure_models.TARGETS_REVISION:
+            return 1
+        if last.local != settings.local:
+            return 1
+        if last.lab.clahe_strength != settings.lab.clahe_strength:
+            return 2
+        if last.lab != settings.lab:
+            return 4
+        if last.altproc != settings.altproc:
+            return 5
+        if last.toning != settings.toning:
+            return 6
+        if last.finish != settings.finish:
+            return 7
+        if last.export != settings.export:
+            # Carrier width is mm-of-print, so a print-size change moves the finish pass too.
+            if settings.finish.carrier_width > 0.0 and last.export.export_print_size != settings.export.export_print_size:
+                return 7
+            return 8
+
+        return 9  # Nothing changed
+
+    def _get_intermediate_texture(self, w: int, h: int, usage: int, label: str) -> GPUTexture:
+        """Retrieves or creates a texture from the pool.
+
+        Key is (w, h, usage, label). A 90°/270° rotation already swaps w and h
+        upstream (see w_rot/h_rot computation), so the key naturally changes
+        with geometry — no extra geometry field needed.
+
+        Invariant: callers must pass post-rotation dimensions. If rotation
+        handling ever moves downstream of texture allocation, revisit this key.
+        """
+        key = (w, h, usage, label)
+        if key not in self._tex_cache:
+            self._tex_cache[key] = GPUTexture(w, h, usage=usage)
+        self._tex_gen[key] = self._render_gen
+        return self._tex_cache[key]
+
+    def evict_stale_textures(self, destroy: bool = True) -> None:
+        """Drop pool textures untouched by the previous render. Bounds VRAM: a same-dimensions roll keeps its chain, a
+        dimension change frees the old one a render later. A preview passes destroy=False, since the canvas may still
+        sample an evicted texture; it is freed with its last reference."""
+        self._render_gen += 1
+        stale = [k for k, gen in self._tex_gen.items() if gen < self._render_gen - 1]
+        if not stale:
+            return
+        for key in stale:
+            tex = self._tex_cache.pop(key, None)
+            self._tex_gen.pop(key, None)
+            if tex is not None and destroy:
+                tex.destroy()
+        # A new texture under the same key starts empty, so its upload must not be skipped.
+        labels = {key[3] for key in stale}
+        if labels & {"local_ev", "local_key"}:
+            self._local_ev_key = None
+        if labels & {"rl_a", "rl_b", "sharpen_h", "sharpen_v"}:
+            self._sharpen_state_key = None
+        if labels & {"chroma_h", "chroma_v"}:
+            self._chroma_state_key = None
+        if "contrast_mask" in labels:
+            self._mask_tex_key = None
+        # Bind groups keyed by id() never match a destroyed view again; drop, don't leak.
+        self._bind_group_cache.clear()
+
+    def requires_tiling(self, img: np.ndarray, settings: WorkspaceConfig, render_size_ref: Optional[float] = None) -> bool:
+        """True when a direct texture chain exceeds a device or working-set limit.
+
+        An export paper larger than the texture limit tiles too: the tiled path assembles
+        it in host memory, so the export keeps the size the user asked for."""
+        h, w = img.shape[:2]
+        max_tex = self.gpu.limits.get("max_texture_dimension_2d", 8192)
+        if APP_CONFIG.max_texture_size is not None:
+            max_tex = min(max_tex, APP_CONFIG.max_texture_size)
+        rot = settings.geometry.rotation % 4
+        w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
+        if w_rot > max_tex or h_rot > max_tex or w * h > TILING_THRESHOLD_PX:
+            return True
+        if render_size_ref:
+            return False
+        paper_w, paper_h, *_ = self._calculate_layout_dims(settings, w_rot, h_rot, None)
+        return max(paper_w, paper_h) > max_tex
+
+    def _release_texture_pool(self, retain: Optional[GPUTexture] = None) -> None:
+        """Destroy pooled textures after their submitted work is complete."""
+        for tex in self._tex_cache.values():
+            if tex is not retain:
+                tex.destroy()
+        self._tex_cache.clear()
+        self._tex_gen.clear()
+        self._bind_group_cache.clear()
+        self._current_source_hash = None
+        self._last_settings = None
+        self._local_ev_key = None
+        self._mask_tex_key = None
+        self._sharpen_state_key = None
+        self._chroma_state_key = None
+
+    def _init_resources(self) -> None:
+        """Initializes hardware pipelines and persistent buffers."""
+        if self._pipelines or not self.gpu.device:
+            return
+        # Buffers are recreated below, so force the next kernel upload.
+        self._sharpen_kernel_key = None
+        self._chroma_kernel_key = None
+        t0 = time.perf_counter()
+        device = self.gpu.device
+        self._sampler = device.create_sampler(min_filter="linear", mag_filter="linear")
+
+        hw_min = self.gpu.limits.get("min_uniform_buffer_offset_alignment", 256)
+        self._alignment = max(256, hw_min)
+
+        for name, path in self._shaders.items():
+            self._pipelines[name] = self._create_pipeline(path)
+
+        # Unified Uniform Buffer (UBO)
+        self._buffers["unified_u"] = GPUBuffer(
+            sum(self._slot_bytes(n) for n in self._uniform_names),
+            wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+
+        # Storage buffers for intermediate metrics and CLAHE
+        self._buffers["clahe_h"] = GPUBuffer(65536, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._buffers["clahe_c"] = GPUBuffer(
+            65536,
+            wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+        )
+        # Sharpen blur taps (gaussian_kernel_1d): 1024 f32 covers radius <= 511.
+        self._buffers["sharpen_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        # Auto Masking: the gradient histogram, then (masking, auto share) for the lab pass.
+        self._buffers["grain_hist"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._buffers["auto_mask"] = GPUBuffer(256, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+        # Chroma Denoise low-pass taps, the same helper's.
+        self._buffers["chroma_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        # The Mackie-line blur taps, the same helper's, for the Sabattier passes.
+        self._buffers["sabattier_k"] = GPUBuffer(4096, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        # Filed-carrier jitter profiles are a fixed table, so upload once.
+        self._buffers["carrier_s"] = GPUBuffer(carrier_profiles().nbytes, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._buffers["carrier_s"].upload(np.ascontiguousarray(carrier_profiles().ravel(), dtype=np.float32))
+        self._buffers["carrier_t"] = GPUBuffer(linear_carrier_tone().nbytes, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._buffers["metrics"] = GPUBuffer(
+            METRICS_BUFFER_SIZE,
+            wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+        )
+
+        logger.info(
+            "load-timing gpu_init %.0fms (compiled %d shaders/pipelines)",
+            (time.perf_counter() - t0) * 1000,
+            len(self._pipelines),
+        )
+
+    def _create_pipeline(self, shader_path: str) -> Any:
+        shader_module = ShaderLoader.load(shader_path)
+        assert self.gpu.device is not None
+        try:
+            return self.gpu.device.create_compute_pipeline(layout="auto", compute={"module": shader_module, "entry_point": "main"})
+        except Exception:
+            logger.exception(f"Failed to compile pipeline: {shader_path}")
+            raise
+
+    def _slot_bytes(self, name: str) -> int:
+        """Aligned bytes a stage occupies in the unified UBO (>= 1 slot)."""
+        return -(-self._uniform_sizes[name] // self._alignment) * self._alignment
+
+    def _get_uniform_binding(self, name: str) -> Dict[str, Any]:
+        """Calculates UBO offset and size for a specific pipeline stage.
+        Offsets are cumulative so an oversized stage spans multiple slots."""
+        offset = 0
+        for n in self._uniform_names:
+            if n == name:
+                break
+            offset += self._slot_bytes(n)
+        return {
+            "buffer": self._buffers["unified_u"].buffer,
+            "offset": offset,
+            "size": self._uniform_sizes[name],
+        }
+
+    def process_to_texture(
+        self,
+        img: np.ndarray,
+        settings: WorkspaceConfig,
+        scale_factor: float = 1.0,
+        tiling_mode: bool = False,
+        bounds_override: Optional[Any] = None,
+        global_offset: Tuple[int, int] = (0, 0),
+        full_dims: Optional[Tuple[int, int]] = None,
+        clahe_cdf_override: Optional[np.ndarray] = None,
+        metered_anchor_override: Optional[float] = None,
+        textural_range_override: Optional[float] = None,
+        neutral_axis_override: Optional[tuple] = None,
+        shadow_point_override: Optional[float] = None,
+        highlight_point_override: Optional[float] = None,
+        apply_layout: bool = True,
+        render_size_ref: Optional[float] = None,
+        source_hash: Optional[str] = None,
+        readback_metrics: bool = True,
+        vignette_full_crop: Optional[Tuple[int, int, int, int]] = None,
+        local_maps: Optional[np.ndarray] = None,
+        analysis_source_hash: Optional[str] = None,
+        cam_xyz: Optional[list] = None,
+        camera_wb: Optional[list] = None,
+        contrast_mask_override: Optional[Tuple[np.ndarray, float, Tuple[int, int, int, int]]] = None,
+        film_base: Optional[tuple] = None,
+        source_base_log: Any = NOT_READ,
+        sabattier_sigma_override: Optional[float] = None,
+        diffusion_override: Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]] = None,
+        # Crop tool preview: toning and finish span the whole rotated frame, with no border or
+        # carrier; the meter, contrast mask and active_roi stay on the crop, as in the CPU engine.
+        full_frame: bool = False,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Executes the full pipeline, returning a GPU texture and associated metrics.
+
+        ``local_maps`` is the pre-rasterised (h, w, 2) dodge/burn EV + local grade
+        map already in the post-geometry frame; tiled export passes a per-tile slice.
+        When None and masks are present, it is computed here from ``settings.local``.
+
+        ``contrast_mask_override`` is (plane, centre, printed frame in rotated pixels),
+        built once per tiled export because a tile cannot see the pre-geometry source.
+        """
+        if not self.gpu.is_available:
+            raise RuntimeError("GPU not available")
+        self._init_resources()
+        device = self.gpu.device
+        assert device is not None
+
+        h, w = img.shape[:2]
+        k1_eff = settings.geometry.distortion_k1
+        source_tex = self._get_intermediate_texture(
+            w,
+            h,
+            wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            "source",
+        )
+
+        # Only upload if the source content has changed
+        if source_hash is None or source_hash != self._current_source_hash:
+            source_tex.upload(img)
+            self._current_source_hash = source_hash
+            start_stage = 0
+        elif tiling_mode:
+            start_stage = 0
+        else:
+            start_stage = self._detect_invalidated_stage(settings, scale_factor, render_size_ref, full_frame)
+
+        # ROI calculation
+        if tiling_mode and full_dims:
+            w_rot, h_rot = w, h
+            x1, y1 = 0, 0
+            crop_w, crop_h = w, h
+            actual_full_dims = full_dims
+            orig_shape = (h, w)
+            roi = (0, h, 0, w)
+        else:
+            rot = settings.geometry.rotation % 4
+            w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
+            # Invariant: intermediate textures are allocated with post-rotation
+            # dimensions, so the cache key naturally avoids 90°/270° collisions.
+            # If rotation handling ever moves downstream of _get_intermediate_texture
+            # calls, this invariant must be re-checked.
+            assert w_rot > 0 and h_rot > 0
+            actual_full_dims, orig_shape = (w_rot, h_rot), (h, w)
+            if settings.geometry.crop_rect:
+                roi = get_manual_rect_coords(
+                    (h_rot, w_rot),
+                    settings.geometry.crop_rect,
+                    offset_px=settings.geometry.autocrop_offset,
+                    scale_factor=scale_factor,
+                )
+            elif settings.geometry.crop_to_valid and not settings.geometry.crop_from_auto:
+                valid_rect = compute_geometry_crop_rect(
+                    settings.geometry.fine_rotation, settings.geometry.converge_v, settings.geometry.converge_h, w_rot, h_rot
+                )
+                roi = get_manual_rect_coords(
+                    (h_rot, w_rot), valid_rect, offset_px=settings.geometry.autocrop_offset, scale_factor=scale_factor
+                )
+            elif settings.geometry.autocrop_offset > 0:
+                margin = settings.geometry.autocrop_offset * scale_factor
+                roi = apply_margin_to_roi((0, h_rot, 0, w_rot), h_rot, w_rot, margin)
+            else:
+                roi = (0, h_rot, 0, w_rot)
+        # roi stays the real crop throughout, for the meter, the contrast mask and the
+        # reported overlay -- all of which the crop tool's full_frame preview must still
+        # match the CPU engine on. Only the render's own dispatch extent (the late,
+        # crop-fused stages) widens to the whole rotated frame while it is on.
+        y1, y2, x1, x2 = (0, h_rot, 0, w_rot) if full_frame and not tiling_mode else roi
+        crop_w, crop_h = max(1, x2 - x1), max(1, y2 - y1)
+
+        def _analysis_grid_source() -> Tuple[np.ndarray, float]:
+            return _build_analysis_source(
+                img,
+                settings.geometry,
+                roi,
+                settings.process.analysis_buffer,
+                settings.process.analysis_rect,
+                tiling_mode,
+                APP_CONFIG.preview_render_size,
+                meter_rect=settings.process.meter_rect if settings.process.meter_as_loaded
+                else None if crops_frame(settings.geometry) else settings.process.meter_rect,
+                as_loaded=settings.process.meter_as_loaded,
+            )
+
+        def _white_grid() -> np.ndarray:
+            source, buffer = _analysis_grid_source()
+            return fade_white_grid(settings.process, settings.process.process_mode, cam_xyz, camera_wb, source, None, buffer)
+
+        # Before every key and matrix below, which read the white. A tile takes its export's white.
+        white_space = render_white_space(settings.process, settings.process.process_mode, cam_xyz, camera_wb)
+        proc = settings.process
+        white_key = (
+            None
+            if analysis_source_hash is None or tiling_mode
+            else (analysis_source_hash, white_space, roi, settings.geometry, proc.analysis_buffer, proc.analysis_rect, proc.meter_rect)
+            + (proc.process_mode, proc.positive_source, proc.linear_raw, proc.highlight_reconstruction)
+        )
+        measured_white = None
+        if not tiling_mode and fade_white_stale(proc, white_space):
+            cached = self._fade_white_cache
+            if white_key is not None and cached is not None and cached[0] == white_key:
+                measured_white = cached[1]
+            else:
+                measured_white = resolve_fade_white(proc, white_space, _white_grid)
+                if white_key is not None:
+                    self._fade_white_cache = (white_key, measured_white)
+        settings = replace(settings, process=with_fade_white(settings.process, measured_white))
+
+        # Reuse the per-source meter across creative-slider previews: fill any missing
+        # override from the cache so the needs_* gates below skip the analysis entirely.
+        analysis_key = None
+        density_above_base_value = None  # (Dmin, Dmed, Dmax) above the clear base; the cache keeps it across skipped analyses
+        if analysis_source_hash is not None and not tiling_mode:
+            analysis_key = _analysis_cache_key(settings, analysis_source_hash, film_base)
+            (
+                bounds_override,
+                metered_anchor_override,
+                textural_range_override,
+                neutral_axis_override,
+                shadow_point_override,
+                highlight_point_override,
+                density_above_base_value,
+            ) = _fill_analysis_overrides(
+                self._analysis_cache,
+                analysis_key,
+                bounds_override,
+                metered_anchor_override,
+                textural_range_override,
+                neutral_axis_override,
+                shadow_point_override,
+                highlight_point_override,
+                None,
+            )
+
+        timing.lap("upload source")
+        analysis_t0 = time.perf_counter()
+        cast_on = settings.exposure.cast_removal_strength > 0.0 and not tiling_mode
+        # The neutral axis runs on both colour processes; B&W has no channels to balance.
+        needs_axis = neutral_axis_override is None and cast_on and not is_mono(settings.process)
+        _roll_luma = settings.process.use_luma_average and settings.process.is_locked_initialized
+        _roll_color = settings.process.use_color_average and settings.process.is_locked_initialized
+        needs_bounds_analysis = not (bounds_override or (_roll_luma and _roll_color) or settings.process.is_local_initialized)
+        transfer = render_path(settings.process) is not RenderPath.PRINT
+        # Auto Density reads the anchor, and so does Auto Grade's Shadow Reach on the transfer
+        # path whatever Auto Density says. Previews also measure it for the Analysis-panel stats.
+        anchor_used = settings.exposure.auto_exposure or (transfer and settings.exposure.auto_normalize_contrast)
+        needs_anchor = metered_anchor_override is None and not tiling_mode and (anchor_used or readback_metrics)
+        needs_textural = textural_range_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
+        needs_shadow = shadow_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
+        needs_highlight = highlight_point_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
+
+        prefiltered = None
+        cam_prefiltered = None
+        sorted_grid = None
+        scan_clip_fractions = None
+        analysis_source = None
+        unmix_m, fade_anchor_m = fade_density(settings.process, settings.process.process_mode, white_space)
+        # The transparency curve reads working space, so its meter must too: the same
+        # camera matrices TransparencyBaseProcessor applies, on the grid.
+        slide_stage = density_stage(settings.process, cam_xyz, camera_wb, unmix_m, fade_anchor_m) if transfer else None
+        # The crossover table, measured on the CPU grid when the frame has none. A tile takes its export's.
+        measured_crossover = None
+        crossover = None
+        if slide_stage is not None:
+            space = crossover_space(FadeDensity(unmix_m, fade_anchor_m), white_space, settings.process)
+            crossover_key = None if white_key is None else white_key + (space, proc.fade_crossover_space)
+
+            def _faded_grid() -> np.ndarray:
+                source, buffer = _analysis_grid_source()
+                return faded_stage_grid(slide_stage, source, None, buffer)
+
+            cached = self._crossover_cache
+            if crossover_key is not None and cached is not None and cached[0] == crossover_key and proc.fade_crossover > 0.0:
+                table, measured_crossover = cached[1]
+            else:
+                table, measured_crossover = resolve_crossover(settings.process, space, _faded_grid, measure=not tiling_mode)
+                if crossover_key is not None and measured_crossover is not None:
+                    self._crossover_cache = (crossover_key, (table, measured_crossover))
+            crossover = crossover_offsets(table, settings.process.fade_crossover)
+        # A drag renders without metrics and caches no densities; the release that reads them
+        # back re-runs the grid once so the cache fills.
+        # A source with no base is known as such, so it never re-enters the grid for it.
+        if source_base_log is NOT_READ:
+            source_base_log = cached_base_log(analysis_source_hash)
+        base_known_empty = source_base_log is None
+        needs_density = readback_metrics and not tiling_mode and not transfer and density_above_base_value is None and not base_known_empty
+        if needs_bounds_analysis or needs_axis or needs_anchor or needs_textural or needs_shadow or needs_highlight or needs_density:
+            # Keyed without the clip sliders: a clip drag reuses the grid and
+            # re-runs only the percentile analysis.
+            p = settings.process
+            prefilter_key = (
+                (
+                    analysis_source_hash,
+                    # roi already reflects rotation/crop_rect/autocrop_offset; flips and the
+                    # warps move pixels without changing it.
+                    settings.geometry.flip_horizontal,
+                    settings.geometry.flip_vertical,
+                    settings.geometry.fine_rotation,
+                    settings.geometry.converge_v,
+                    settings.geometry.converge_h,
+                    settings.geometry.distortion_k1,
+                    roi,
+                    p.analysis_buffer,
+                    p.analysis_rect,
+                    p.meter_rect,
+                    p.crosstalk_strength,
+                    p.crosstalk_matrix,
+                    p.crosstalk_process,
+                    *(getattr(p, f) for f in FADE_METER_FIELDS if f != "fade_crossover"),
+                    None if crossover is None else (crossover.lo, crossover.hi, crossover.bins.tobytes()),
+                    p.process_mode,
+                    p.positive_source,
+                    None
+                    if slide_stage is None
+                    else tuple(None if m is None else tuple(np.asarray(m).ravel().tolist()) for m in slide_stage),
+                )
+                if analysis_source_hash is not None and not tiling_mode
+                else None
+            )
+            if prefilter_key is not None and self._prefilter_cache is not None and self._prefilter_cache[0] == prefilter_key:
+                prefiltered, scan_clip_fractions = self._prefilter_cache[1], self._prefilter_cache[2]
+                sorted_grid = self._prefilter_cache[3]
+                cam_prefiltered = self._prefilter_cache[4]
+            else:
+                # Use views to avoid copying the full-res image; crop to ROI first.
+                analysis_source, an_buffer = _build_analysis_source(
+                    img,
+                    settings.geometry,
+                    roi,
+                    settings.process.analysis_buffer,
+                    settings.process.analysis_rect,
+                    tiling_mode,
+                    APP_CONFIG.preview_render_size,
+                    meter_rect=settings.process.meter_rect if settings.process.meter_as_loaded
+                    else None if crops_frame(settings.geometry) else settings.process.meter_rect,
+                    as_loaded=settings.process.meter_as_loaded,
+                )
+                # Shared prefilter, once for all five meters (ROI already applied).
+                # Unmixed like the CPU path so every meter reads the unmixed film.
+                log_grid = prefilter_log_grid(analysis_source, None, an_buffer)
+                prefiltered = unmix_log_image(log_grid, unmix_m)
+                scan_clip_fractions = measure_clip_fractions(analysis_source, None, an_buffer)
+                if slide_stage is not None:
+                    cam_prefiltered = density_stage_grid(slide_stage, analysis_source, None, an_buffer, lambda: log_grid, crossover)
+                if prefilter_key is not None:
+                    self._prefilter_cache = (prefilter_key, prefiltered, scan_clip_fractions, None, cam_prefiltered)
+            if analysis_key is not None:
+                self._clip_cache = (analysis_key, scan_clip_fractions)
+        elif analysis_key is not None and self._clip_cache is not None and self._clip_cache[0] == analysis_key:
+            scan_clip_fractions = self._clip_cache[1]
+
+        def _sorted() -> np.ndarray:
+            """The prefiltered grid sorted per channel. Held beside the grid it came from,
+            so a clip drag re-reads one sort instead of re-partitioning per percentile."""
+            nonlocal sorted_grid
+            assert prefiltered is not None
+            if sorted_grid is None:
+                sorted_grid = sorted_channel_grid(prefiltered)
+                cache = self._prefilter_cache
+                if cache is not None and cache[1] is prefiltered:
+                    self._prefilter_cache = (cache[0], cache[1], cache[2], sorted_grid, cache[4])
+            return sorted_grid
+
+        def _analyze_bounds() -> LogNegativeBounds:
+            assert prefiltered is not None
+            return analyze_log_exposure_bounds_from_log(
+                prefiltered,
+                None,
+                0.0,
+                percentile_clip=settings.process.luma_range_clip,
+                color_clip=settings.process.color_range_clip,
+                sorted_grid=_sorted(),
+            )
+
+        if bounds_override:
+            bounds = base_bounds = anchor_bounds = bounds_override
+        else:
+            bounds, base_bounds = resolve_bounds_detailed(settings.process, _analyze_bounds)
+            anchor_bounds = luma_source_bounds(settings.process, base_bounds)
+        if prefiltered is not None and readback_metrics and not transfer and (density_above_base_value is None or needs_bounds_analysis):
+            # Only a preview reads the densities, like the anchor's readback_metrics gate. A base
+            # the user set on the roll wins; else the source's rebate read, which run_pipeline
+            # passes in, read here only for a caller that did not.
+            if film_base is not None:
+                density_above_base_value = density_above_base(tuple(film_base), bounds, prefiltered, unmix_m)
+            else:
+                if source_base_log is NOT_READ:
+                    source_base_log = base_log_for(analysis_source_hash, img)
+                density_above_base_value = density_above_base(source_base_log, bounds, prefiltered, unmix_m)
+
+        # Neutral axis for the two-point Cast Removal; normalized at consumption. The
+        # transparency path measures it on the working-space grid the curve consumes.
+        neutral_axis_refs = neutral_axis_override
+        axis_grid = cam_prefiltered if transfer else prefiltered
+        if needs_axis and axis_grid is not None:
+            if transfer:
+                neutral_axis_refs = measure_transfer_neutral_axis(axis_grid, render_path(settings.process) is RenderPath.POSITIVE)
+            else:
+                neutral_axis_refs = measure_neutral_axis_from_log(axis_grid, bounds, None, 0.0)
+            pooled_axis = pooled_neutral_axis(settings.process)
+            if pooled_axis is not None:
+                neutral_axis_refs = blend_neutral_axis(neutral_axis_refs, pooled_axis)
+
+        # Auto Density/Auto Grade meter the working-space grid against the fixed window on
+        # the transparency path, and the regular per-frame grid/bounds everywhere else.
+        meter_grid = cam_prefiltered if transfer else prefiltered
+        meter_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else anchor_bounds
+        meter_assumed = transfer_assumed_anchor() if transfer else None
+
+        metered_anchor = metered_anchor_override
+        if needs_anchor and meter_grid is not None:
+            metered_anchor = measure_anchor_from_log(meter_grid, meter_bounds, None, 0.0, assumed=meter_assumed)
+
+        textural_range = textural_range_override
+        if needs_textural and meter_grid is not None:
+            textural_range = measure_textural_range_from_log(meter_grid, None, 0.0)
+
+        shadow_point = shadow_point_override
+        if needs_shadow and meter_grid is not None:
+            shadow_point = measure_shadow_point_from_log(meter_grid, meter_bounds, None, 0.0)
+
+        highlight_point = highlight_point_override
+        if needs_highlight and meter_grid is not None:
+            highlight_point = measure_highlight_point_from_log(meter_grid, meter_bounds, None, 0.0)
+
+        if analysis_key is not None:
+            self._analysis_cache = _update_analysis_cache(
+                self._analysis_cache,
+                analysis_key,
+                bounds,
+                metered_anchor,
+                textural_range,
+                neutral_axis_refs,
+                shadow_point,
+                highlight_point,
+                density_above_base_value,
+            )
+
+        # Same helper, same pre-geometry array as the CPU engine, so the two mask alike.
+        # Keyed off the meter, so only the Contrast Mask slider's own value stays live.
+        mask_plane = None
+        mask_centre = 0.5
+        mask_key = None
+        # The printed frame in rotated pixels; the shader maps a plane onto it and clamps
+        # outside, which is expand_mask_plane's edge padding.
+        y1_f, y2_f, x1_f, x2_f = roi if roi is not None else (0, h_rot, 0, w_rot)
+        y1_f, x1_f = max(0, y1_f), max(0, x1_f)
+        y2_f, x2_f = min(h_rot, y2_f), min(w_rot, x2_f)
+        frame_rect = (x1_f, y1_f, x2_f - x1_f, y2_f - y1_f)
+        mask_rect = None
+        if settings.exposure.contrast_mask_strength > 0.0 and render_path(settings.process) is RenderPath.PRINT:
+            if tiling_mode:
+                # A tile holds no pre-geometry source, so the caller builds the plane once
+                # for the whole export and the frame shifts into tile coords here.
+                if contrast_mask_override is not None:
+                    mask_plane, mask_centre, frame = contrast_mask_override
+                    mask_key = ("tiled",)
+                    mask_rect = (frame[0] - global_offset[0], frame[1] - global_offset[1], frame[2], frame[3])
+            else:
+                geo = settings.geometry
+                bw_weights = plane_weights(settings.process, settings.exposure)
+                mask_key = (
+                    analysis_key,
+                    bounds,
+                    roi,
+                    (h_rot, w_rot),
+                    (geo.rotation, geo.fine_rotation, geo.flip_horizontal, geo.flip_vertical, geo.converge_v, geo.converge_h, k1_eff),
+                    bw_weights,
+                )
+                if self._mask_plane is None or self._mask_plane[0] != mask_key:
+                    self._mask_plane = (
+                        mask_key,
+                        *contrast_mask_plane(
+                            img,
+                            bounds,
+                            unmix_m,
+                            roi_norm=normalized_roi(roi, (h_rot, w_rot)),
+                            bw_weights=bw_weights,
+                            **geometry_kwargs(settings.geometry, k1_eff),
+                        ),
+                    )
+                mask_plane = self._mask_plane[1]
+                mask_centre = self._mask_plane[2]
+                mask_rect = frame_rect
+
+        mask_uniform = None
+        if mask_plane is not None and mask_rect is not None:
+            if mask_rect[2] < 1 or mask_rect[3] < 1:
+                mask_plane = None
+            else:
+                mask_uniform = (
+                    mask_centre,
+                    float(mask_rect[0]),
+                    float(mask_rect[1]),
+                    float(mask_rect[2]),
+                    float(mask_rect[3]),
+                )
+
+        # The Diffusion plane shares the mask texture (gba) and rect. It is built in the print's own
+        # normalization, trims included, so the shader mixes it as light. Print path only.
+        diff_plane = None
+        diff_key = None
+        diff_rect = None
+        if settings.exposure.diffusion > 0.0 and render_path(settings.process) is RenderPath.PRINT:
+            if tiling_mode:
+                if diffusion_override is not None:
+                    diff_plane, frame = diffusion_override
+                    diff_key = ("tiled",)
+                    diff_rect = (frame[0] - global_offset[0], frame[1] - global_offset[1], frame[2], frame[3])
+            else:
+                geo = settings.geometry
+                wp3, bp3 = per_channel_point_offsets(settings.process)
+                diff_bounds = LogNegativeBounds(
+                    tuple(bounds.floors[ch] + wp3[ch] for ch in range(3)), tuple(bounds.ceils[ch] + bp3[ch] for ch in range(3))
+                )
+                diff_weights = plane_weights(settings.process, settings.exposure)
+                grid_key = (
+                    analysis_key,
+                    roi,
+                    (h_rot, w_rot),
+                    (geo.rotation, geo.fine_rotation, geo.flip_horizontal, geo.flip_vertical, geo.converge_v, geo.converge_h, k1_eff),
+                )
+                # The blur is keyed without bounds, so a trim drag only re-normalizes the grid.
+                if self._diffusion_grid is None or self._diffusion_grid[0] != grid_key:
+                    self._diffusion_grid = (
+                        grid_key,
+                        diffusion_grid(
+                            img,
+                            unmix_m,
+                            roi_norm=normalized_roi(roi, (h_rot, w_rot)),
+                            **geometry_kwargs(geo, k1_eff),
+                        ),
+                    )
+                diff_key = (grid_key, tuple(diff_bounds.floors), tuple(diff_bounds.ceils), diff_weights)
+                # A None plane (an unmetered frame) is cached under its key like any other.
+                cached = self._diffusion_plane
+                if cached is None or cached[0] != diff_key:
+                    cached = (diff_key, diffusion_plane(self._diffusion_grid[1], diff_bounds, diff_weights))
+                    self._diffusion_plane = cached
+                diff_plane = cached[1]
+                diff_rect = frame_rect
+            if diff_rect is not None and (diff_rect[2] < 1 or diff_rect[3] < 1):
+                diff_plane = None
+        plane_rect = mask_rect if mask_plane is not None else diff_rect
+        plane_tex_key = (mask_key if mask_plane is not None else None, diff_key if diff_plane is not None else None)
+
+        timing.lap("meter/mask planes")
+
+        # CPU meter cost, logged once per source (skips creative-slider re-renders).
+        if analysis_source is not None and analysis_source_hash is not None and analysis_source_hash != self._analysis_timing_hash:
+            self._analysis_timing_hash = analysis_source_hash
+            logger.info(
+                "load-timing analysis %.0fms (bounds=%s axis=%s anchor=%s textural=%s)",
+                (time.perf_counter() - analysis_t0) * 1000,
+                needs_bounds_analysis,
+                needs_axis,
+                needs_anchor,
+                needs_textural,
+            )
+
+        pw, ph, cw, ch, ox, oy, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+
+        self._upload_unified_uniforms(
+            settings,
+            bounds,
+            global_offset,
+            actual_full_dims,
+            (0, 0) if tiling_mode else (x1, y1),
+            crop_w,
+            crop_h,
+            tiling_mode,
+            render_size_ref,
+            scale_factor,
+            vignette_full_crop=vignette_full_crop,
+            full_frame=full_frame,
+            metered_anchor=metered_anchor,
+            textural_range=textural_range,
+            neutral_axis_refs=neutral_axis_refs,
+            shadow_point=shadow_point,
+            highlight_point=highlight_point,
+            unmix=unmix_m,
+            fade_anchor=fade_anchor_m,
+            crossover=crossover,
+            white_space=white_space,
+            cam_xyz=cam_xyz,
+            camera_wb=camera_wb,
+            contrast_mask=mask_uniform,
+            # A tile is a slice of the export, so its lines take the whole frame's width.
+            sabattier_sigma=sabattier_sigma_override
+            if sabattier_sigma_override is not None
+            else line_sigma_px(settings.altproc.sabattier_agitation, (h_rot, w_rot)),
+            plane_rect=plane_rect,
+            diffusion_mix=diffusion_mix(settings.exposure.diffusion) if diff_plane is not None else 0.0,
+        )
+        if clahe_cdf_override is not None:
+            self._buffers["clahe_c"].upload(clahe_cdf_override)
+
+        timing.lap("uniforms")
+        # Texture chain
+        tex_geom = self._get_intermediate_texture(
+            w_rot,
+            h_rot,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
+            "geom",
+        )
+        tex_norm = self._get_intermediate_texture(
+            w_rot,
+            h_rot,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+            "norm",
+        )
+        tex_expo = self._get_intermediate_texture(
+            w_rot,
+            h_rot,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
+            "expo",
+        )
+        tex_clahe = self._get_intermediate_texture(
+            w_rot,
+            h_rot,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
+            "clahe",
+        )
+        tex_lab = self._get_intermediate_texture(
+            w_rot,
+            h_rot,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING,
+            "lab",
+        )
+        # The Contrast Mask plane rides its own analysis-grid texture, uploaded only when the
+        # plane itself moves. A 1x1 dummy keeps the bind group valid when it is off (mask.x
+        # gates it).
+        if mask_plane is not None or diff_plane is not None:
+            grid = mask_plane if mask_plane is not None else diff_plane
+            tex_mask = self._get_intermediate_texture(
+                grid.shape[1],
+                grid.shape[0],
+                wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+                "contrast_mask",
+            )
+            if self._mask_tex_key != plane_tex_key:
+                # r = the Contrast Mask plane, gba = the Diffusion plane's channels; both come
+                # off the same analysis grid, so they share one texture and one rect.
+                r_plane = mask_plane if mask_plane is not None else np.zeros(grid.shape[:2], dtype=np.float32)
+                gba = diff_plane if diff_plane is not None else np.zeros((*grid.shape[:2], 3), dtype=np.float32)
+                tex_mask.upload(np.dstack([r_plane, gba]))
+                self._mask_tex_key = plane_tex_key
+        else:
+            tex_mask = self._get_intermediate_texture(
+                1,
+                1,
+                wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+                "contrast_mask",
+            )
+        # The dodge/burn EV map feeds the exposure pass. A zero-initialized 1x1 dummy keeps
+        # the bind group valid when no masks are active (ev_scale.w gates it).
+        wants_ev_map = bool(settings.local.masks)
+        if wants_ev_map:
+            tex_local_ev = self._get_intermediate_texture(
+                w_rot,
+                h_rot,
+                wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+                "local_ev",
+            )
+        else:
+            tex_local_ev = self._get_intermediate_texture(
+                1,
+                1,
+                wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+                "local_ev",
+            )
+        # Tone-limited masks' shape alphas; the same 1x1 dummy when there is none (key_meta.x
+        # gates it).
+        key_size = (w_rot, h_rot) if limited_masks(settings.local) else (1, 1)
+        tex_local_key = self._get_intermediate_texture(
+            *key_size,
+            wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            "local_key",
+        )
+        tex_toning = self._get_intermediate_texture(
+            crop_w,
+            crop_h,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+            "toning",
+        )
+
+        enc = device.create_command_encoder()
+
+        if start_stage <= 0:
+            self._dispatch_pass(
+                enc,
+                "geometry",
+                [
+                    (0, source_tex.view),
+                    (1, tex_geom.view),
+                    (2, self._get_uniform_binding("geometry")),
+                ],
+                w_rot,
+                h_rot,
+            )
+
+        if start_stage <= 1:
+            self._dispatch_pass(
+                enc,
+                "normalization",
+                [
+                    (0, tex_geom.view),
+                    (1, tex_norm.view),
+                    (2, self._get_uniform_binding("normalization")),
+                ],
+                w_rot,
+                h_rot,
+            )
+            if wants_ev_map:
+                # This stage re-runs for any exposure change, but the map only moves
+                # with the masks and the geometry; the shader applies the grade.
+                tiled_maps = local_maps is not None
+                raster_key = (
+                    settings.local,
+                    settings.geometry.rotation,
+                    settings.geometry.fine_rotation,
+                    settings.geometry.flip_horizontal,
+                    settings.geometry.flip_vertical,
+                    k1_eff,
+                    settings.geometry.converge_v,
+                    settings.geometry.converge_h,
+                    orig_shape,
+                    w_rot,
+                    h_rot,
+                )
+                if tiled_maps or self._local_ev_key != raster_key:
+                    if local_maps is None:
+                        if self._local_maps_cache is not None and self._local_maps_cache[0] == raster_key:
+                            local_maps = self._local_maps_cache[1]
+                        else:
+                            local_maps = compute_local_maps(
+                                settings.local,
+                                h_rot,
+                                w_rot,
+                                orig_shape,
+                                rotation=settings.geometry.rotation,
+                                fine_rotation=settings.geometry.fine_rotation,
+                                flip_horizontal=settings.geometry.flip_horizontal,
+                                flip_vertical=settings.geometry.flip_vertical,
+                                distortion_k1=k1_eff,
+                                converge_v=settings.geometry.converge_v,
+                                converge_h=settings.geometry.converge_h,
+                            )
+                            self._local_maps_cache = (raster_key, local_maps)
+                    if local_maps is None:
+                        local_maps = np.zeros((h_rot, w_rot, 3), dtype=np.float32)
+                    ev_plane = local_maps[:, :, 0]
+                    # r = dodge/burn EV, g = the masks' flash, b = local grade ISO-R deltas (tone-limited
+                    # masks add their grade here). One texture, so neither map costs a bind slot.
+                    tex_local_ev.upload(np.dstack([ev_plane, local_maps[:, :, 2], local_maps[:, :, 1]]))
+                    if local_maps.shape[2] > 3:
+                        planes = np.zeros((*ev_plane.shape, MAX_KEYED_MASKS), dtype=np.float32)
+                        planes[:, :, : local_maps.shape[2] - 3] = local_maps[:, :, 3:]
+                        tex_local_key.upload(planes)
+                    # A tiled export passes a per-tile slice, which is not reusable.
+                    self._local_ev_key = None if tiled_maps else raster_key
+            if render_path(settings.process) is not RenderPath.PRINT:
+                # The transfer curve takes no dodge/burn map: local EV is a print-exposure
+                # input, and this path replaces the print.
+                self._dispatch_pass(
+                    enc,
+                    "transfer",
+                    [
+                        (0, tex_norm.view),
+                        (1, tex_expo.view),
+                        (2, self._get_uniform_binding("transfer")),
+                    ],
+                    w_rot,
+                    h_rot,
+                )
+            else:
+                self._dispatch_pass(
+                    enc,
+                    "exposure",
+                    [
+                        (0, tex_norm.view),
+                        (1, tex_expo.view),
+                        (2, self._get_uniform_binding("exposure")),
+                        (3, tex_local_ev.view),
+                        (4, tex_mask.view),
+                        (5, tex_local_key.view),
+                        (6, self._lut_texture(self._exposure_lut).view),
+                    ],
+                    w_rot,
+                    h_rot,
+                )
+
+        if settings.lab.clahe_strength > 0:
+            if clahe_cdf_override is None and start_stage <= 2:
+                self._dispatch_pass(
+                    enc,
+                    "clahe_hist",
+                    [(0, tex_expo.view), (1, self._buffers["clahe_h"])],
+                    8,
+                    8,
+                )
+                self._dispatch_pass(
+                    enc,
+                    "clahe_cdf",
+                    [
+                        (0, self._buffers["clahe_h"]),
+                        (1, self._buffers["clahe_c"]),
+                        (2, self._get_uniform_binding("clahe_u")),
+                    ],
+                    8,
+                    8,
+                )
+            if start_stage <= 2:
+                self._dispatch_pass(
+                    enc,
+                    "clahe_apply",
+                    [
+                        (0, tex_expo.view),
+                        (1, tex_clahe.view),
+                        (2, self._buffers["clahe_c"]),
+                        (3, self._get_uniform_binding("clahe_u")),
+                    ],
+                    w_rot,
+                    h_rot,
+                )
+            prev_tex = tex_clahe
+        else:
+            prev_tex = tex_expo
+
+        if start_stage <= 2:
+            self._sharpen_state_key = None
+            self._chroma_state_key = None
+        if start_stage <= 4:
+            # Sharpen state (USM blur or RL deconvolution) feeds the lab pass; a 1x1 dummy keeps binding 3 valid when it is
+            # off. The blur reads only its input, radius and kernel, so a lab-only change reuses the last one.
+            usage = wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING
+            lab_u = self._get_uniform_binding("lab")
+            sharpen_key = (settings.lab.sharpen_method, float(settings.lab.sharpen_radius), w_rot, h_rot)
+            blur_current = sharpen_key == self._sharpen_state_key
+            if settings.lab.sharpen > 0:
+                self._sharpen_state_key = sharpen_key
+            if settings.lab.sharpen > 0 and settings.lab.sharpen_method == SharpenMethod.RL:
+                # Iterative RL: ping-pong two textures through init + N x (blur_h, div_v,
+                # blur_h, mult_v). The final estimate lands back in rl_a.
+                tex_rl_a = self._get_intermediate_texture(w_rot, h_rot, usage, "rl_a")
+                tex_rl_b = self._get_intermediate_texture(w_rot, h_rot, usage, "rl_b")
+                if not blur_current:
+                    self._dispatch_pass(enc, "rl_init", [(0, prev_tex.view), (1, tex_rl_a.view)], w_rot, h_rot)
+                sk = self._buffers["sharpen_k"]
+                for _ in range(0 if blur_current else rl_iterations(settings.lab.sharpen_radius)):
+                    self._dispatch_pass(enc, "rl_blur_h", [(0, tex_rl_a.view), (1, tex_rl_b.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                    self._dispatch_pass(enc, "rl_div_v", [(0, tex_rl_b.view), (1, tex_rl_a.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                    self._dispatch_pass(enc, "rl_blur_h", [(0, tex_rl_a.view), (1, tex_rl_b.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                    self._dispatch_pass(enc, "rl_mult_v", [(0, tex_rl_b.view), (1, tex_rl_a.view), (2, lab_u), (3, sk)], w_rot, h_rot)
+                tex_sharpen_v = tex_rl_a
+            elif settings.lab.sharpen > 0:
+                tex_sharpen_h = self._get_intermediate_texture(w_rot, h_rot, usage, "sharpen_h")
+                tex_sharpen_v = self._get_intermediate_texture(w_rot, h_rot, usage, "sharpen_v")
+                if not blur_current:
+                    sk = self._buffers["sharpen_k"]
+                    self._dispatch_pass(
+                        enc, "lab_sharpen_h", [(0, prev_tex.view), (1, tex_sharpen_h.view), (2, lab_u), (3, sk)], w_rot, h_rot
+                    )
+                    self._dispatch_pass(
+                        enc, "lab_sharpen_v", [(0, tex_sharpen_h.view), (1, tex_sharpen_v.view), (2, lab_u), (3, sk)], w_rot, h_rot
+                    )
+            else:
+                tex_sharpen_v = self._get_intermediate_texture(1, 1, usage, "sharpen_v")
+            if settings.lab.sharpen > 0 and settings.lab.sharpen_auto_masking:
+                enc.clear_buffer(self._buffers["grain_hist"].buffer)
+                self._dispatch_pass(
+                    enc, "sharpen_grain_hist", [(0, tex_sharpen_v.view), (1, self._buffers["grain_hist"]), (2, lab_u)], w_rot, h_rot
+                )
+                self._dispatch_pass(
+                    enc, "sharpen_grain_pick", [(0, self._buffers["grain_hist"]), (1, self._buffers["auto_mask"]), (2, lab_u)], 1, 1
+                )
+            # The Chroma Denoise low-pass reads only its input and sigma, so a lab-only change reuses it too.
+            chroma_sigma = chroma_denoise_sigma(chroma_denoise_radius(settings.lab.chroma_denoise, is_mono(settings.process)), scale_factor)
+            if chroma_sigma > 0.0:
+                tex_chroma_h = self._get_intermediate_texture(w_rot, h_rot, usage, "chroma_h")
+                tex_chroma_v = self._get_intermediate_texture(w_rot, h_rot, usage, "chroma_v")
+                chroma_key = (chroma_sigma, w_rot, h_rot)
+                if chroma_key != self._chroma_state_key:
+                    ck = self._buffers["chroma_k"]
+                    self._dispatch_pass(
+                        enc, "chroma_lowpass_h", [(0, prev_tex.view), (1, tex_chroma_h.view), (2, lab_u), (3, ck)], w_rot, h_rot
+                    )
+                    self._dispatch_pass(
+                        enc, "chroma_lowpass_v", [(0, tex_chroma_h.view), (1, tex_chroma_v.view), (2, lab_u), (3, ck)], w_rot, h_rot
+                    )
+                    self._chroma_state_key = chroma_key
+            else:
+                tex_chroma_v = self._get_intermediate_texture(1, 1, usage, "chroma_v")
+            self._dispatch_pass(
+                enc,
+                "lab",
+                [
+                    (0, prev_tex.view),
+                    (1, tex_lab.view),
+                    (2, lab_u),
+                    (3, tex_sharpen_v.view),
+                    (4, tex_chroma_v.view),
+                    (5, self._buffers["auto_mask"]),
+                ],
+                w_rot,
+                h_rot,
+            )
+
+        tex_pre_toning = tex_lab
+
+        # Alternative processes are mutually exclusive, with no pass when none is picked: toning then reads tex_lab.
+        alt = settings.altproc.alt_process
+        if alt != AltProcess.NONE and settings.process.process_mode == ProcessMode.BW:
+            usage_alt = wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC
+            if alt == AltProcess.SABATTIER:
+                # The developed-silver mask, its blur in two separable passes (the Mackie line
+                # is the blur's reach), then the fold. Without lines only the fold runs.
+                tex_alt = self._get_intermediate_texture(w_rot, h_rot, usage_alt, "sabattier")
+                if start_stage <= 5:
+                    sab_u = self._get_uniform_binding("sabattier")
+                    sab_k = self._buffers["sabattier_k"]
+                    tex_bromide = tex_lab
+                    if self._sabattier_kernel_key:
+                        tex_sab_mask = self._get_intermediate_texture(w_rot, h_rot, usage_alt, "sabattier_mask")
+                        tex_bromide = self._get_intermediate_texture(w_rot, h_rot, usage_alt, "sabattier_h")
+                        self._dispatch_pass(enc, "sabattier_mask", [(0, tex_lab.view), (1, tex_sab_mask.view), (2, sab_u)], w_rot, h_rot)
+                        self._dispatch_pass(
+                            enc, "sabattier_h", [(0, tex_sab_mask.view), (1, tex_bromide.view), (2, sab_u), (3, sab_k)], w_rot, h_rot
+                        )
+                    self._dispatch_pass(
+                        enc,
+                        "sabattier_v",
+                        [(0, tex_lab.view), (1, tex_bromide.view), (2, tex_alt.view), (3, sab_u), (4, sab_k)],
+                        w_rot,
+                        h_rot,
+                    )
+            else:
+                shader = _ALT_SHADER[alt]
+                tex_alt = self._get_intermediate_texture(w_rot, h_rot, usage_alt, shader)
+                if start_stage <= 5:
+                    self._dispatch_pass(
+                        enc,
+                        shader,
+                        [
+                            (0, tex_lab.view),
+                            (1, tex_alt.view),
+                            (2, self._get_uniform_binding(shader)),
+                        ],
+                        w_rot,
+                        h_rot,
+                    )
+            tex_pre_toning = tex_alt
+
+        if start_stage <= 6:
+            self._dispatch_pass(
+                enc,
+                "toning",
+                [
+                    (0, tex_pre_toning.view),
+                    (1, tex_toning.view),
+                    (2, self._get_uniform_binding("toning")),
+                ],
+                crop_w,
+                crop_h,
+            )
+
+        # --- Finish (Vignette) ---
+        tex_finish = self._get_intermediate_texture(
+            crop_w,
+            crop_h,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+            "finish_tex",
+        )
+        if start_stage <= 7:
+            self._dispatch_pass(
+                enc,
+                "finish",
+                [
+                    (0, tex_toning.view),
+                    (1, tex_finish.view),
+                    (2, self._get_uniform_binding("finish")),
+                    (3, self._buffers["carrier_s"]),
+                    (4, self._buffers["carrier_t"]),
+                ],
+                crop_w,
+                crop_h,
+            )
+        # The pool never zeros or evicts it, so it still holds its last output when the stage
+        # is cached; tex_toning is pre-vignette and never the display source.
+        tex_for_layout = tex_finish
+
+        if not tiling_mode and apply_layout and not full_frame:
+            paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+            tex_final = self._get_intermediate_texture(
+                paper_w,
+                paper_h,
+                wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+                "final",
+            )
+            if start_stage <= 8:
+                self._dispatch_pass(
+                    enc,
+                    "layout",
+                    [
+                        (0, tex_for_layout.view),
+                        (1, tex_final.view),
+                        (2, self._get_uniform_binding("layout")),
+                    ],
+                    paper_w,
+                    paper_h,
+                )
+            content_rect = (off_x, off_y, content_w, content_h)
+        else:
+            tex_final, content_rect = tex_for_layout, (0, 0, crop_w, crop_h)
+
+        if not tiling_mode and readback_metrics:
+            device.queue.write_buffer(self._buffers["metrics"].buffer, 0, _METRICS_ZEROS)
+            enc.copy_buffer_to_buffer(self._buffers["auto_mask"].buffer, 4, self._buffers["metrics"].buffer, _METRICS_AUTO_MASK_BASE * 4, 4)
+            # Always compute metrics on the content image (tex_toning) before any
+            # border/layout pass so that border pixels don't skew the histogram.
+            self._dispatch_pass(
+                enc,
+                "metrics",
+                [(0, tex_toning.view), (1, self._buffers["metrics"])],
+                crop_w,
+                crop_h,
+            )
+            # The density histogram slice sits past the RGBL bins, so one shared readback. The same pass
+            # bins the scan-side parade: Peek Negative paints without a render, so it reads this print's scan.
+            self._dispatch_pass(
+                enc,
+                "density_hist",
+                [
+                    (0, tex_norm.view),
+                    (
+                        1,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_DENSITY_BASE * 4,
+                            "size": _METRICS_DENSITY_WORDS * 4,
+                        },
+                    ),
+                    (2, self._get_uniform_binding("density_hist")),
+                    (
+                        3,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_DENSITY_PARADE_BASE * 4,
+                            "size": _METRICS_DENSITY_PARADE_WORDS * 4,
+                        },
+                    ),
+                    (4, tex_geom.view),
+                    (
+                        5,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_FULL_SCALE_BASE * 4,
+                            "size": _METRICS_FULL_SCALE_WORDS * 4,
+                        },
+                    ),
+                ],
+                crop_w,
+                crop_h,
+            )
+            # Joint RGB bins for the printability read-out. Same content texture as the
+            # marginal histogram, and profile-free: the engine never learns which output
+            # profile is being proofed to, the CPU dots this against the gamut LUT.
+            self._dispatch_pass(
+                enc,
+                "color_hist",
+                [
+                    (0, tex_toning.view),
+                    (
+                        1,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_COLOR_BASE * 4,
+                            "size": _METRICS_COLOR_WORDS * 4,
+                        },
+                    ),
+                ],
+                crop_w,
+                crop_h,
+            )
+            self._dispatch_pass(
+                enc,
+                "waveform",
+                [
+                    (0, tex_toning.view),
+                    (
+                        1,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_WAVE_BASE * 4,
+                            "size": _METRICS_WAVE_WORDS * 4,
+                        },
+                    ),
+                    (
+                        2,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_WAVE_RGB_BASE * 4,
+                            "size": _METRICS_WAVE_RGB_WORDS * 4,
+                        },
+                    ),
+                    (
+                        3,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_PARADE_BASE * 4,
+                            "size": _METRICS_PARADE_WORDS * 4,
+                        },
+                    ),
+                ],
+                crop_w,
+                crop_h,
+            )
+            self._dispatch_pass(
+                enc,
+                "vectorscope",
+                [
+                    (0, tex_toning.view),
+                    (
+                        1,
+                        {
+                            "buffer": self._buffers["metrics"].buffer,
+                            "offset": _METRICS_SCOPE_BASE * 4,
+                            "size": _METRICS_SCOPE_WORDS * 4,
+                        },
+                    ),
+                ],
+                crop_w,
+                crop_h,
+            )
+
+        # Output transform: scene-linear to display-encoded, so every consumer reads
+        # encoded data.
+        tex_output = self._get_intermediate_texture(
+            tex_final.width,
+            tex_final.height,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+            "output_encoded",
+        )
+        self._dispatch_pass(enc, "output_encode", [(0, tex_final.view), (1, tex_output.view)], tex_final.width, tex_final.height)
+        tex_final = tex_output
+
+        device.queue.submit([enc.finish()])
+        timing.lap("record/submit passes")
+        # The exact stretch the shader normalized with (mirrors the CPU "final_bounds").
+        # The transfer path renders through the fixed window, not the measured one.
+        _base_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else bounds
+        _wp3, _bp3 = transfer_point_offsets(settings.process) if transfer else per_channel_point_offsets(settings.process)
+        final_bounds = LogNegativeBounds(
+            floors=tuple(f + wp for f, wp in zip(_base_bounds.floors, _wp3)),
+            ceils=tuple(c + bp for c, bp in zip(_base_bounds.ceils, _bp3)),
+        )
+        # The scan Parade's base: the roll's picked base, else this source's rebate read.
+        read_base_log = None
+        if not transfer:
+            if film_base is not None:
+                read_base_log = tuple(film_base)
+            elif source_base_log is not NOT_READ:
+                read_base_log = source_base_log
+        metrics: Dict[str, Any] = {
+            "active_roi": roi,
+            "base_positive": tex_final,
+            "normalized_log": tex_norm,
+            "content_rect": content_rect,
+            "log_bounds": bounds,
+            "final_bounds": final_bounds,
+            "log_bounds_base": base_bounds,
+            "norm_density_range": luminance_density_range(bounds),
+            "density_above_base": density_above_base_value,
+            "base_source": "picked" if film_base is not None else "read",
+            "film_base_density": base_scan_density(read_base_log, unmix_m),
+            "metered_anchor": metered_anchor,
+            "contrast_mask_centre": mask_centre,
+            "textural_range": textural_range,
+            "shadow_point": shadow_point,
+            "highlight_point": highlight_point,
+            "scan_clip_fractions": scan_clip_fractions,
+            # Raw cast refs so the chart can re-solve the exact render curves.
+            "neutral_axis_refs": neutral_axis_refs,
+        }
+        if measured_white is not None:
+            metrics["fade_white"] = measured_white
+        if measured_crossover is not None:
+            metrics["fade_crossover"] = measured_crossover
+        # A drag with no read leaves the base out, so the merged metrics keep the last frame's.
+        if not transfer and film_base is None and source_base_log is NOT_READ:
+            del metrics["film_base_density"]
+
+        if not tiling_mode and readback_metrics:
+            raw_metrics = self._readback_metrics()
+            timing.lap("GPU wait/metrics readback")
+            metrics["histogram_raw"] = raw_metrics[:_METRICS_HIST_WORDS].reshape((4, HISTOGRAM_BINS))
+            metrics["histogram_density"] = (
+                raw_metrics[_METRICS_DENSITY_BASE : _METRICS_DENSITY_BASE + _METRICS_DENSITY_WORDS]
+                .reshape((4, DENSITY_HIST_BINS))
+                .astype(np.float64)
+            )
+            metrics["histogram_color"] = (
+                raw_metrics[_METRICS_COLOR_BASE : _METRICS_COLOR_BASE + _METRICS_COLOR_WORDS]
+                .reshape((COLOR_HIST_BINS,) * 3)
+                .astype(np.float64)
+            )
+            metrics["waveform"] = (
+                raw_metrics[_METRICS_WAVE_BASE : _METRICS_WAVE_BASE + _METRICS_WAVE_WORDS]
+                .reshape((WAVEFORM_BINS, WAVEFORM_COLS))
+                .astype(np.float64)
+            )
+            metrics["waveform_color"] = (
+                raw_metrics[_METRICS_WAVE_RGB_BASE : _METRICS_WAVE_RGB_BASE + _METRICS_WAVE_RGB_WORDS]
+                .reshape((3, WAVEFORM_BINS, WAVEFORM_COLS))
+                .astype(np.float64)
+            )
+            metrics["waveform_parade"] = (
+                raw_metrics[_METRICS_PARADE_BASE : _METRICS_PARADE_BASE + _METRICS_PARADE_WORDS]
+                .reshape((3, WAVEFORM_BINS, WAVEFORM_COLS))
+                .astype(np.float64)
+            )
+            metrics["density_parade"] = (
+                raw_metrics[_METRICS_DENSITY_PARADE_BASE : _METRICS_DENSITY_PARADE_BASE + _METRICS_DENSITY_PARADE_WORDS]
+                .reshape((3, WAVEFORM_BINS, WAVEFORM_COLS))
+                .astype(np.float64)
+            )
+            metrics["scan_full_scale"] = (
+                raw_metrics[_METRICS_FULL_SCALE_BASE : _METRICS_FULL_SCALE_BASE + _METRICS_FULL_SCALE_WORDS]
+                .reshape((3, WAVEFORM_COLS))
+                .astype(np.float64)
+            )
+            if settings.lab.sharpen > 0 and settings.lab.sharpen_auto_masking:
+                metrics["auto_masking"] = float(raw_metrics[_METRICS_AUTO_MASK_BASE : _METRICS_AUTO_MASK_BASE + 1].view(np.float32)[0])
+            metrics["vectorscope"] = (
+                raw_metrics[_METRICS_SCOPE_BASE : _METRICS_SCOPE_BASE + _METRICS_SCOPE_WORDS]
+                .reshape((SCOPE_HUE_BINS, SCOPE_CHROMA_BINS))
+                .astype(np.float64)
+            )
+            try:
+                uv_key = (
+                    h,
+                    w,
+                    settings.geometry.rotation,
+                    settings.geometry.fine_rotation,
+                    settings.geometry.flip_horizontal,
+                    settings.geometry.flip_vertical,
+                    roi,
+                    k1_eff,
+                    settings.geometry.converge_v,
+                    settings.geometry.converge_h,
+                    full_frame,
+                )
+                if self._uv_grid_cache is not None and self._uv_grid_cache[0] == uv_key:
+                    metrics["uv_grid"] = self._uv_grid_cache[1]
+                else:
+                    uv_grid = CoordinateMapping.create_uv_grid(
+                        rh_orig=h,
+                        rw_orig=w,
+                        rotation=settings.geometry.rotation,
+                        fine_rot=settings.geometry.fine_rotation,
+                        flip_h=settings.geometry.flip_horizontal,
+                        flip_v=settings.geometry.flip_vertical,
+                        autocrop=True,
+                        # Matches the CPU engine: the crop tool's full-frame preview must not
+                        # slice the grid down to the crop it isn't rendering right now.
+                        autocrop_params={"roi": roi} if roi and not full_frame else None,
+                        distortion_k1=k1_eff,
+                        converge_v=settings.geometry.converge_v,
+                        converge_h=settings.geometry.converge_h,
+                    )
+                    self._uv_grid_cache = (uv_key, uv_grid)
+                    metrics["uv_grid"] = uv_grid
+            except Exception as e:
+                logger.error(f"GPU Engine metrics error: {e}")
+
+        self._last_settings = settings
+        self._last_targets_rev = exposure_models.TARGETS_REVISION
+        self._last_scale_factor = scale_factor
+        self._last_render_size_ref = render_size_ref
+        self._last_full_frame = full_frame
+        timing.lap("metrics")
+        return tex_final, metrics
+
+    def _upload_unified_uniforms(
+        self,
+        settings: WorkspaceConfig,
+        bounds: Any,
+        offset: Tuple[int, int],
+        full_dims: Tuple[int, int],
+        crop_offset: Tuple[int, int],
+        crop_w: int,
+        crop_h: int,
+        tiling_mode: bool,
+        render_size_ref: Optional[float],
+        scale_factor: float,
+        vignette_full_crop: Optional[Tuple[int, int, int, int]] = None,
+        full_frame: bool = False,
+        metered_anchor: Optional[float] = None,
+        textural_range: Optional[float] = None,
+        neutral_axis_refs: Optional[
+            Tuple[Tuple[float, float, float], Tuple[float, float, float], Optional[Tuple[float, float, float]], float]
+        ] = None,
+        shadow_point: Optional[float] = None,
+        highlight_point: Optional[float] = None,
+        unmix: Optional[np.ndarray] = None,
+        fade_anchor: Optional[Tuple[float, float, float]] = None,
+        crossover: Any = None,
+        white_space: str = "",
+        cam_xyz: Optional[list] = None,
+        camera_wb: Optional[list] = None,
+        contrast_mask: Optional[Tuple[Any, ...]] = None,
+        sabattier_sigma: float = 0.0,
+        plane_rect: Optional[Tuple[float, float, float, float]] = None,
+        diffusion_mix: float = 0.0,
+    ) -> None:
+        """Packs and uploads all pipeline parameters to the unified UBO."""
+        # scale_s uses the post-rotation dims the geometry pass emits. Zeroed for tiled
+        # export below, where geometry runs on the CPU instead.
+        w_rot, h_rot = full_dims
+        k1_eff = settings.geometry.distortion_k1
+        scale_s = compute_distortion_scale(k1_eff, w_rot, h_rot) if k1_eff != 0.0 else 1.0
+        g_data = struct.pack(
+            "ifii",
+            int(settings.geometry.rotation),
+            float(settings.geometry.fine_rotation),
+            (1 if settings.geometry.flip_horizontal else 0),
+            (1 if settings.geometry.flip_vertical else 0),
+        ) + struct.pack("ffff", float(k1_eff), float(scale_s), 0.0, 0.0)
+        # The shader undoes the keystone first, so it gets the CPU's own matrix inverted
+        # and normalized to [0,1] coords. Deriving the quad twice would let the two drift.
+        g_data += _keystone_inverse_bytes(settings.geometry.converge_v, settings.geometry.converge_h)
+        if tiling_mode:
+            g_data = b"\x00" * 64
+
+        f, c = bounds.floors, bounds.ceils
+        # The shaders read only the B&W value.
+        mode_val = 1 if settings.process.process_mode == ProcessMode.BW else 0
+
+        # Per-channel WP/BP (global + layer trims) mirror the CPU path. Baked into the packed
+        # floors/ceils, so the shader's scalar wp/bp offsets, kept at 0.0 for layout, need no
+        # per-channel lanes.
+        wp3, bp3 = per_channel_point_offsets(settings.process)
+        adj_floors = (f[0] + wp3[0], f[1] + wp3[1], f[2] + wp3[2])
+        adj_ceils = (c[0] + bp3[0], c[1] + bp3[1], c[2] + bp3[2])
+
+        # Transparency transfer uses the fixed window, deviated by White/Black Point as the
+        # measured path above is. That nudge is user-driven rather than metered, so it keeps
+        # identity at wp3=bp3=0. Mirrors TransparencyBaseProcessor.
+        if render_path(settings.process) is not RenderPath.PRINT:
+            wp3, bp3 = transfer_point_offsets(settings.process)
+            t_floors, t_ceils = transfer_bounds()
+            adj_floors = (t_floors[0] + wp3[0], t_floors[1] + wp3[1], t_floors[2] + wp3[2])
+            adj_ceils = (t_ceils[0] + bp3[0], t_ceils[1] + bp3[1], t_ceils[2] + bp3[2])
+
+        # The density stage the caller resolved once per frame (density_stage). The lane layout is
+        # documented on the shader's uniform struct.
+        cam, unmix, post, anchor = density_stage(settings.process, cam_xyz, camera_wb, unmix, fade_anchor)
+        if unmix is None:
+            unmix = np.eye(3)
+        unmix_w = unmix[:, 3] if unmix.shape[1] == 4 else (0.0, 0.0, 0.0)
+        if cam is None:
+            cam = np.eye(3, dtype=np.float32)
+        post_on = 1.0 if post is not None else 0.0
+        if post is None:
+            post = np.eye(3, dtype=np.float32)
+
+        n_data = (
+            struct.pack("ffff", adj_floors[0], adj_floors[1], adj_floors[2], 0.0)
+            + struct.pack("ffff", adj_ceils[0], adj_ceils[1], adj_ceils[2], 0.0)
+            + struct.pack(
+                "IIff",
+                mode_val,
+                0 if render_path(settings.process) is RenderPath.PRINT else 1,
+                0.0,
+                0.0,
+            )
+            + struct.pack("ffff", unmix[0, 0], unmix[0, 1], unmix[0, 2], unmix_w[0])
+            + struct.pack("ffff", unmix[1, 0], unmix[1, 1], unmix[1, 2], unmix_w[1])
+            + struct.pack("ffff", unmix[2, 0], unmix[2, 1], unmix[2, 2], unmix_w[2])
+            + struct.pack("ffff", float(cam[0, 0]), float(cam[0, 1]), float(cam[0, 2]), 0.0)
+            + struct.pack("ffff", float(cam[1, 0]), float(cam[1, 1]), float(cam[1, 2]), 0.0)
+            + struct.pack("ffff", float(cam[2, 0]), float(cam[2, 1]), float(cam[2, 2]), 0.0)
+            + struct.pack("ffff", float(post[0, 0]), float(post[0, 1]), float(post[0, 2]), post_on)
+            + struct.pack("ffff", float(post[1, 0]), float(post[1, 1]), float(post[1, 2]), 0.0)
+            + struct.pack("ffff", float(post[2, 0]), float(post[2, 1]), float(post[2, 2]), 0.0)
+            + struct.pack("ffff", *((0.0, 0.0, 0.0, 0.0) if anchor is None else (*anchor, 1.0)))
+            + crossover_uniform(crossover)
+        )
+
+        from negpy.features.exposure.logic import (
+            _reference_linear_value,
+            cast_solve_inputs,
+            contrast_mask_coeffs,
+            filtration_offsets,
+            per_channel_dye_separation,
+            per_channel_toe_shoulder,
+            grade_coupled_shape,
+            black_hold_taper,
+            channel_density_ranges,
+            local_ev_scale,
+            paper_dmin_rgb,
+            highlight_hold_offset,
+            shadow_hold_offset,
+            per_channel_curve_params,
+            effective_midtone_gamma,
+            per_channel_midtone_gamma,
+            per_channel_widths,
+            preflash_params,
+            split_grade_deltas,
+        )
+        from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+        from negpy.features.exposure.normalization import LogNegativeBounds, luminance_density_range
+
+        # Transparency transfer params (mirrors transparency/logic.py; inert on the print path).
+        tc = TRANSFER_CONSTANTS
+        t_e = slide_exposure(settings.process, settings.exposure)
+        t_mono = slide_mono_weights(settings.process, settings.exposure)
+        t_exp0, t_contrast0, t_toe3, t_sh3 = transfer_curve_params(t_e)
+        # Auto Density/Auto Grade, restated on this curve; each follows its toggle.
+        t_exp, t_contrast, t_hl_auto, t_sh_auto = transfer_auto_terms(
+            t_e, t_exp0, t_contrast0, textural_range, metered_anchor, shadow_point, highlight_point
+        )
+        t_tw3, t_sw3 = transfer_widths(t_e)
+        t_cmy = contrast_free_cmy(
+            filtration_offsets(
+                (t_e.wb_cyan, t_e.wb_magenta, t_e.wb_yellow),
+                LogNegativeBounds(floors=adj_floors, ceils=adj_ceils),
+            ),
+            t_contrast,
+        )
+        t_sh_c, t_hi_c, t_zone_k = zone_geometry()
+        t_wb_c, t_wb_k = wb_split_geometry()
+        t_cmy_m = EXPOSURE_CONSTANTS["cmy_max_density"]
+        # Cast Removal on the transparency curve: a per-channel affine on density, since
+        # this curve has no per-channel slope to re-solve. Identity when there is no axis.
+        t_cast_gain, t_cast_off = transfer_cast_affine(
+            LogNegativeBounds(adj_floors, adj_ceils),
+            neutral_axis_refs,
+            t_e.cast_removal_strength,
+            fade_white_target(settings.process, white_space),
+        )
+        # A finished positive skips the baseline gain, and the zone_taper.y lane below tells
+        # the shader to skip display_rendering too. Matches transparency/logic.py.
+        t_positive_source = bool(settings.process.positive_source)
+        t_baseline_gain = 1.0 if t_positive_source else 2.0 ** float(tc["transfer_baseline_ev"])
+        # Dye Separation on the transfer curve: same per-channel k3 as the print path,
+        # applied directly since there is no paper matrix here (see
+        # transparency/logic.py::apply_transfer_curve).
+        t_sep_k3 = per_channel_dye_separation(
+            t_e.dye_separation,
+            (
+                t_e.dye_separation_trim_red,
+                t_e.dye_separation_trim_green,
+                t_e.dye_separation_trim_blue,
+            ),
+        )
+        t_sep_damping = float(t_e.separation_damping)
+        tr_data = (
+            struct.pack(
+                "ffffffff",
+                float(t_exp),
+                float(t_contrast),
+                float(TRANSFER_DENSITY_RANGE),
+                float(t_zone_k),
+                float(tc["transfer_contrast_pivot"]),
+                float(tc["transfer_toe_knee"]),
+                float(tc["transfer_shoulder_knee"]),
+                float(t_baseline_gain),
+            )
+            + struct.pack("ffff", t_toe3[0], t_toe3[1], t_toe3[2], 0.0)
+            + struct.pack("ffff", t_sh3[0], t_sh3[1], t_sh3[2], 0.0)
+            + struct.pack("ffff", t_tw3[0], t_tw3[1], t_tw3[2], 0.0)
+            + struct.pack("ffff", t_sw3[0], t_sw3[1], t_sw3[2], 0.0)
+            + struct.pack("ffff", t_cmy[0], t_cmy[1], t_cmy[2], 0.0)
+            + struct.pack(
+                "ffff",
+                float(t_e.shadow_density + t_sh_auto),
+                float(t_e.highlight_density + t_hl_auto),
+                float(t_sh_c),
+                float(t_hi_c),
+            )
+            + struct.pack(
+                "ffff",
+                t_e.shadow_cyan * t_cmy_m,
+                t_e.shadow_magenta * t_cmy_m,
+                t_e.shadow_yellow * t_cmy_m,
+                float(t_wb_c),
+            )
+            + struct.pack(
+                "ffff",
+                t_e.highlight_cyan * t_cmy_m,
+                t_e.highlight_magenta * t_cmy_m,
+                t_e.highlight_yellow * t_cmy_m,
+                float(t_wb_k),
+            )
+            + struct.pack(
+                "ffff",
+                float(ZONE_BLACK_TAPER),
+                1.0 if t_positive_source else 0.0,
+                math.radians(float(settings.process.hue_trim)),
+                0.0,
+            )
+            + struct.pack("ffff", t_cast_gain[0], t_cast_gain[1], t_cast_gain[2], 0.0)
+            + struct.pack(
+                "ffff",
+                t_cast_off[0] * TRANSFER_DENSITY_RANGE,
+                t_cast_off[1] * TRANSFER_DENSITY_RANGE,
+                t_cast_off[2] * TRANSFER_DENSITY_RANGE,
+                0.0,
+            )
+            + struct.pack("ffff", t_sep_k3[0], t_sep_k3[1], t_sep_k3[2], t_sep_damping)
+            + struct.pack("ffff", *(t_mono or (0.0, 0.0, 0.0)), 1.0 if t_mono else 0.0)
+        )
+        from negpy.features.exposure.papers import (
+            compose_density_matrices,
+            effective_constants,
+            effective_paper_profile,
+            resolve_print_color,
+            resolve_saturation_matrix,
+        )
+
+        exp = printed_exposure(settings.process, settings.exposure)
+        paper = effective_paper_profile(exp.paper_profile, settings.process.process_mode)
+        pc = effective_constants(paper)  # tonal overrides; non-paper keys == EXPOSURE_CONSTANTS
+        d_min = paper.d_min if exp.paper_dmin else 0.0
+        # metered_anchor may be measured for stats even when auto_exposure is off, so let
+        # it move the render only when the toggle is on.
+        render_anchor = metered_anchor if exp.auto_exposure else None
+        lum_range = luminance_density_range(bounds)
+        # adj_floors/adj_ceils (packed above) are the final bounds the shader normalizes
+        # with, shared by the Cast Removal neutral axis.
+        strength, neutral_axis_norm = cast_solve_inputs(
+            LogNegativeBounds(adj_floors, adj_ceils),
+            neutral_axis_refs,
+            exp.cast_removal_strength,
+        )
+        mg = effective_midtone_gamma(paper, exp.midtone_gamma)
+        slopes, pivots, curvatures = per_channel_curve_params(
+            exp.grade,
+            exp.density,
+            exp.auto_normalize_contrast,
+            strength,
+            lum_range,
+            textural_range,
+            d_min=d_min,
+            anchor=render_anchor,
+            paper=paper,
+            neutral_axis_norm=neutral_axis_norm,
+            grade_trims=(exp.grade_trim_red, exp.grade_trim_green, exp.grade_trim_blue),
+            shadow_point=shadow_point,
+            midtone_gamma=mg,
+        )
+        hl_auto = (
+            highlight_hold_offset(
+                slopes[1], pivots[1], highlight_point, d_min=d_min, paper=paper, preflash=exp.preflash, grade=exp.grade, midtone_gamma=mg
+            )
+            if exp.auto_normalize_contrast and highlight_point is not None
+            else 0.0
+        )
+        sh_auto = (
+            shadow_hold_offset(slopes[1], pivots[1], shadow_point, d_min=d_min, paper=paper, midtone_gamma=mg)
+            if exp.auto_normalize_contrast and shadow_point is not None
+            else 0.0
+        )
+        cmy_m = EXPOSURE_CONSTANTS["cmy_max_density"]
+        _toe_eff, _shoulder_eff = grade_coupled_shape(slopes[1], exp.toe, exp.shoulder)
+        _sg3, _hg3 = split_grade_deltas(
+            exp.grade,
+            exp.shadow_grade,
+            exp.highlight_grade,
+            shadow_trims=(exp.shadow_grade_trim_red, exp.shadow_grade_trim_green, exp.shadow_grade_trim_blue),
+            highlight_trims=(exp.highlight_grade_trim_red, exp.highlight_grade_trim_green, exp.highlight_grade_trim_blue),
+        )
+        # Per-channel effective toe/shoulder, pre-scaled. The uniform block is full at
+        # 256B, so these ride the vec4 w-lanes.
+        _ts_k = float(EXPOSURE_CONSTANTS["toe_shoulder_strength"])
+        _toe3, _sh3 = per_channel_toe_shoulder(
+            _toe_eff,
+            _shoulder_eff,
+            (exp.toe_trim_red, exp.toe_trim_green, exp.toe_trim_blue),
+            (exp.shoulder_trim_red, exp.shoulder_trim_green, exp.shoulder_trim_blue),
+        )
+        _toe3 = tuple(t * _ts_k for t in _toe3)
+        _sh3 = tuple(s * _ts_k for s in _sh3)
+        _mg3 = per_channel_midtone_gamma(
+            paper,
+            exp.midtone_gamma,
+            (exp.midtone_gamma_trim_red, exp.midtone_gamma_trim_green, exp.midtone_gamma_trim_blue),
+        )
+        _tw3, _sw3 = per_channel_widths(
+            exp.toe_width,
+            exp.shoulder_width,
+            (exp.toe_width_trim_red, exp.toe_width_trim_green, exp.toe_width_trim_blue),
+            (exp.shoulder_width_trim_red, exp.shoulder_width_trim_green, exp.shoulder_width_trim_blue),
+        )
+        # Mirrors apply_characteristic_curve (absolute CC, paper base, dye mix).
+        wb_offsets = filtration_offsets(
+            (exp.wb_cyan, exp.wb_magenta, exp.wb_yellow),
+            LogNegativeBounds(adj_floors, adj_ceils),
+        )
+        dmin_rgb = paper_dmin_rgb(d_min, paper)
+        dye, lut = resolve_print_color(paper)
+        self._exposure_lut = lut
+        lut_row = (0.0, 0.0, 0.0, 0.0)
+        if lut is not None:
+            lut_black = 0.0
+            if not exp.paper_black:
+                lut_black = lut_black_luminance(lut, dmin_rgb, black_density_rgb(float(pc["d_max"]), _toe3, float(pc["toe_height"])))
+            lut_row = (*(float(v) for v in lut.e_max), lut_black)
+        # Density-space Dye Separation, composed into the same dye_mix slot as the paper's
+        # real crosstalk. Mirrors apply_characteristic_curve exactly.
+        if settings.process.process_mode == ProcessMode.BW:
+            sat_k3 = (1.0, 1.0, 1.0)
+            sep_damping = 0.0
+            sat = None
+        else:
+            sat_k3 = per_channel_dye_separation(
+                exp.dye_separation,
+                (exp.dye_separation_trim_red, exp.dye_separation_trim_green, exp.dye_separation_trim_blue),
+            )
+            # Separation Damping makes k per-pixel, so it leaves the matrix slot to the
+            # paper's coupling and runs in the shader instead.
+            sep_damping = float(exp.separation_damping) if sat_k3 != (1.0, 1.0, 1.0) else 0.0
+            sat = None if sep_damping > 0.0 else resolve_saturation_matrix(sat_k3)
+        composed = compose_density_matrices(dye, sat)
+        dye = composed  # use_dye_mix (below) and dye_rows both key off this
+        dye_rows = np.eye(3) if dye is None else dye
+
+        # The metrics this render publishes, shared by the tone-limited masks and the carrier.
+        curve_metrics = {
+            "final_bounds": LogNegativeBounds(adj_floors, adj_ceils),
+            "norm_density_range": lum_range,
+            "metered_anchor": metered_anchor,
+            "textural_range": textural_range,
+            "shadow_point": shadow_point,
+            "highlight_point": highlight_point,
+            "neutral_axis_refs": neutral_axis_refs,
+        }
+        key_params = limited_mask_params(settings.local, exp, settings.process.process_mode, curve_metrics)
+        key_rows = np.zeros((MAX_KEYED_MASKS, 4), dtype=np.float32)
+        if key_params is not None:
+            key_rows[: len(key_params)] = key_params
+        # (lim, a, b, lo, hi, g_lo, g_hi); lim 0 = off.
+        mask_k = (0.0,) * 7
+        if contrast_mask:
+            coeffs = contrast_mask_coeffs(exp.contrast_mask_strength, contrast_mask[0], slopes, pivots, wb_offsets, lum_range)
+            if coeffs is not None:
+                mask_k = (coeffs[6], *coeffs[:6])
+        plane_rect_v = (
+            tuple(float(v) for v in contrast_mask[1:])
+            if contrast_mask
+            else (tuple(float(v) for v in plane_rect) if plane_rect is not None else (0.0, 0.0, 1.0, 1.0))
+        )
+        r_min, r_max = float(EXPOSURE_CONSTANTS["iso_r_min"]), float(EXPOSURE_CONSTANTS["iso_r_max"])
+        key_meta = struct.pack(
+            "ffff", 0.0 if key_params is None else float(len(key_params)), min(max(float(exp.grade), r_min), r_max), r_min, r_max
+        )
+
+        # The w-lanes carry per-channel toe (first three vec4s) and shoulder (next three).
+        # See the toe3/sh3 reads in exposure.wgsl.
+        e_data = (
+            struct.pack("ffff", pivots[0], pivots[1], pivots[2], _toe3[0])
+            + struct.pack("ffff", slopes[0], slopes[1], slopes[2], _toe3[1])
+            + struct.pack("ffff", curvatures[0], curvatures[1], curvatures[2], _toe3[2])
+            + struct.pack("ffff", wb_offsets[0], wb_offsets[1], wb_offsets[2], _sh3[0])
+            + struct.pack(
+                "ffff",
+                exp.shadow_cyan * cmy_m,
+                exp.shadow_magenta * cmy_m,
+                exp.shadow_yellow * cmy_m,
+                _sh3[1],
+            )
+            + struct.pack(
+                "ffff",
+                exp.highlight_cyan * cmy_m,
+                exp.highlight_magenta * cmy_m,
+                exp.highlight_yellow * cmy_m,
+                _sh3[2],
+            )
+            # Asymmetric H&D print-curve scalars; mirrors negpy_core print_curve.rs.
+            # Per-channel knee widths occupy the dead scalar toe/shoulder/
+            # midtone_gamma slots and the former flare pad (see exposure.wgsl).
+            + struct.pack(
+                "14fI3fIf",
+                _tw3[0],
+                _tw3[1],
+                _tw3[2],
+                _sw3[0],
+                # Zone Density ΔD shadow offset in the ex-d_min slot; the highlight offset
+                # rides d_min_rgb.w.
+                exp.shadow_density + sh_auto,
+                pc["d_max"],
+                pc["toe_sharpness_base"],
+                pc["shoulder_sharpness_base"],
+                # Separation Damping (toeshoulder_width_ref is a WGSL literal).
+                sep_damping,
+                pc["toe_height"],
+                pc["shoulder_height"],
+                pc["reference_print_density"],
+                _sw3[1],
+                # Separation Damping's per-layer k, red (ex-surround_gamma slot). Green and
+                # blue ride the split_sh/split_hi w-lanes.
+                sat_k3[0],
+                mode_val,
+                _reference_linear_value(d_min, paper),
+                _sw3[2],
+                float(pc["paper_gamma_width"]),
+                1 if dye is not None else 0,
+                # BPC flag (former pad). Per-channel toe/shoulder/Snap ride the vec4
+                # w-lanes, widths the ex-scalar slots, Zone Density ΔD the ex-d_min slot
+                # and d_min_rgb.w, Split Grade the split_sh/split_hi rows past 256B.
+                1.0 if not exp.paper_black else 0.0,
+            )
+            + struct.pack("ffff", dmin_rgb[0], dmin_rgb[1], dmin_rgb[2], exp.highlight_density + hl_auto)
+            # Dye-row w-lanes carry the per-channel midtone gamma (Snap).
+            + struct.pack("ffff", dye_rows[0, 0], dye_rows[0, 1], dye_rows[0, 2], _mg3[0])
+            + struct.pack("ffff", dye_rows[1, 0], dye_rows[1, 1], dye_rows[1, 2], _mg3[1])
+            + struct.pack("ffff", dye_rows[2, 0], dye_rows[2, 1], dye_rows[2, 2], _mg3[2])
+            # Dodge/burn EV-stop size per channel (local_ev_scale); w = enable flag.
+            + struct.pack(
+                "ffff",
+                *local_ev_scale(LogNegativeBounds(adj_floors, adj_ceils)),
+                1.0 if settings.local.masks else 0.0,
+            )
+            # Split Grade per-channel zone contrast gains (split_grade_deltas). The w-lanes
+            # carry Separation Damping's green and blue k.
+            + struct.pack("ffff", _sg3[0], _sg3[1], _sg3[2], sat_k3[1])
+            + struct.pack("ffff", _hg3[0], _hg3[1], _hg3[2], sat_k3[2])
+            # Hue Trim in radians (x), then the preflash fraction, threshold value and paper
+            # gamma (yzw). The shader rotates before its encode.
+            + struct.pack(
+                "ffff",
+                math.radians(float(settings.process.hue_trim)),
+                max(exp.preflash, 0.0),
+                *preflash_params(exp.grade, d_min, paper, mg),
+            )
+            # Contrast Mask: its stop cap (0 = off), then the printed frame's origin and span in rotated pixels, shared
+            # with the Diffusion plane; w = the diffusion mix (0 = off). The shader does the upscale. The span's
+            # zw and the next row carry the rest of contrast_mask_coeffs.
+            + struct.pack("ffff", mask_k[0], plane_rect_v[0], plane_rect_v[1], diffusion_mix)
+            + struct.pack("ffff", plane_rect_v[2], plane_rect_v[3], mask_k[3], mask_k[4])
+            + struct.pack("ffff", mask_k[1], mask_k[2], mask_k[5], mask_k[6])
+            + key_rows.tobytes()
+            + key_meta
+            # Diffusion: each channel's log range, one normalized unit of val in density; w = the
+            # Hold Black taper span (0 = off).
+            + struct.pack("ffff", *channel_density_ranges(LogNegativeBounds(adj_floors, adj_ceils)), black_hold_taper(exp, paper))
+            # Print-stock LUT: xyz = e_max (0 = no LUT), w = the black that BPC maps to 0.
+            + struct.pack("ffff", *lut_row)
+            + struct.pack("ffff", *collapse_weights(settings.process, exp), 0.0)
+        )
+
+        cls = float(settings.lab.clahe_strength)
+        c_data = (
+            struct.pack(
+                "ffiiii",
+                cls,
+                cls * 2.5,
+                offset[0],
+                offset[1],
+                full_dims[0],
+                full_dims[1],
+            )
+            + b"\x00" * 8
+        )
+
+        lab = settings.lab
+        # Sharpen taps are computed once in Python by gaussian_kernel_1d, the same array
+        # the CPU convolves with, and uploaded to sharpen_k. The shaders need only the
+        # half-width, derived from the array itself so the support matches.
+        sharpen_radius_px = 0
+        if lab.sharpen > 0:
+            kernel = gaussian_kernel_1d(lab.sharpen_radius)
+            sharpen_radius_px = len(kernel) // 2
+            kernel_key = (float(lab.sharpen_radius),)
+            if self._sharpen_kernel_key != kernel_key:
+                self._buffers["sharpen_k"].upload(kernel)
+                self._sharpen_kernel_key = kernel_key
+        chroma_radius_px = 0
+        chroma_sigma = chroma_denoise_sigma(chroma_denoise_radius(lab.chroma_denoise, is_mono(settings.process)), scale_factor)
+        if chroma_sigma > 0.0:
+            chroma_kernel = gaussian_kernel_1d(chroma_sigma)
+            chroma_radius_px = len(chroma_kernel) // 2
+            if self._chroma_kernel_key != chroma_sigma:
+                self._buffers["chroma_k"].upload(chroma_kernel)
+                self._chroma_kernel_key = chroma_sigma
+        hal_amounts = halation_amounts(lab.halation_strength, is_mono(settings.process))
+        l_data = struct.pack(
+            "ffffffffffffffff",
+            float(lab.sharpen),
+            float(lab.chroma_denoise),
+            float(lab.saturation),
+            GLOW_AMOUNT_MAX * float(lab.glow_amount),
+            float(lab.halation_strength),
+            # Chroma Denoise's sigma is chroma_denoise * scale_factor, as on the CPU.
+            float(scale_factor),
+            float(sharpen_radius_px),
+            float(lab.sharpen_masking),
+            1.0 if lab.sharpen_method == SharpenMethod.RL else 0.0,
+            float(lab.skin_protection),
+            float(chroma_radius_px),
+            1.0 if lab.sharpen_auto_masking else 0.0,
+            *hal_amounts,
+            float(min(h_rot, w_rot)),
+        ) + struct.pack("ffffffff", float(2.0 ** float(lab.exposure_ev)), float(lab.tone_highlights),
+                        float(lab.tone_shadows), float(lab.tone_whites), float(lab.tone_blacks),
+                        1.0 if hsl_active(lab) and not is_mono(settings.process) else 0.0, 0.0, 0.0,
+                        ) + struct.pack("24f", *lab.hsl_hue, *lab.hsl_saturation, *lab.hsl_luminance) + struct.pack(
+            "4f", *(wb_gains(lab.wb_temp, lab.wb_tint) if not is_mono(settings.process) else (1.0, 1.0, 1.0)), 0.0)
+
+        is_bw = 1 if is_mono(settings.process) else 0
+
+        altproc = settings.altproc
+        lc = LITH_CONSTANTS
+        lith_dmax = float(pc["d_max"])
+        lith_over = 0.301 * float(altproc.lith_exposure)
+        li_data = (
+            struct.pack("ffff", *[float(p[0]) for p in paper.lith_path])
+            + struct.pack("ffff", *[float(p[1]) for p in paper.lith_path])
+            + struct.pack(
+                "ffff",
+                lith_over,
+                lith_over * float(lc["foot_veil"]),
+                lith_dmax * (lc["knee_lo"] - lc["knee_span"] * float(altproc.lith_snatch)),
+                max(lc["abrupt_lo"] - lc["abrupt_span"] * float(altproc.lith_abruptness), 0.01),
+            )
+            # 12 bytes of tail padding: two vec4s force a 16-byte struct align, so
+            # WGSL rounds LithUniforms up to 64 and the binding size must match.
+            + struct.pack("f", lith_dmax)
+            + b"\x00" * 12
+        )
+
+        cs = sensitizer_constants(altproc.cyano_sensitizer)
+        cc = CYANOTYPE_CONSTANTS
+        cy_data = (
+            struct.pack("ffff", *[float(p[0]) for p in cs["path"]])
+            + struct.pack("ffff", *[float(p[1]) for p in cs["path"]])
+            + struct.pack(
+                "ffff",
+                0.301 * float(altproc.cyano_exposure),
+                max(float(altproc.cyano_scale), 0.1),
+                float(altproc.cyano_bleach),
+                float(altproc.cyano_tannin),
+            )
+            # 4 bytes of tail padding, as for lith: the leading vec4s round
+            # CyanoUniforms up to 64 and the binding size must match.
+            + struct.pack(
+                "fff",
+                float(cs["d_max"]),
+                float(cc["brown_dir"][0]),
+                float(cc["brown_dir"][1]),
+            )
+            + b"\x00" * 4
+        )
+
+        # Mackie-line taps from gaussian_kernel_1d, as on the CPU; the shaders read the half-width
+        # from the array. A zero sigma leaves the key None and skips the mask and blur passes.
+        sc = SABATTIER_CONSTANTS
+        sab_sigma = max(float(sabattier_sigma), 0.0)
+        sab_radius = 0
+        if altproc.alt_process == AltProcess.SABATTIER and sab_sigma > 0.0:
+            sab_kernel = gaussian_kernel_1d(sab_sigma)
+            sab_radius = len(sab_kernel) // 2
+            if self._sabattier_kernel_key != sab_sigma:
+                self._buffers["sabattier_k"].upload(sab_kernel)
+                self._sabattier_kernel_key = sab_sigma
+        else:
+            self._sabattier_kernel_key = None
+        sa_data = struct.pack(
+            "ffffffff",
+            float(altproc.sabattier_reexposure) * lith_dmax,
+            float(sc["fold_width"]),
+            float(sc["edge_width"]),
+            float(altproc.sabattier_strength),
+            float(sab_radius),
+            1.0 if sab_radius > 0 else 0.0,
+            lith_dmax,
+            0.0,
+        )
+
+        t_data = (
+            struct.pack(
+                "ffff",
+                float(lab.saturation),
+                float(settings.toning.selenium_strength),
+                float(settings.toning.sepia_strength),
+                2.2,
+            )
+            + struct.pack(
+                "iiIf",
+                crop_offset[0],
+                crop_offset[1],
+                is_bw,
+                float(settings.toning.gold_strength),
+            )
+            + struct.pack(
+                "ffff",
+                float(settings.toning.shadow_tint_hue),
+                float(settings.toning.shadow_tint_strength),
+                float(settings.toning.highlight_tint_hue),
+                float(settings.toning.highlight_tint_strength),
+            )
+            + struct.pack(
+                "fffI",
+                float(settings.toning.blue_strength),
+                float(settings.toning.copper_strength),
+                float(settings.toning.vanadium_strength),
+                _ALT_MODE.get(altproc.alt_process, 0) if settings.process.process_mode == ProcessMode.BW else 0,
+            )
+        )
+
+        if vignette_full_crop is None:
+            v_full_w, v_full_h, v_off_x, v_off_y = crop_w, crop_h, 0, 0
+        else:
+            v_full_w, v_full_h, v_off_x, v_off_y = vignette_full_crop
+        carrier_px = 0.0
+        if settings.finish.carrier_width > 0.0 and not full_frame:
+            carrier_px = carrier_width_px(
+                settings.finish.carrier_width,
+                settings.export.export_print_size,
+                float(max(v_full_w, v_full_h)),
+            )
+            self._buffers["carrier_t"].upload(rebate_tone(settings, curve_metrics).ravel())
+        paper = PrintService.effective_paper_linear(settings.finish, settings.toning)
+        f_data = struct.pack(
+            "ffffffffffffff",
+            float(settings.finish.vignette_stops),
+            float(settings.finish.vignette_size),
+            float(settings.finish.vignette_roundness),
+            float(v_full_w),
+            float(v_full_h),
+            float(v_off_x),
+            float(v_off_y),
+            float(carrier_px),
+            float(settings.finish.carrier_rough),
+            float(settings.finish.carrier_flare),
+            float(settings.finish.carrier_corner),
+            float(paper[0]),
+            float(paper[1]),
+            float(paper[2]),
+        )
+
+        pw, ph, cw, ch, ox, oy, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+        color_hex = PrintService.effective_border_color(settings.finish, settings.toning).lstrip("#")
+        # The layout pass writes scene-linear values that output_encode encodes after it.
+        bg = tuple(float(v) for v in working_oetf_decode(np.array([int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4)], np.float32)))
+        scale = float(cw) / max(1.0, float(crop_w))
+        y_data = (
+            struct.pack("ffffii", bg[0], bg[1], bg[2], 1.0, ox, oy) + struct.pack("iiii", cw, ch, crop_w, crop_h) + struct.pack("f", scale)
+        )
+
+        # ROI offset + crop dims for the density-histogram pass (tex_norm is uncropped), and the bounds
+        # the scan parade inverts the stretch with.
+        dh_data = (
+            struct.pack("IIII", crop_offset[0], crop_offset[1], crop_w, crop_h)
+            + struct.pack("ffff", adj_floors[0], adj_floors[1], adj_floors[2], 0.0)
+            + struct.pack("ffff", adj_ceils[0], adj_ceils[1], adj_ceils[2], 0.0)
+        )
+
+        full_buffer = bytearray()
+        for name, d in zip(
+            self._uniform_names,
+            [g_data, n_data, e_data, tr_data, c_data, l_data, li_data, cy_data, sa_data, t_data, f_data, y_data, dh_data],
+        ):
+            full_buffer += d + b"\x00" * (self._slot_bytes(name) - len(d))
+
+        if not self.gpu.device:
+            raise RuntimeError("GPU device lost")
+        self.gpu.device.queue.write_buffer(self._buffers["unified_u"].buffer, 0, full_buffer)
+
+    def _calculate_layout_dims(
+        self, settings: WorkspaceConfig, cw: int, ch: int, size_ref: Optional[float]
+    ) -> Tuple[int, int, int, int, int, int, int]:
+        """Calculates final paper and image dimensions based on print settings.
+        Returns (paper_w, paper_h, content_w, content_h, off_x, off_y, dpi).
+
+        Only a preview paper is capped to max_texture_size; an export paper over the cap
+        tiles instead (``requires_tiling``)."""
+        mode = settings.export.export_resolution_mode
+
+        # Preview path: size_ref is the desired paper long edge. Derive virtual DPI from it
+        # and print_size_cm so the border scales sensibly. Forces non-ORIGINAL math.
+        if size_ref:
+            dpi = int((size_ref * 2.54) / max(0.1, settings.export.export_print_size))
+            paper_long_px = int(size_ref)
+            mode = ExportResolutionMode.PRINT
+        elif mode == ExportResolutionMode.TARGET_PX:
+            dpi = PrintService.effective_dpi(settings.export)
+            paper_long_px = max(1, int(settings.export.export_target_long_edge_px))
+        else:
+            dpi = settings.export.export_dpi
+            paper_long_px = int((settings.export.export_print_size / 2.54) * dpi)
+
+        border_px = int((settings.finish.border_size / 2.54) * dpi)
+        weight = max(1.0, float(settings.finish.border_bottom_weight))
+        border_bottom_px = int(border_px * weight)
+        border_y_px = border_px + border_bottom_px
+
+        if mode == ExportResolutionMode.ORIGINAL:
+            content_w, content_h = cw, ch
+
+            if settings.export.paper_aspect_ratio == AspectRatio.ORIGINAL:
+                paper_w, paper_h = content_w + 2 * border_px, content_h + border_y_px
+            else:
+                try:
+                    w_r, h_r = map(float, settings.export.paper_aspect_ratio.split(":"))
+                    paper_ratio = w_r / h_r
+                except Exception:
+                    paper_ratio = cw / ch
+
+                min_paper_w = content_w + 2 * border_px
+                min_paper_h = content_h + border_y_px
+
+                if (min_paper_w / min_paper_h) > paper_ratio:
+                    paper_w = min_paper_w
+                    paper_h = int(paper_w / paper_ratio)
+                else:
+                    paper_h = min_paper_h
+                    paper_w = int(paper_h * paper_ratio)
+
+            off_x = (paper_w - content_w) // 2
+            off_y = PrintService.weighted_offset_y(paper_h, content_h, border_px, border_bottom_px)
+        else:
+            if settings.export.paper_aspect_ratio == AspectRatio.ORIGINAL:
+                # Same formulas as PrintService.apply_layout, or the mat gains a 1 px line.
+                if cw >= ch:
+                    content_w = max(10, paper_long_px - 2 * border_px)
+                    content_h = max(1, content_w * ch // cw)
+                else:
+                    content_h = max(10, paper_long_px - border_y_px)
+                    content_w = max(1, content_h * cw // ch)
+                paper_w, paper_h = content_w + 2 * border_px, content_h + border_y_px
+                off_x, off_y = border_px, border_px
+            else:
+                paper_w, paper_h = PrintService.paper_dims_from_long_edge(
+                    paper_long_px,
+                    settings.export.paper_aspect_ratio,
+                    cw,
+                    ch,
+                )
+                inner_w, inner_h = max(10, paper_w - 2 * border_px), max(10, paper_h - border_y_px)
+                content_w, content_h = PrintService.fit_content(cw, ch, inner_w, inner_h)
+
+                off_x = (paper_w - content_w) // 2
+                off_y = PrintService.weighted_offset_y(paper_h, content_h, border_px, border_bottom_px)
+
+        # A preview must not manufacture pixels. The decode can land below size_ref (a
+        # half-size RAW preview, or a crop), and resampling it up to the paper long edge
+        # leaves the canvas quoting zoom against a buffer denser than the pixels behind
+        # it: 1:1 then reads closer than one scan pixel per device pixel. Re-derive the
+        # layout from the size the content can fill; the display shader does the rest.
+        if size_ref and cw > 0 and ch > 0 and (content_w > cw or content_h > ch):
+            fit = min(cw / content_w, ch / content_h)
+            return self._calculate_layout_dims(settings, cw, ch, size_ref * fit)
+
+        max_tex = APP_CONFIG.max_texture_size if size_ref else None
+        if max_tex is not None:
+            long_edge = max(paper_w, paper_h)
+            if long_edge > max_tex:
+                s = max_tex / long_edge
+                paper_w = max(1, int(paper_w * s))
+                paper_h = max(1, int(paper_h * s))
+                content_w = max(1, int(content_w * s))
+                content_h = max(1, int(content_h * s))
+                off_x = int(off_x * s)
+                off_y = int(off_y * s)
+                dpi = max(1, int(dpi * s))
+
+        return paper_w, paper_h, content_w, content_h, off_x, off_y, dpi
+
+    def _readback_clahe_cdf(self) -> np.ndarray:
+        """Reads back the CLAHE CDF buffer from GPU."""
+        device = self.gpu.device
+        assert device is not None
+        nbytes = 64 * HISTOGRAM_BINS * 4
+        read_buf = device.create_buffer(
+            size=nbytes,
+            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+        )
+        encoder = device.create_command_encoder()
+        encoder.copy_buffer_to_buffer(self._buffers["clahe_c"].buffer, 0, read_buf, 0, nbytes)
+        device.queue.submit([encoder.finish()])
+        read_buf.map_sync(wgpu.MapMode.READ)
+        data = np.frombuffer(read_buf.read_mapped(), dtype=np.float32).copy()
+        read_buf.unmap()
+        read_buf.destroy()
+        return data
+
+    def _readback_metrics(self) -> np.ndarray:
+        """Synchronously reads back the flat metrics buffer (u32 words) from GPU."""
+        device = self.gpu.device
+        if not device:
+            return np.zeros(METRICS_BUFFER_SIZE // 4, dtype=np.uint32)
+        if self._metrics_staging is None:
+            read_buf = device.create_buffer(
+                size=METRICS_BUFFER_SIZE,
+                usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+            )
+            self._metrics_staging = read_buf
+        else:
+            read_buf = self._metrics_staging
+        encoder = device.create_command_encoder()
+        encoder.copy_buffer_to_buffer(self._buffers["metrics"].buffer, 0, read_buf, 0, METRICS_BUFFER_SIZE)
+        device.queue.submit([encoder.finish()])
+        read_buf.map_sync(wgpu.MapMode.READ)
+        data = np.frombuffer(read_buf.read_mapped(), dtype=np.uint32).copy()
+        read_buf.unmap()
+        return data
+
+    def _submit_readback(self, tex: GPUTexture, slot: int = 0) -> Optional[tuple]:
+        """Queues a texture→staging copy; _resolve_readback maps it later."""
+        device = self.gpu.device
+        if not device:
+            return None
+        prb = (tex.width * 16 + 255) & ~255
+        cur = self._downsample_staging.get(slot)
+        if cur is None or cur[:2] != (prb, tex.height):
+            if cur is not None:
+                cur[2].destroy()
+            read_buf = device.create_buffer(
+                size=prb * tex.height,
+                usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+            )
+            self._downsample_staging[slot] = (prb, tex.height, read_buf)
+        else:
+            read_buf = cur[2]
+        encoder = device.create_command_encoder()
+        encoder.copy_texture_to_buffer(
+            {"texture": tex.texture},
+            {"buffer": read_buf, "bytes_per_row": prb, "rows_per_image": tex.height},
+            (tex.width, tex.height, 1),
+        )
+        device.queue.submit([encoder.finish()])
+        return (read_buf, prb, tex.width, tex.height)
+
+    @staticmethod
+    def _resolve_readback(handle: tuple, dest: Optional[np.ndarray] = None, crop: Optional[Tuple[int, int]] = None) -> Optional[np.ndarray]:
+        """Maps a queued staging buffer and hands back its RGB.
+
+        The mapped memory dies at unmap, so the copy out happens inside: `dest` takes the
+        trimmed region straight (one copy), else the caller gets an owned array.
+        """
+        read_buf, prb, w, h = handle
+        read_buf.map_sync(wgpu.MapMode.READ)
+        try:
+            raw = np.frombuffer(read_buf.read_mapped(copy=False), dtype=np.uint8).reshape((h, prb))
+            valid = raw[:, : w * 16]
+            # The texture is already display-encoded (output_encode pass).
+            rgba = valid.view(np.float32).reshape((h, w, 4))
+            if dest is None:
+                return np.ascontiguousarray(rgba[:, :, :3])
+            oy, ox = crop if crop is not None else (0, 0)
+            rgba_to_rgb_into(rgba, dest, oy, ox)
+            return None
+        finally:
+            read_buf.unmap()
+
+    def _readback_downsampled(self, tex: GPUTexture) -> np.ndarray:
+        """Reads back texture as float32 RGB array, handling hardware alignment."""
+        handle = self._submit_readback(tex)
+        if handle is None:
+            return np.zeros((1, 1, 3), dtype=np.float32)
+        out = self._resolve_readback(handle)
+        assert out is not None
+        return out
+
+    def _dispatch_pass(self, encoder: Any, pipeline_name: str, bindings: list, w: int, h: int) -> None:
+        """Configures and dispatches a compute pass."""
+        pipeline = self._pipelines.get(pipeline_name)
+        if pipeline is None:
+            raise RuntimeError(f"Pipeline not initialized: {pipeline_name}")
+
+        if not self.gpu.device:
+            raise RuntimeError("GPU device lost")
+
+        wg_x, wg_y = (
+            (16, 16)
+            if pipeline_name in ["autocrop", "metrics", "clahe_hist", "density_hist", "color_hist", "waveform", "vectorscope"]
+            else (8, 8)
+        )
+
+        cache_key = (pipeline_name, tuple(_binding_identity(idx, res) for idx, res in bindings))
+        bind_group = self._bind_group_cache.get(cache_key)
+        if bind_group is None:
+            entries = []
+            for idx, res in bindings:
+                if res is None:
+                    raise ValueError(
+                        f"Binding {idx} in pipeline '{pipeline_name}' is None. "
+                        "This usually means a hardware resource was not properly initialized or has been destroyed."
+                    )
+
+                if isinstance(res, dict) and "buffer" in res:
+                    if res["buffer"] is None:
+                        raise ValueError(f"Buffer in binding {idx} ({pipeline_name}) is None")
+                    entries.append({"binding": idx, "resource": res})
+                elif isinstance(res, GPUBuffer):
+                    if res.buffer is None:
+                        raise ValueError(f"GPUBuffer in binding {idx} ({pipeline_name}) is None")
+                    entries.append(
+                        {
+                            "binding": idx,
+                            "resource": {
+                                "buffer": res.buffer,
+                                "offset": 0,
+                                "size": res.buffer.size,
+                            },
+                        }
+                    )
+                else:
+                    entries.append({"binding": idx, "resource": res})
+
+            layout = self._bind_layout_cache.get(pipeline_name)
+            if layout is None:
+                layout = pipeline.get_bind_group_layout(0)
+                self._bind_layout_cache[pipeline_name] = layout
+            try:
+                bind_group = self.gpu.device.create_bind_group(layout=layout, entries=entries)
+            except Exception as e:
+                logger.error(f"Failed to create bind group for {pipeline_name}: {e}")
+                raise
+            self._bind_group_cache[cache_key] = bind_group
+
+        pass_enc = encoder.begin_compute_pass()
+        pass_enc.set_pipeline(pipeline)
+        pass_enc.set_bind_group(0, bind_group)
+        if pipeline_name in ["clahe_hist", "clahe_cdf"]:
+            pass_enc.dispatch_workgroups(8, 8)
+        else:
+            pass_enc.dispatch_workgroups((w + wg_x - 1) // wg_x, (h + wg_y - 1) // wg_y)
+        pass_enc.end()
+
+    def process(
+        self,
+        img: np.ndarray,
+        settings: WorkspaceConfig,
+        scale_factor: float = 1.0,
+        bounds_override: Optional[Any] = None,
+        readback_metrics: bool = True,
+        cam_xyz: Optional[list] = None,
+        camera_wb: Optional[list] = None,
+        source_hash: Optional[str] = None,
+        analysis_source_hash: Optional[str] = None,
+        memory_bounded: bool = False,
+        render_size_ref: Optional[float] = None,
+        film_base: Optional[tuple] = None,
+        source_base_log: Any = NOT_READ,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """High-level processing entry point with automatic tiling."""
+        self._init_resources()
+        self.evict_stale_textures()
+        if self.requires_tiling(img, settings, render_size_ref):
+            return self._process_tiled(
+                img,
+                settings,
+                scale_factor,
+                bounds_override=bounds_override,
+                cam_xyz=cam_xyz,
+                camera_wb=camera_wb,
+                readback_metrics=readback_metrics,
+                memory_bounded=memory_bounded,
+                render_size_ref=render_size_ref,
+                film_base=film_base,
+                source_base_log=source_base_log,
+            )
+        tex_final, metrics = self.process_to_texture(
+            img,
+            settings,
+            scale_factor=scale_factor,
+            bounds_override=bounds_override,
+            readback_metrics=readback_metrics,
+            cam_xyz=cam_xyz,
+            camera_wb=camera_wb,
+            source_hash=source_hash,
+            analysis_source_hash=analysis_source_hash,
+            render_size_ref=render_size_ref,
+            film_base=film_base,
+            source_base_log=source_base_log,
+        )
+        out = self._readback_downsampled(tex_final)
+        timing.lap("GPU wait/readback")
+        return out, metrics
+
+    def _process_tiled(
+        self,
+        img: np.ndarray,
+        settings: WorkspaceConfig,
+        scale_factor: float,
+        bounds_override: Optional[Any] = None,
+        cam_xyz: Optional[list] = None,
+        camera_wb: Optional[list] = None,
+        film_base: Optional[tuple] = None,
+        readback_metrics: bool = True,
+        memory_bounded: bool = False,
+        render_size_ref: Optional[float] = None,
+        source_base_log: Any = NOT_READ,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Processes ultra-high resolution images using memory-efficient tiling."""
+        h, w = img.shape[:2]
+        transient_tiles = memory_bounded or APP_CONFIG.low_vram_export_tiling
+
+        if transient_tiles:
+            self._release_texture_pool()
+
+        # Tiles apply geometry on the CPU (shader uniform zeroed), so distortion too.
+        k1_eff = settings.geometry.distortion_k1
+
+        img_rot = apply_geometry_orientation(
+            img, settings.geometry.rotation, settings.geometry.flip_horizontal, settings.geometry.flip_vertical
+        )
+        if settings.geometry.fine_rotation != 0.0:
+            img_rot = apply_fine_rotation(img_rot, settings.geometry.fine_rotation)
+        if k1_eff != 0.0:
+            img_rot = apply_radial_distortion(img_rot, k1_eff)
+        # Last, as in GeometryProcessor: a plane projectivity cannot be fitted to a frame
+        # that still carries barrel distortion.
+        img_rot = apply_keystone(img_rot, settings.geometry.converge_v, settings.geometry.converge_h)
+
+        # Rasterise the dodge/burn EV map once at full post-geometry resolution; tiles
+        # slice it directly, like IR above.
+        # ponytail: mask vertices are distortion-mapped so centres land right, but the
+        # feathered falloff is not re-warped. Negligible unless a mask sits at the frame
+        # edge under strong k1. Rasterise on a warped grid if that combination matters.
+        local_maps_rot: Optional[np.ndarray] = None
+        if settings.local.masks:
+            h_rot_full, w_rot_full = img_rot.shape[:2]
+            local_maps_rot = compute_local_maps(
+                settings.local,
+                h_rot_full,
+                w_rot_full,
+                (h, w),
+                rotation=settings.geometry.rotation,
+                fine_rotation=settings.geometry.fine_rotation,
+                flip_horizontal=settings.geometry.flip_horizontal,
+                flip_vertical=settings.geometry.flip_vertical,
+                distortion_k1=k1_eff,
+                converge_v=settings.geometry.converge_v,
+                converge_h=settings.geometry.converge_h,
+            )
+
+        preview_scale = APP_CONFIG.preview_render_size / max(h, w)
+        img_small = negpy_core.resize_linear(np.ascontiguousarray(img, dtype=np.float32), (int(w * preview_scale), int(h * preview_scale)))
+
+        # This render meters the whole frame for the tiles; the CLAHE CDF it leaves behind
+        # is the one they share. Taken from here rather than from the last preview, which
+        # may belong to another image or to settings the export has since moved past.
+        with timing.step("reference pass"):
+            _, metrics_ref = self.process_to_texture(
+                img_small,
+                settings,
+                scale_factor=scale_factor,
+                cam_xyz=cam_xyz,
+                camera_wb=camera_wb,
+                readback_metrics=readback_metrics,
+                apply_layout=False,
+                film_base=film_base,
+                source_base_log=source_base_log,
+            )
+
+        global_cdfs = self._readback_clahe_cdf()
+        # Every tile and global meter below takes the white the reference pass measured.
+        settings = replace(settings, process=with_fade_white(settings.process, metrics_ref.get("fade_white")))
+        settings = replace(settings, process=with_fade_crossover(settings.process, metrics_ref.get("fade_crossover")))
+
+        if transient_tiles:
+            normalized_log = metrics_ref.get("normalized_log")
+            if isinstance(normalized_log, GPUTexture):
+                metrics_ref["normalized_log"] = np.ascontiguousarray(normalized_log.readback()[:, :, :3])
+            self._release_texture_pool()
+
+        rot = settings.geometry.rotation % 4
+        w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
+        if settings.geometry.crop_rect:
+            roi = get_manual_rect_coords(
+                (h_rot, w_rot),
+                settings.geometry.crop_rect,
+                offset_px=settings.geometry.autocrop_offset,
+                scale_factor=scale_factor,
+            )
+        elif settings.geometry.crop_to_valid and not settings.geometry.crop_from_auto:
+            valid_rect = compute_geometry_crop_rect(
+                settings.geometry.fine_rotation, settings.geometry.converge_v, settings.geometry.converge_h, w_rot, h_rot
+            )
+            roi = get_manual_rect_coords((h_rot, w_rot), valid_rect, offset_px=settings.geometry.autocrop_offset, scale_factor=scale_factor)
+        elif settings.geometry.autocrop_offset > 0:
+            margin = settings.geometry.autocrop_offset * scale_factor
+            roi = apply_margin_to_roi((0, h_rot, 0, w_rot), h_rot, w_rot, margin)
+        else:
+            roi = (0, h_rot, 0, w_rot)
+        y1, y2, x1, x2 = roi
+        crop_w, crop_h = x2 - x1, y2 - y1
+
+        # All global meters read the same downsample + scaled ROI; compute lazily once.
+        ah, aw = img_rot.shape[:2]
+        a_scale = min(1.0, APP_CONFIG.preview_render_size / max(ah, aw))
+        analysis_roi = (int(y1 * a_scale), int(y2 * a_scale), int(x1 * a_scale), int(x2 * a_scale))
+        analysis_shape = (int(ah * a_scale), int(aw * a_scale))
+        # Freehand analysis_rect wins over the crop ROI + centered buffer here too.
+        meter_rect = None if crops_frame(settings.geometry) else settings.process.meter_rect
+        meter_roi, meter_buffer = resolve_analysis_region(
+            analysis_shape,
+            None if meter_rect is not None else analysis_roi,
+            settings.process.analysis_buffer,
+            settings.process.analysis_rect,
+            meter_rect,
+        )
+        analysis_small: Optional[np.ndarray] = None
+
+        def _analysis_img() -> np.ndarray:
+            nonlocal analysis_small
+            if analysis_small is None:
+                analysis_small = _downsample_for_analysis(img_rot, APP_CONFIG.preview_render_size)
+            return analysis_small
+
+        # Unmixed like the non-tiled path, lazily: skipped when bounds are locked and no
+        # auto refs, anchor or textural range need it.
+        tile_white_space = render_white_space(settings.process, settings.process.process_mode, cam_xyz, camera_wb)
+        unmix_m, fade_anchor_m = fade_density(settings.process, settings.process.process_mode, tile_white_space)
+        tile_space = crossover_space(FadeDensity(unmix_m, fade_anchor_m), tile_white_space, settings.process)
+        tile_crossover = crossover_offsets(
+            resolve_crossover(settings.process, tile_space, lambda: np.empty(0), measure=False)[0], settings.process.fade_crossover
+        )
+        log_grid_cache: Optional[np.ndarray] = None
+        prefiltered_cache: Optional[np.ndarray] = None
+        sorted_cache: Optional[np.ndarray] = None
+
+        def _log_grid() -> np.ndarray:
+            nonlocal log_grid_cache
+            if log_grid_cache is None:
+                log_grid_cache = prefilter_log_grid(_analysis_img(), meter_roi, meter_buffer)
+            return log_grid_cache
+
+        def _prefiltered() -> np.ndarray:
+            nonlocal prefiltered_cache
+            if prefiltered_cache is None:
+                prefiltered_cache = unmix_log_image(_log_grid(), unmix_m)
+            return prefiltered_cache
+
+        def _sorted() -> np.ndarray:
+            nonlocal sorted_cache
+            if sorted_cache is None:
+                sorted_cache = sorted_channel_grid(_prefiltered())
+            return sorted_cache
+
+        def _analyze_global_bounds() -> LogNegativeBounds:
+            return analyze_log_exposure_bounds_from_log(
+                _prefiltered(),
+                None,
+                0.0,
+                percentile_clip=settings.process.luma_range_clip,
+                color_clip=settings.process.color_range_clip,
+                sorted_grid=_sorted(),
+            )
+
+        if bounds_override:
+            global_bounds = global_anchor_bounds = bounds_override
+        else:
+            global_bounds, global_base_bounds = resolve_bounds_detailed(settings.process, _analyze_global_bounds)
+            global_anchor_bounds = luma_source_bounds(settings.process, global_base_bounds)
+
+        # The meters follow process_to_texture's: the transfer curve reads working space
+        # against the fixed window.
+        transfer = render_path(settings.process) is not RenderPath.PRINT
+        transfer_grid: Optional[np.ndarray] = None
+
+        def _meter_grid() -> np.ndarray:
+            nonlocal transfer_grid
+            if not transfer:
+                return _prefiltered()
+            if transfer_grid is None:
+                slide_stage = density_stage(settings.process, cam_xyz, camera_wb, unmix_m, fade_anchor_m)
+                transfer_grid = density_stage_grid(slide_stage, _analysis_img(), meter_roi, meter_buffer, _log_grid, tile_crossover)
+            return transfer_grid
+
+        meter_bounds = LogNegativeBounds(*transfer_bounds()) if transfer else global_anchor_bounds
+
+        global_neutral_axis = None
+        if settings.exposure.cast_removal_strength > 0.0 and not is_mono(settings.process):
+            if transfer:
+                global_neutral_axis = measure_transfer_neutral_axis(_meter_grid(), render_path(settings.process) is RenderPath.POSITIVE)
+            else:
+                global_neutral_axis = measure_neutral_axis_from_log(_meter_grid(), global_bounds, None, 0.0)
+            pooled_axis = pooled_neutral_axis(settings.process)
+            if pooled_axis is not None:
+                global_neutral_axis = blend_neutral_axis(global_neutral_axis, pooled_axis)
+
+        global_metered_anchor = None
+        if settings.exposure.auto_exposure or (transfer and settings.exposure.auto_normalize_contrast):
+            global_metered_anchor = measure_anchor_from_log(
+                _meter_grid(), meter_bounds, None, 0.0, assumed=transfer_assumed_anchor() if transfer else None
+            )
+
+        global_textural_range = None
+        global_shadow_point = None
+        global_highlight_point = None
+        if settings.exposure.auto_normalize_contrast:
+            global_textural_range = measure_textural_range_from_log(_meter_grid(), None, 0.0)
+            global_shadow_point = measure_shadow_point_from_log(_meter_grid(), meter_bounds, None, 0.0)
+            global_highlight_point = measure_highlight_point_from_log(_meter_grid(), meter_bounds, None, 0.0)
+
+        global_mask = None
+        if settings.exposure.contrast_mask_strength > 0.0 and render_path(settings.process) is RenderPath.PRINT:
+            global_mask = (
+                *contrast_mask_plane(
+                    img,
+                    global_bounds,
+                    unmix_m,
+                    roi_norm=normalized_roi(roi, (h_rot, w_rot)),
+                    bw_weights=plane_weights(settings.process, settings.exposure),
+                    **geometry_kwargs(settings.geometry, k1_eff),
+                ),
+                (x1, y1, crop_w, crop_h),
+            )
+            # One plane serves every tile; the first upload wins.
+            self._mask_tex_key = None
+        global_diffusion = None
+        if settings.exposure.diffusion > 0.0 and render_path(settings.process) is RenderPath.PRINT:
+            wp3, bp3 = per_channel_point_offsets(settings.process)
+            trimmed = LogNegativeBounds(
+                tuple(global_bounds.floors[ch] + wp3[ch] for ch in range(3)), tuple(global_bounds.ceils[ch] + bp3[ch] for ch in range(3))
+            )
+            grid = diffusion_grid(
+                img,
+                unmix_m,
+                roi_norm=normalized_roi(roi, (h_rot, w_rot)),
+                **geometry_kwargs(settings.geometry, k1_eff),
+            )
+            plane = diffusion_plane(grid, trimmed, plane_weights(settings.process, settings.exposure))
+            global_diffusion = None if plane is None else (plane, (x1, y1, crop_w, crop_h))
+            self._mask_tex_key = None
+
+        paper_w, paper_h, content_w, content_h, off_x, off_y, _ = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
+        full_source_res = np.empty((crop_h, crop_w, 3), dtype=np.float32)
+
+        # Defect repairs are baked into the source before the engine, so no stage here
+        # samples beyond its own pixel for them and the halo owes them nothing.
+        halo = TILE_HALO
+        # The sharpen blur reads ±kernel-radius px, which outgrows TILE_HALO at large
+        # radii and shows tile seams in the USM band. RL's influence spreads with the
+        # iterations but decays geometrically, so 6x the kernel radius covers it. Capped
+        # by the 512 ceiling below.
+        if settings.lab.sharpen > 0:
+            k_radius = len(gaussian_kernel_1d(settings.lab.sharpen_radius)) // 2
+            mult = 6 if settings.lab.sharpen_method == SharpenMethod.RL else 1
+            halo = max(halo, k_radius * mult)
+        # Glow/halation taps reach up to their radius (lab.wgsl). Without this the bloom
+        # seams at tile edges on big exports.
+        if settings.lab.glow_amount > 0.0:
+            halo = max(halo, glow_reach_px((h_rot, w_rot)) + 1)
+        if settings.lab.halation_strength > 0.0:
+            halo = max(halo, halation_reach_px((h_rot, w_rot)) + 1)
+        # Chroma Denoise reads its low-pass kernel's half-width, plus one for the edge test's neighbors.
+        chroma_sigma = chroma_denoise_sigma(chroma_denoise_radius(settings.lab.chroma_denoise, is_mono(settings.process)), scale_factor)
+        if chroma_sigma > 0.0:
+            halo = max(halo, len(gaussian_kernel_1d(chroma_sigma)) // 2 + 2)
+        # The Mackie-line blur reads its kernel's half-width each side, sigma from the whole
+        # frame's short side, so every tile draws the frame's line.
+        sabattier_sigma = None
+        if settings.altproc.alt_process == AltProcess.SABATTIER and settings.process.process_mode == ProcessMode.BW:
+            sabattier_sigma = line_sigma_px(settings.altproc.sabattier_agitation, (h_rot, w_rot))
+            if sabattier_sigma > 0.0:
+                halo = max(halo, len(gaussian_kernel_1d(sabattier_sigma)) // 2 + 1)
+        halo = min(halo, 512)
+
+        # Opt-in (AppConfig.low_vram_export_tiling, off by default): a smaller tile
+        # (see TILE_SIZE_LOW_VRAM) and skipping the one-tile-ahead pipelining below --
+        # on a tight, unqueryable VRAM budget, keeping two tiles' worth of
+        # textures/buffers live at once is the difference between fitting and a
+        # device-lost abort. Left off, exports keep both the full tile size and the
+        # overlap for throughput.
+        low_vram = transient_tiles
+        tile_size = TILE_SIZE_LOW_VRAM if low_vram else TILE_SIZE
+
+        # The queue serializes tile N's staging copy ahead of tile N+1's passes, so
+        # deferring the map_sync by one tile is safe and overlaps the wait.
+        pending: Optional[tuple] = None
+        tile_index = 0
+        pooled_shape: Optional[tuple] = None  # low VRAM: the one tile input shape the pool holds
+        timing.lap("global bounds/setup")
+        with timing.step("tiles"):
+            for ty in range(0, crop_h, tile_size):
+                for tx in range(0, crop_w, tile_size):
+                    tw, th = min(tile_size, crop_w - tx), min(tile_size, crop_h - ty)
+                    ix1, iy1 = max(0, x1 + tx - halo), max(0, y1 + ty - halo)
+                    ix2, iy2 = (
+                        min(w_rot, x1 + tx + tw + halo),
+                        min(h_rot, y1 + ty + th + halo),
+                    )
+                    maps_tile = np.ascontiguousarray(local_maps_rot[iy1:iy2, ix1:ix2]) if local_maps_rot is not None else None
+                    ox, oy = x1 + tx - ix1, y1 + ty - iy1
+                    if low_vram and pooled_shape not in (None, (iy2 - iy1, ix2 - ix1)):
+                        self._release_texture_pool()
+                    pooled_shape = (iy2 - iy1, ix2 - ix1)
+                    tile_res, _ = self.process_to_texture(
+                        img_rot[iy1:iy2, ix1:ix2],
+                        settings,
+                        scale_factor=scale_factor,
+                        tiling_mode=True,
+                        bounds_override=global_bounds,
+                        metered_anchor_override=global_metered_anchor,
+                        textural_range_override=global_textural_range,
+                        neutral_axis_override=global_neutral_axis,
+                        shadow_point_override=global_shadow_point,
+                        highlight_point_override=global_highlight_point,
+                        global_offset=(ix1, iy1),
+                        full_dims=(w_rot, h_rot),
+                        clahe_cdf_override=global_cdfs,
+                        apply_layout=False,
+                        vignette_full_crop=(crop_w, crop_h, tx - ox, ty - oy),
+                        local_maps=maps_tile,
+                        cam_xyz=cam_xyz,
+                        camera_wb=camera_wb,
+                        contrast_mask_override=global_mask,
+                        sabattier_sigma_override=sabattier_sigma,
+                        diffusion_override=global_diffusion,
+                    )
+                    handle = self._submit_readback(tile_res, slot=0 if low_vram else tile_index % 2)
+                    if low_vram:
+                        self._resolve_readback(handle, full_source_res[ty : ty + th, tx : tx + tw], (oy, ox))
+                    else:
+                        if pending is not None:
+                            p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
+                            self._resolve_readback(p_handle, full_source_res[p_ty : p_ty + p_th, p_tx : p_tx + p_tw], (p_oy, p_ox))
+                        pending = (handle, ty, tx, th, tw, oy, ox)
+                    tile_index += 1
+            if pending is not None:
+                p_handle, p_ty, p_tx, p_th, p_tw, p_oy, p_ox = pending
+                self._resolve_readback(p_handle, full_source_res[p_ty : p_ty + p_th, p_tx : p_tx + p_tw], (p_oy, p_ox))
+            if low_vram:
+                self._release_texture_pool()
+
+        # Mirrors PrintService.apply_layout: only INTER_AREA is area-correct on a shrink.
+        shrinking = content_w < crop_w or content_h < crop_h
+        scaled_content = full_source_res
+        if content_w != crop_w or content_h != crop_h:
+            src = np.ascontiguousarray(full_source_res, dtype=np.float32)
+            size = (content_w, content_h)
+            scaled_content = negpy_core.resize_area(src, size) if shrinking else negpy_core.resize_kernel(src, size, lanczos=True)
+        # No border means the paper buffer is a full-res allocation, fill and copy that
+        # reproduces the content exactly.
+        if (paper_w, paper_h, off_x, off_y) == (content_w, content_h, 0, 0):
+            result = scaled_content
+        else:
+            result = np.zeros((paper_h, paper_w, 3), dtype=np.float32)
+            color_hex = PrintService.effective_border_color(settings.finish, settings.toning).lstrip("#")
+            result[:] = tuple(int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+            result[off_y : off_y + content_h, off_x : off_x + content_w] = scaled_content
+        metrics_ref["base_positive"] = result
+        # metrics_ref comes from the preview-size metering render; the rect must describe this buffer.
+        metrics_ref["content_rect"] = (off_x, off_y, content_w, content_h)
+        return result, metrics_ref
+
+    def cleanup(self, collect: bool = True, retain: Optional[GPUTexture] = None) -> None:
+        """Evacuates the texture pool; optionally forces garbage collection.
+
+        ``retain`` is handed to the caller instead: its pool key goes with it, so the
+        next render allocates a fresh one rather than painting over borrowed pixels.
+        """
+        self._release_texture_pool(retain)
+        self._bind_layout_cache.clear()
+        self._uv_grid_cache = None
+        # The stage textures a resume would paint onto are gone, local_ev included, so the
+        # next frame must re-upload and start from stage 0.
+        self._local_maps_cache = None
+        if collect:
+            gc.collect()
+        logger.info("GPUEngine: VRAM resources released")
+
+    def _lut_texture(self, lut: Optional[PrintLut]) -> GPUTexture:
+        """The LUT unrolled to 2D, node (i, j, k) at texel (i + N*j, k); a 1x1 dummy without one."""
+        key = "" if lut is None else lut.key
+        cached = self._lut_textures.get(key)
+        if cached is None or cached[0] is not lut:
+            if cached is not None:
+                cached[1].destroy()
+                self._bind_group_cache.clear()
+            usage = wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST
+            if lut is None:
+                tex = GPUTexture(1, 1, usage=usage)
+                tex.upload(np.ones((1, 1, 4), dtype=np.float32))
+            else:
+                n = lut.table.shape[0]
+                tex = GPUTexture(n * n, n, usage=usage)
+                tex.upload(np.ascontiguousarray(lut.table.transpose(2, 1, 0, 3).reshape(n, n * n, 3)))
+            self._lut_textures[key] = (lut, tex)
+        return self._lut_textures[key][1]
+
+    def destroy_all(self) -> None:
+        """Full resource teardown."""
+        self.cleanup()
+        for _, tex in self._lut_textures.values():
+            tex.destroy()
+        self._lut_textures.clear()
+        if self._metrics_staging is not None:
+            self._metrics_staging.destroy()
+            self._metrics_staging = None
+        for staging in self._downsample_staging.values():
+            staging[2].destroy()
+        self._downsample_staging.clear()
+        for buf in self._buffers.values():
+            buf.destroy()
+        self._buffers.clear()
+        self._pipelines.clear()
+        self._sampler = None
+        logger.info("GPUEngine: Engine decommissioned")

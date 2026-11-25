@@ -1,0 +1,376 @@
+import unittest
+from dataclasses import replace
+
+import numpy as np
+
+from negpy.domain.models import (
+    AspectRatio,
+    ColorSpace,
+    ExportConfig,
+    ExportFormat,
+    ExportResolutionMode,
+    WorkspaceConfig,
+    flat_export_config,
+    flat_master_config,
+)
+from negpy.features.exposure.logic import flat_curve_params
+from negpy.features.exposure.models import RenderIntent
+from negpy.services.rendering.engine import DarkroomEngine
+from negpy.services.rendering.image_processor import ImageProcessor
+
+
+def _ramp_image(n: int = 64) -> np.ndarray:
+    """A 3-channel normalized-log ramp from below 0 to above 1 (unclamped)."""
+    x = np.linspace(-0.3, 1.3, n, dtype=np.float32)
+    return np.stack([x, x, x], axis=-1)[None, :, :]
+
+
+def _ramp_in_range(lo: float, hi: float, n: int = 64) -> np.ndarray:
+    """A 3-channel normalized-log ramp over a valid operating sub-range."""
+    x = np.linspace(lo, hi, n, dtype=np.float32)
+    return np.stack([x, x, x], axis=-1)[None, :, :]
+
+
+class TestFlatCurveParams(unittest.TestCase):
+    def test_returns_low_contrast_neutral_curve(self):
+        gain, lift = flat_curve_params()
+        # Log master: gain < 1 keeps it flat; lift is the shadow code.
+        self.assertTrue(0.0 < gain < 1.0)
+        self.assertTrue(0.0 < lift < 1.0)
+
+
+class TestFlatPhotometric(unittest.TestCase):
+    def _render(self, exposure_overrides=None, image=None) -> np.ndarray:
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.exposure.models import ExposureConfig
+        from negpy.features.exposure.processor import PhotometricProcessor
+        from negpy.features.process.models import ProcessMode
+
+        cfg = ExposureConfig(render_intent=RenderIntent.FLAT)
+        if exposure_overrides:
+            cfg = replace(cfg, **exposure_overrides)
+        img = _ramp_image() if image is None else image
+        ctx = PipelineContext(scale_factor=1.0, original_size=(1, img.shape[1]), process_mode=ProcessMode.C41)
+        # Provide metrics a print render would consume so we prove flat ignores them.
+        ctx.metrics["metered_anchor"] = 0.9
+        return PhotometricProcessor(cfg).process(img, ctx)
+
+    def test_monotonic_decreasing(self):
+        out = self._render()[0, :, 1]
+        diffs = np.diff(out)
+        self.assertTrue(np.all(diffs <= 1e-6), "flat positive must be monotonic (decreasing) in scene density")
+
+    def test_no_clipping_with_headroom(self):
+        # Over the valid operating range the log code stays well off both endpoints.
+        out = self._render(image=_ramp_in_range(0.0, 1.0))
+        self.assertGreater(float(out.min()), 0.02, "flat master should keep shadows off the black point")
+        self.assertLess(float(out.max()), 0.98, "flat master should keep highlights off the white point")
+
+    def test_low_contrast(self):
+        out = self._render(image=_ramp_in_range(0.0, 1.0))[0, :, 1]
+        self.assertLess(float(out.max() - out.min()), 0.97)
+
+    def test_flat_is_log_linear(self):
+        # Regression guard: output IS the log code value — gamma-less and linear in
+        # the log signal: code == lift + gain*(1 - val). No 10^-D, no sRGB.
+        gain, lift = flat_curve_params()
+        val = np.linspace(0.05, 0.95, 40, dtype=np.float32)
+        img = np.stack([val, val, val], axis=-1)[None, :, :]
+        out = self._render(image=img)[0, :, 1]
+        np.testing.assert_allclose(out, lift + gain * (1.0 - val), atol=1e-4)
+
+    def test_ignores_auto_and_creative_print_decisions(self):
+        base = self._render()
+        # None of these print decisions may affect the flat render.
+        varied = self._render(
+            {
+                "auto_exposure": True,
+                "auto_normalize_contrast": True,
+                "cast_removal_strength": 1.0,
+                "grade": 50.0,
+                "density": 1.8,
+                "toe": 0.9,
+                "shoulder": 0.9,
+                "paper_dmin": True,
+            }
+        )
+        np.testing.assert_allclose(base, varied, atol=1e-6)
+
+    def _colored(self) -> np.ndarray:
+        rng = np.random.default_rng(1)
+        return rng.uniform(0.1, 0.9, (1, 64, 3)).astype(np.float32)
+
+    def test_digital_stock_is_byte_exact(self):
+        img = self._colored()
+        np.testing.assert_array_equal(self._render(image=img), self._render({"paper_profile": "neutral"}, image=img))
+        gain, lift = flat_curve_params()
+        np.testing.assert_array_equal(self._render(image=img), np.clip(lift + gain * (1.0 - img), 0.0, 1.0))
+
+    def test_color_stock_keeps_neutrals(self):
+        val = np.linspace(0.05, 0.95, 40, dtype=np.float32)
+        img = np.stack([val, val, val], axis=-1)[None, :, :]
+        np.testing.assert_allclose(self._render({"paper_profile": "pakon"}, image=img), self._render(image=img), atol=1e-5)
+
+    def test_color_stock_lowers_flat_chroma(self):
+        img = self._colored()
+
+        def spread(out: np.ndarray) -> float:
+            return float(np.std(out - out.mean(axis=-1, keepdims=True)))
+
+        self.assertLess(spread(self._render({"paper_profile": "pakon"}, image=img)), spread(self._render(image=img)))
+
+    def test_bw_ignores_the_stock_matrix(self):
+        from negpy.domain.interfaces import PipelineContext
+        from negpy.features.exposure.models import ExposureConfig
+        from negpy.features.exposure.processor import PhotometricProcessor
+        from negpy.features.process.models import ProcessMode
+
+        img = self._colored()
+        ctx = PipelineContext(scale_factor=1.0, original_size=(1, img.shape[1]), process_mode=ProcessMode.BW)
+        cfg = ExposureConfig(render_intent=RenderIntent.FLAT)
+        a = PhotometricProcessor(cfg).process(img, ctx)
+        b = PhotometricProcessor(replace(cfg, paper_profile="pakon")).process(img, ctx)
+        np.testing.assert_array_equal(a, b)
+
+
+class TestFlatStockMatrix(unittest.TestCase):
+    # build_print_luts.py --flat-only refits a LUT's matrix; these bound what a 3×3 can do on the
+    # ICC-derived LUTs, so a rebuilt LUT with a stale matrix fails here.
+    MEDIAN_DE00 = 1.5
+    P95_DE00 = 4.0
+    # The Frontier's and Nikon Scan's hue turns are not linear in density, so a 3x3 holds their color only roughly.
+    LOOSE = {"frontier": (2.5, 8.5), "nikon_scan": (1.5, 6.0)}
+
+    def test_every_bundled_lut_carries_a_matrix_with_unit_rows(self):
+        from negpy.features.exposure.print_lut import LUT_DIR, flat_matrix
+
+        keys = sorted(p.stem for p in LUT_DIR.glob("*.npz"))
+        self.assertTrue(keys)
+        for key in keys:
+            m = flat_matrix(key)
+            self.assertIsNotNone(m, key)
+            np.testing.assert_allclose(m.sum(axis=1), 1.0, atol=1e-9, err_msg=key)
+
+    def test_matrix_reproduces_its_lut(self):
+        from negpy.features.exposure.print_lut import LUT_DIR, flat_matrix, load_print_lut, tetra_lookup
+        from negpy.features.process.chart import delta_e2000
+        from negpy.kernel.image.logic import rgb_to_lab_working
+
+        rng = np.random.default_rng(7)
+        for path in sorted(LUT_DIR.glob("*.npz")):
+            lut, m = load_print_lut(path.stem), flat_matrix(path.stem)
+            level = rng.uniform(0.15, 0.75, (800, 1)) * float(lut.e_max.min())
+            d = rng.normal(size=(800, 3))
+            d -= d.mean(axis=1, keepdims=True)
+            d /= np.linalg.norm(d, axis=1, keepdims=True)
+            e = np.clip(level + rng.uniform(0.0, 0.9, (800, 1)) * d, 0.0, lut.e_max)
+            looked = np.array([tetra_lookup(lut.table, lut.e_max, *p) for p in e])
+            de = delta_e2000(rgb_to_lab_working(np.clip(looked, 0, 1)), rgb_to_lab_working(np.clip(10.0 ** -(e @ m.T), 0, 1)))
+            median, p95 = self.LOOSE.get(path.stem, (self.MEDIAN_DE00, self.P95_DE00))
+            self.assertLess(float(np.median(de)), median, path.stem)
+            self.assertLess(float(np.percentile(de, 95)), p95, path.stem)
+
+    def test_stocks_without_a_lut_mix_their_own_rows(self):
+        from negpy.features.exposure.papers import PAPER_PROFILES, resolve_flat_matrix, resolve_print_color
+        from negpy.features.exposure.print_lut import DyeLut
+
+        for key, paper in PAPER_PROFILES.items():
+            m = resolve_flat_matrix(paper)
+            if isinstance(paper.print_color, DyeLut):
+                self.assertIsNotNone(m, key)
+            else:
+                dye, _ = resolve_print_color(paper)
+                self.assertTrue(m is dye or np.array_equal(m, dye), key)
+
+
+class TestFlatEngineSkipsStages(unittest.TestCase):
+    def test_creative_stages_bypassed(self):
+        engine = DarkroomEngine()
+        img = np.random.rand(48, 48, 3).astype(np.float32)
+
+        flat = WorkspaceConfig(exposure=replace(WorkspaceConfig().exposure, render_intent=RenderIntent.FLAT))
+        res_default = engine.process(img, flat, source_hash="flat_a")
+
+        # Crank every creative stage; flat intent must ignore them all.
+        loud = replace(
+            flat,
+            lab=replace(flat.lab, sharpen=1.0, saturation=2.0, clahe_strength=1.0, glow_amount=1.0, halation_strength=1.0),
+            toning=replace(flat.toning, sepia_strength=1.0, selenium_strength=1.0),
+            finish=replace(flat.finish, vignette_stops=0.9),
+        )
+        res_loud = engine.process(img, loud, source_hash="flat_b")
+
+        np.testing.assert_allclose(res_default, res_loud, atol=1e-6)
+
+    def test_flat_differs_from_print(self):
+        engine = DarkroomEngine()
+        img = np.random.rand(48, 48, 3).astype(np.float32)
+        print_cfg = WorkspaceConfig()
+        flat_cfg = flat_master_config(print_cfg)
+
+        res_print = engine.process(img, print_cfg, source_hash="p")
+        res_flat = engine.process(img, flat_cfg, source_hash="f")
+        self.assertFalse(np.allclose(res_print, res_flat, atol=1e-3))
+
+
+class TestFlatRollConsistency(unittest.TestCase):
+    """A flat master must render an identical patch across frames when the roll
+    shares one locked normalization baseline (req #8)."""
+
+    def _images_with_shared_patch(self):
+        a = np.full((32, 32, 3), 0.05, dtype=np.float32)
+        b = np.full((32, 32, 3), 0.80, dtype=np.float32)
+        a[0:8, 0:8] = 0.2
+        b[0:8, 0:8] = 0.2  # identical mid patch, very different surroundings
+        return a, b
+
+    def _flat_cfg(self, *, locked: bool):
+        base = flat_master_config(WorkspaceConfig())
+        proc = replace(
+            base.process,
+            use_luma_average=locked,
+            use_color_average=locked,
+            locked_floors=(-2.0, -2.0, -2.0) if locked else (0.0, 0.0, 0.0),
+            locked_ceils=(-0.1, -0.1, -0.1) if locked else (0.0, 0.0, 0.0),
+        )
+        return replace(base, process=proc)
+
+    def test_locked_bounds_give_identical_patch(self):
+        a, b = self._images_with_shared_patch()
+        cfg = self._flat_cfg(locked=True)
+        ra = DarkroomEngine().process(a, cfg, source_hash="ra")
+        rb = DarkroomEngine().process(b, cfg, source_hash="rb")
+        np.testing.assert_allclose(ra[0:8, 0:8], rb[0:8, 0:8], atol=1e-6)
+
+    def test_per_frame_bounds_drift(self):
+        # Proves the locking matters: without it, the same patch renders differently.
+        a, b = self._images_with_shared_patch()
+        cfg = self._flat_cfg(locked=False)
+        ra = DarkroomEngine().process(a, cfg, source_hash="ra2")
+        rb = DarkroomEngine().process(b, cfg, source_hash="rb2")
+        self.assertFalse(np.allclose(ra[0:8, 0:8], rb[0:8, 0:8], atol=1e-3))
+
+
+class TestFlatConfigHelpers(unittest.TestCase):
+    def test_flat_master_config_disables_automation(self):
+        cfg = flat_master_config(WorkspaceConfig())
+        self.assertEqual(cfg.exposure.render_intent, RenderIntent.FLAT)
+        self.assertFalse(cfg.exposure.auto_exposure)
+        self.assertFalse(cfg.exposure.auto_normalize_contrast)
+        self.assertEqual(cfg.exposure.cast_removal_strength, 0.0)
+        self.assertFalse(cfg.exposure.paper_dmin)
+        self.assertTrue(cfg.exposure.paper_black)  # BPC off: keep the flat render's lifted black
+        self.assertEqual(cfg.exposure.toe, 0.0)
+        self.assertEqual(cfg.exposure.shoulder, 0.0)
+
+    def test_flat_master_config_preserves_framing_and_white_balance(self):
+        src = WorkspaceConfig(exposure=replace(WorkspaceConfig().exposure, wb_cyan=0.1, wb_yellow=-0.2))
+        cfg = flat_master_config(src)
+        self.assertEqual(cfg.exposure.wb_cyan, 0.1)
+        self.assertEqual(cfg.exposure.wb_yellow, -0.2)
+        self.assertEqual(cfg.geometry, src.geometry)
+        self.assertEqual(cfg.process, src.process)
+
+    def test_flat_export_config_full_res_preserves_color_space(self):
+        # Color space follows the user's export selection; flat must not override it.
+        src = ExportConfig(
+            export_color_space=ColorSpace.SRGB.value,
+            export_resolution_mode=ExportResolutionMode.ORIGINAL.value,
+        )
+        out = flat_export_config(src)
+        self.assertEqual(out.export_fmt, ExportFormat.TIFF)
+        self.assertEqual(out.export_color_space, ColorSpace.SRGB.value)
+        self.assertEqual(
+            flat_export_config(ExportConfig(export_color_space=ColorSpace.PROPHOTO.value)).export_color_space,
+            ColorSpace.PROPHOTO.value,
+        )
+        self.assertEqual(out.export_resolution_mode, ExportResolutionMode.ORIGINAL.value)
+        self.assertEqual(out.paper_aspect_ratio, AspectRatio.ORIGINAL)
+
+    def test_flat_export_config_honours_target_px(self):
+        src = ExportConfig(
+            export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+            export_target_long_edge_px=6000,
+            paper_aspect_ratio=AspectRatio.R_3_2,
+        )
+        out = flat_export_config(src)
+        self.assertEqual(out.export_resolution_mode, ExportResolutionMode.TARGET_PX.value)
+        self.assertEqual(out.export_target_long_edge_px, 6000)
+        self.assertEqual(out.paper_aspect_ratio, AspectRatio.R_3_2)
+
+    def test_flat_export_config_honours_print_mode(self):
+        src = ExportConfig(
+            export_resolution_mode=ExportResolutionMode.PRINT.value,
+            export_print_size=24.0,
+            export_dpi=360,
+            paper_aspect_ratio=AspectRatio.R_5_4,
+        )
+        out = flat_export_config(src)
+        self.assertEqual(out.export_resolution_mode, ExportResolutionMode.PRINT.value)
+        self.assertEqual(out.export_print_size, 24.0)
+        self.assertEqual(out.export_dpi, 360)
+        self.assertEqual(out.paper_aspect_ratio, AspectRatio.R_5_4)
+
+    def test_flat_export_target_px_resizes_via_print_service(self):
+        """Regression: flat export must not discard Pixels sizing (e.g. 6000px long edge)."""
+        from negpy.services.export.print import PrintService
+
+        img = np.zeros((5333, 8000, 3), dtype=np.float32)
+        export = flat_export_config(
+            ExportConfig(
+                export_resolution_mode=ExportResolutionMode.TARGET_PX.value,
+                export_target_long_edge_px=6000,
+            )
+        )
+        result, _ = PrintService.apply_layout(img, export)
+        self.assertEqual(max(result.shape[:2]), 6000)
+        self.assertEqual(result.shape[1], 6000)
+        self.assertAlmostEqual(result.shape[0] / result.shape[1], 5333 / 8000, places=2)
+
+    def test_flat_export_config_allows_jxl_for_taggable_space(self):
+        src = ExportConfig(
+            export_fmt=ExportFormat.JXL,
+            export_color_space=ColorSpace.SRGB.value,
+        )
+        out = flat_export_config(src)
+        self.assertEqual(out.export_fmt, ExportFormat.JXL)
+        self.assertTrue(out.jxl_lossless)
+
+    def test_flat_export_config_falls_back_to_tiff_for_untaggable_jxl(self):
+        src = ExportConfig(
+            export_fmt=ExportFormat.JXL,
+            export_color_space=ColorSpace.PROPHOTO.value,
+        )
+        out = flat_export_config(src)
+        self.assertEqual(out.export_fmt, ExportFormat.TIFF)
+
+    def test_flat_export_config_falls_back_to_tiff_for_non_jxl(self):
+        for fmt in (ExportFormat.JPEG, ExportFormat.PNG, ExportFormat.WEBP):
+            src = ExportConfig(export_fmt=fmt, export_color_space=ColorSpace.SRGB.value)
+            out = flat_export_config(src)
+            self.assertEqual(out.export_fmt, ExportFormat.TIFF, f"expected TIFF fallback for {fmt}")
+
+
+class TestRenderIntentSerialization(unittest.TestCase):
+    def test_round_trips_through_flat_dict(self):
+        cfg = flat_master_config(WorkspaceConfig())
+        restored = WorkspaceConfig.from_flat_dict(cfg.to_dict())
+        self.assertEqual(restored.exposure.render_intent, RenderIntent.FLAT)
+
+    def test_legacy_config_defaults_to_print(self):
+        # An old workspace dict without render_intent must default to PRINT.
+        data = WorkspaceConfig().to_dict()
+        data.pop("render_intent", None)
+        restored = WorkspaceConfig.from_flat_dict(data)
+        self.assertEqual(restored.exposure.render_intent, RenderIntent.PRINT)
+
+
+class TestImageProcessorFlatRouting(unittest.TestCase):
+    def test_is_flat_detection(self):
+        flat = flat_master_config(WorkspaceConfig())
+        self.assertTrue(ImageProcessor._is_flat(flat))
+        self.assertFalse(ImageProcessor._is_flat(WorkspaceConfig()))
+
+
+if __name__ == "__main__":
+    unittest.main()
