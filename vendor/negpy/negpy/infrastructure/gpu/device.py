@@ -7,6 +7,13 @@ from negpy.kernel.system.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _is_opengl(adapter) -> bool:
+    try:
+        return "opengl" in str(adapter.info.get("backend_type", "")).lower()
+    except Exception:
+        return False
+
+
 class GPUDevice:
     """
     Hardware adapter and device manager.
@@ -35,6 +42,12 @@ class GPUDevice:
         try:
             warm_wgpu_cffi_types()
             self.adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+            if self.adapter and _is_opengl(self.adapter):
+                # An OpenGL context belongs to one thread, but the device is shared by every
+                # render thread: wgpu's GL backend then deadlocks ("Could not lock adapter
+                # context") and aborts the process. Without Metal, Vulkan or D3D12, render on the CPU.
+                logger.warning(f"Only an OpenGL adapter ({self.adapter.summary}): rendering on the CPU")
+                self.adapter = None
             if self.adapter:
                 self.device = self.adapter.request_device_sync()
                 self.limits = self.device.limits
