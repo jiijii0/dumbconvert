@@ -1434,31 +1434,14 @@ class TopRowAndAccentTest(AppTestCase):
 
 
 class FilmFirstTest(AppTestCase):
-    """The film stock is chosen before anything is measured: the roll waits for it, says so, and
-    cannot be exported; changing it while an analysis runs starts a new one at once."""
+    """The film stock (or "No film stock") is chosen before anything is measured: the roll waits for
+    it, says so, and cannot be exported; changing it while an analysis runs starts a new one at once."""
 
     def test_the_roll_waits_for_its_film(self):
-        self.win = win = window()
-        win.spotlight_enabled = True
-        win.add_rolls([test_roll(3, name="Film first")])
-        idle(win)
+        win = self.open_roll(3)
         g = win.group
-        spot = win.spotlight
-        pump(0.4)
-        self.assertTrue(spot.on(), "the window is not darkened around the film stock")
-        hole = spot.hole.toRect()
-        field = win.stock_box.mapTo(spot.parentWidget(), win.stock_box.rect().center())
-        self.assertTrue(hole.contains(field), "the film stock field is not left in the light")
-        self.assertFalse(spot.mask().contains(field), "clicks would not reach the film stock field")
-        self.assertTrue(spot.mask().contains(win.preview.mapTo(spot.parentWidget(), win.preview.rect().center())),
-                        "the photo is not behind the dark")
-        win.set_tab(3)
-        pump(0.4)
-        self.assertFalse(spot.isVisible(), "Settings stays dark")
-        win.set_tab(0)
-        pump(0.4)
-        self.assertTrue(spot.on())
         self.assertFalse(g.analyzing or g.analyzed, "the roll was analysed before its film was chosen")
+        self.assertTrue(win.stock_box.property("needed"), "the film stock field does not ask to be chosen")
         bar = win.roll_progress
         self.assertTrue(bar.isVisible() and bar.waiting)
         self.assertIn("choose the film stock", bar.label.text())
@@ -1470,11 +1453,47 @@ class FilmFirstTest(AppTestCase):
         self.assertFalse(bar.waiting)
         self.assertEqual(bar.label.palette().color(bar.label.foregroundRole()).name(), app.COLORS["text"],
                          "the analysis line is not in the normal text grey")
-        pump(0.4)
-        self.assertFalse(spot.isVisible(), "the window stays dark once the film is chosen")
         win._set_roll_stock(g, "")                    # taken back: waits again
         self.assertFalse(g.analyzed or g.analyzing)
         self.assertTrue(bar.waiting)
+
+    def test_no_film_stock_is_a_choice_too(self):
+        win = self.open_roll(3)
+        g = win.group
+        box = win.stock_box
+        box.setCurrentIndex(box.findData(""))          # "No film stock", picked on purpose
+        win.on_stock_changed(box.currentIndex())
+        idle(win, 300)
+        self.assertTrue(g.no_stock and g.film_chosen)
+        self.assertTrue(g.analyzed, "choosing No film stock did not let the roll be analysed")
+        self.assertFalse(box.property("needed"))
+        self.assertIn("No film stock", g.label()[1])
+        self.assertEqual(box.lineEdit().text(), "No film stock")
+        session = win._session()["groups"][0]
+        self.assertTrue(session["no_stock"], "the choice is not kept with the session")
+        gold = next(d["id"] for d in app.engine.film_stocks() if d["displayName"] == "Kodak Gold 200")
+        box.setCurrentIndex(box.findData(gold))         # a film after all
+        win.on_stock_changed(box.currentIndex())
+        idle(win, 300)
+        self.assertFalse(g.no_stock)
+        self.assertEqual(g.stock_id, gold)
+
+    def test_each_roll_keeps_its_own_film(self):
+        self.win = win = window()
+        win.add_rolls([test_roll(2, name="Roll A"), test_roll(2, name="Roll B")])
+        idle(win)
+        a, b = win.groups[0], win.groups[1]
+        win.show_group(a)
+        win._set_roll_stock(a, "other-color")
+        idle(win, 300)
+        win.show_group(b)
+        self.assertTrue(win.stock_box.property("needed"), "the second roll took the first roll's film")
+        self.assertIn("choose the film stock", win.roll_progress.label.text())
+        self.assertFalse(b.analyzed)
+        win.show_group(a)
+        self.assertFalse(win.stock_box.property("needed"))
+        self.assertEqual(win.stock_box.currentData(), "other-color")
+        self.assertTrue(a.analyzed)
 
     def test_a_new_film_interrupts_the_running_analysis(self):
         win = self.open_roll(4)

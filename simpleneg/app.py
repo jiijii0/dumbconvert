@@ -32,7 +32,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Property, QEasingCurve, QEvent, QVariantAnimation, QItemSelectionModel, QPropertyAnimation, QSettings, QObject, QPoint, QPointF, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import (QBrush, QRegion, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
+from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QLinearGradient,
                            QRadialGradient,
                            QPainter, QPainterPath, QPen, QPolygonF,
                            QPixmap, QShortcut, QTransform)
@@ -94,6 +94,7 @@ class Group:
     name: str
     photos: list = field(default_factory=list)
     stock_id: str = ""        # film stock (NegPy catalogue id), rolls only
+    no_stock: bool = False    # "No film stock" chosen on purpose: the roll converts without one
     camera: str = ""          # camera the film was shot with, rolls only
     lens: str = ""
     date: str = ""            # "2024", "2024-06" or "2024-06-21"
@@ -111,12 +112,17 @@ class Group:
     def stock(self) -> dict | None:
         return engine.stock_by_id(self.stock_id) if self.stock_id else None
 
+    @property
+    def film_chosen(self) -> bool:
+        """A film stock was picked, or "No film stock": the roll can be analysed."""
+        return bool(self.stock_id) or self.no_stock
+
     def label(self) -> tuple[str, str]:
         """(title, subtitle) for its card in the left column."""
         n = len(self.photos)
         if self.kind == "frames":
             return "Single frames", f"{n} frame{'s' if n != 1 else ''}"
-        film = self.stock["displayName"] if self.stock else FILM_NEEDED
+        film = self.stock["displayName"] if self.stock else "No film stock" if self.no_stock else FILM_NEEDED
         state = "  ·  analysing…" if self.analyzing else ""
         return self.name, f"{film}  ·  {n} frame{"s" if n != 1 else ""}{state}"
 
@@ -333,94 +339,6 @@ class InfoDot(QWidget):
         p.setBrush(c)
         p.drawEllipse(QRectF(8.25, 5.6, 1.5, 1.5))     # the dot of the i
         p.drawRoundedRect(QRectF(8.3, 8.0, 1.4, 5.0), 0.7, 0.7)
-        p.end()
-
-
-class Spotlight(QWidget):
-    """Everything dark but one control: the step to take first (a roll's film stock). Clicks on the
-    dark go nowhere and make the control flash; the control itself is a hole and takes them."""
-    PAD = 6
-
-    def __init__(self, parent, target: QWidget, nudge):
-        super().__init__(parent)
-        self.target, self.nudge = target, nudge
-        self.hole = QRectF()
-        self._fade = 0.0
-        self._anim = QVariantAnimation(self, duration=220, easingCurve=QEasingCurve.OutCubic)
-        self._anim.valueChanged.connect(self._set_fade)
-        self._anim.finished.connect(lambda: self._fade <= 0.001 and super(Spotlight, self).hide())
-        self._follow = QTimer(self, interval=60, timeout=self._place)   # the column scrolls, the window resizes
-        super().hide()
-
-    def _set_fade(self, v):
-        self._fade = float(v)
-        self.update()
-
-    def on(self) -> bool:
-        return self.isVisible() and self._anim.endValue() != 0.0
-
-    def appear(self):
-        if self.on():
-            return
-        self._place()
-        self.show()
-        self.raise_()
-        self._follow.start()
-        self._anim.stop()
-        self._anim.setStartValue(self._fade)
-        self._anim.setEndValue(1.0)
-        self._anim.start()
-
-    def leave(self):
-        if not self.isVisible():
-            return
-        self._follow.stop()
-        self._anim.stop()
-        self._anim.setStartValue(self._fade)
-        self._anim.setEndValue(0.0)
-        self._anim.start()
-
-    def _place(self):
-        par = self.parentWidget()
-        if self.geometry() != par.rect():
-            self.setGeometry(par.rect())
-        if self.target.isVisible():
-            tl = self.target.mapTo(par, QPoint(0, 0))
-            hole = QRectF(tl.x(), tl.y(), self.target.width(), self.target.height()).adjusted(
-                -self.PAD, -self.PAD, self.PAD, self.PAD)
-        else:
-            hole = QRectF()
-        if hole != self.hole:
-            self.hole = hole
-            region = QRegion(self.rect())
-            if not hole.isEmpty():
-                region = region.subtracted(QRegion(hole.toRect(), QRegion.Rectangle))
-            self.setMask(region)
-            self.update()
-
-    def mousePressEvent(self, e):
-        self.nudge()
-        e.accept()
-
-    def wheelEvent(self, e):
-        e.accept()
-
-    def paintEvent(self, _e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        path = QPainterPath()
-        path.addRect(QRectF(self.rect()))
-        if not self.hole.isEmpty():
-            cut = QPainterPath()
-            cut.addRoundedRect(self.hole, 9, 9)
-            path = path.subtracted(cut)
-        p.fillPath(path, QColor(0, 0, 0, int(165 * self._fade)))
-        if not self.hole.isEmpty():
-            ring = QColor(ACCENT2)
-            ring.setAlphaF(self._fade)
-            p.setPen(QPen(ring, 1.5))
-            p.setBrush(Qt.NoBrush)
-            p.drawRoundedRect(self.hole.adjusted(0.75, 0.75, -0.75, -0.75), 9, 9)
         p.end()
 
 
@@ -3593,8 +3511,6 @@ class MainWindow(QMainWindow):
         keep.setRetainSizeWhenHidden(True)            # the tab row keeps its layout
         self.title_box.setSizePolicy(keep)
         self.title_box.setVisible(working)            # the photo's name only over the photo
-        if hasattr(self, "spotlight"):
-            self._update_spotlight()
         for sc in self._shortcuts + self._fixed_shortcuts:
             sc.setEnabled(working)
         (self.bindings_page if index == 2 else self.settings_page if index == 3 else self.preview).setFocus()
@@ -3739,7 +3655,6 @@ class MainWindow(QMainWindow):
             self.showMaximized() if self._was_maximized else self.showNormal()
             self._fit_left_column()
         self.preview.full_view = on
-        self._update_spotlight()
         self.preview.reset_zoom()
         self.preview.setFocus()
         self.backdrop.update()
@@ -4185,8 +4100,6 @@ class MainWindow(QMainWindow):
         outer_lay.addWidget(self.tab_row)
         outer_lay.addWidget(self.main_stack, 1)
         self.setCentralWidget(outer)
-        self.spotlight_enabled = True
-        self.spotlight = Spotlight(outer, self.stock_box, self._nudge_stock)
         self.overlay = DropOverlay(outer)
         self.left.setVisible(False)
         self.grid.setVisible(False)
@@ -4976,7 +4889,7 @@ class MainWindow(QMainWindow):
     def _session(self) -> dict:
         from dataclasses import asdict
         return {"pid": os.getpid(), "groups": [
-            {"kind": g.kind, "name": g.name, "stock_id": g.stock_id, "camera": g.camera, "lens": g.lens, "date": g.date,
+            {"kind": g.kind, "name": g.name, "stock_id": g.stock_id, "no_stock": g.no_stock, "camera": g.camera, "lens": g.lens, "date": g.date,
              "location": g.location, "location_label": g.location_label, "push_pull": g.push_pull,
              "photos": [{"path": str(ph.path), "settings": asdict(ph.settings), "exif": ph.exif} for ph in g.photos]}
             for g in self.groups]}
@@ -5120,7 +5033,7 @@ class MainWindow(QMainWindow):
             if not entries:
                 continue
             g = Group(kind=gd.get("kind", "frames"), name=gd.get("name", "Roll"))
-            for k in ("stock_id", "camera", "lens", "date", "location", "location_label", "push_pull"):
+            for k in ("stock_id", "no_stock", "camera", "lens", "date", "location", "location_label", "push_pull"):
                 setattr(g, k, gd.get(k, getattr(g, k)))
             self._add_group(g, [])
             for e in entries:
@@ -5251,8 +5164,8 @@ class MainWindow(QMainWindow):
         if g.kind != "roll":
             return
         self.stock_box.setCurrentIndex(max(self.stock_box.findData(g.stock_id), 0))
-        if not g.stock_id:
-            self.stock_box.lineEdit().clear()         # no stock: the placeholder, free to type
+        if not g.stock_id:                            # not chosen yet: the placeholder, free to type
+            self.stock_box.lineEdit().setText("No film stock" if g.no_stock else "")
         self._refresh_stock_needed()
         self.camera_edit.set_value(g.camera)
         self.lens_edit.set_value(g.lens)
@@ -5315,40 +5228,28 @@ class MainWindow(QMainWindow):
         g = self.group
         if not g or g.kind != "roll":
             return
-        self._set_roll_stock(g, self.stock_box.currentData() or "")
-        if not self.stock_box.currentData():
-            self.stock_box.lineEdit().clear()
+        stock_id = self.stock_box.currentData() or ""
+        was_chosen = g.film_chosen
+        g.no_stock = not stock_id                  # picking "No film stock" is a choice too
+        if stock_id == g.stock_id:
+            if not was_chosen:                     # nothing changes in the frames: just measure now
+                self._refresh_group_item(g)
+                self.analyze_roll(g)
+        else:
+            self._set_roll_stock(g, stock_id)
+        if not stock_id:
+            self.stock_box.lineEdit().setText("No film stock")
         self._refresh_stock_needed()
 
     def _refresh_stock_needed(self):
         """The film stock field stands out (accent edge and placeholder) while the roll has none."""
         g = self.group
-        need = bool(g and g.kind == "roll" and not g.stock_id)
+        need = bool(g and g.kind == "roll" and not g.film_chosen)
         box = self.stock_box
         box.setProperty("needed", need)
         box.setStyleSheet(f"QComboBox {{ border: 1px solid {ACCENT}; }} "
                           f"QLineEdit {{ placeholder-text-color: {ACCENT2}; }}" if need else "")
         self._show_roll_progress()
-        self._update_spotlight()
-
-    def _update_spotlight(self):
-        """While the roll on screen has no film: everything dark but the film stock field."""
-        g = self.group
-        want = (self.spotlight_enabled and bool(g and g.kind == "roll" and not g.stock_id and g in self.groups)
-                and self.main_stack.currentIndex() == 0 and not self._fullscreen)
-        if want and not self._details_open:          # the field lives in the roll's details: open them
-            self._details_open = True
-            self._place_details()
-        if want:
-            self.spotlight.appear()
-        else:
-            self.spotlight.leave()
-
-    def _nudge_stock(self):
-        """A click on the dark: point at the field."""
-        exif_panel.flash(self.stock_box)
-        self.stock_box.setFocus()
-        self.statusBar().clearMessage()
 
     def _set_roll_stock(self, g: Group, stock_id: str):
         """A roll's film stock changed: its frames convert for that film, and the roll is measured again."""
@@ -5374,7 +5275,7 @@ class MainWindow(QMainWindow):
         frame and its result is dropped."""
         if g.kind != "roll" or not g.photos:
             return
-        if not g.stock_id:                        # the film first: nothing to measure for yet
+        if not g.film_chosen:                     # the film first: nothing to measure for yet
             g.analysis_id += 1                    # one running for a film taken back stops
             g.analyzing = g.analyzed = False
             self._refresh_group_item(g)
@@ -5425,7 +5326,7 @@ class MainWindow(QMainWindow):
         if busy:
             g = self.group if self.group in busy else busy[0]
             self.roll_progress.show_progress(g.name, g.progress)
-        elif self.group and self.group.kind == "roll" and not self.group.stock_id and self.group in self.groups:
+        elif self.group and self.group.kind == "roll" and not self.group.film_chosen and self.group in self.groups:
             self.roll_progress.show_waiting(self.group.name)
         elif self.roll_progress.waiting:
             self.roll_progress.hide()
@@ -7148,7 +7049,7 @@ class MainWindow(QMainWindow):
         if not self.all_photos():
             self.statusBar().showMessage("Nothing to export yet.")
             return
-        missing = [g for g in self.groups if g.kind == "roll" and g.photos and not g.stock_id]
+        missing = [g for g in self.groups if g.kind == "roll" and g.photos and not g.film_chosen]
         if missing:                               # the film decides the conversion: choose it first
             g = missing[0]
             if g is not self.group:

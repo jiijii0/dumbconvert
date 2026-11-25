@@ -13,8 +13,8 @@ When you add scans you choose how they are analysed:
   grey axis for cast removal (a frame with no grey in it is balanced like its neighbours).
   Each frame keeps its own brightness range, and an unusual frame keeps its own measurement. This is what lab scanners do: the Frontier reads the
   whole order before correcting colour. Choose the **film stock** first (type to search NegPy's
-  catalogue of negative stocks, or pick "Other colour negative" / "Other B&W negative"): the roll
-  is analysed only once it has one, and until then the window steps back around the field.
+  catalogue of negative stocks, pick "Other colour negative" / "Other B&W negative", or "No film
+  stock"): the roll is analysed once one is chosen, and until then the field and the roll ask for it.
   - B&W stocks convert in B&W automatically;
   - colour stocks use their own dye-unmix (crosstalk) matrix when NegPy ships one, and their own
     Lab print colours (see below); respools of Kodak Vision3 (CineStill, Flic Film, Silbersalz35)

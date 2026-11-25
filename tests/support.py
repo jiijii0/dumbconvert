@@ -161,7 +161,6 @@ _OPEN: list = []
 def window(width: int = 1440, height: int = 900):
     win = app.MainWindow()
     _OPEN.append(win)
-    win.spotlight_enabled = False      # a roll without a film darkens the window; tests that click turn it off
     win.resize(width, height)
     win.show()
     win.activateWindow()
