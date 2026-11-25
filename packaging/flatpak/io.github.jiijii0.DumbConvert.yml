@@ -51,7 +51,7 @@ modules:
     sources:
       - python-wheels.json
 
-  # NegPy's Rust core, compiled from the copy in vendor/negpy (untouched)
+  # NegPy's Rust core, compiled from the copy in vendor/negpy
   - name: negpy-core
     buildsystem: simple
     build-options:

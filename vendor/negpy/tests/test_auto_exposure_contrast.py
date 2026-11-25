@@ -1,0 +1,505 @@
+import unittest
+
+import numpy as np
+
+from negpy.domain.interfaces import PipelineContext
+from negpy.features.exposure.logic import (
+    CharacteristicCurve,
+    compute_pivot,
+    curve_params_from_metrics,
+    effective_grade_range,
+    effective_midtone_gamma,
+    grade_to_slope,
+    _reference_linear_value,
+    auto_highlight_from_metrics,
+    auto_shadow_from_metrics,
+    highlight_hold_offset,
+    shadow_hold_offset,
+    per_channel_curve_params,
+    preflash_params,
+    shadow_reach_slope,
+)
+from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
+from negpy.features.exposure.normalization import (
+    LogNegativeBounds,
+    measure_anchor_from_log,
+    measure_highlight_point_from_log,
+    measure_shadow_point_from_log,
+    measure_textural_range_from_log,
+)
+from negpy.features.exposure.papers import resolve_paper
+from negpy.features.exposure.processor import PhotometricProcessor
+from negpy.features.process.models import ProcessMode
+
+
+def _context(density_range):
+    ctx = PipelineContext(scale_factor=1.0, original_size=(100, 100), process_mode=ProcessMode.C41)
+    ctx.metrics["norm_density_range"] = density_range
+    return ctx
+
+
+class TestAutoNormalizeContrast(unittest.TestCase):
+    """Auto Grade: paper grade follows the negative's textural density scale, partially."""
+
+    def _run(self, exposure, density_range, textural=None):
+        ctx = _context(density_range)
+        if textural is not None:
+            ctx.metrics["textural_range"] = textural
+        img = np.full((8, 8, 3), 0.4, dtype=np.float32)
+        return PhotometricProcessor(exposure).process(img, ctx)
+
+    def test_wider_textural_scale_prints_softer(self):
+        # Same normalized tone, same bounds: the frame whose detail spans more density
+        # gets a softer grade (Ilford/Kodak: ISO R follows the negative density range).
+        exp = ExposureConfig(auto_normalize_contrast=True)
+        contrasty = self._run(exp, 1.6, textural=1.3)
+        normal = self._run(exp, 1.6, textural=0.9)
+        self.assertFalse(np.allclose(contrasty, normal))
+
+    def test_no_textural_falls_back_to_fixed_reference(self):
+        exp = ExposureConfig(auto_normalize_contrast=True)
+        on = self._run(exp, 2.4)
+        ref_exp = ExposureConfig(auto_normalize_contrast=False)
+        ref = self._run(ref_exp, None)
+        np.testing.assert_array_almost_equal(on, ref)
+
+    def test_off_still_tracks_range(self):
+        exp = ExposureConfig(auto_normalize_contrast=False)
+        dense = self._run(exp, 2.4)
+        flat = self._run(exp, 0.7)
+        self.assertFalse(np.allclose(dense, flat))
+
+
+class TestEffectiveGradeRange(unittest.TestCase):
+    """
+    effective = K * lum_range * ((1 - s) + s * nominal / textural): the paper gamma is
+    shrunk toward the population norm (Alkofer, US 4,731,671), so the printed textural
+    range is a blend of the frame's own and a normal negative's.
+    """
+
+    def _with(self, **over):
+        import contextlib
+
+        @contextlib.contextmanager
+        def cm():
+            orig = {k: EXPOSURE_CONSTANTS[k] for k in over}
+            EXPOSURE_CONSTANTS.update(over)
+            try:
+                yield
+            finally:
+                EXPOSURE_CONSTANTS.update(orig)
+
+        return cm()
+
+    def test_physical_returns_floor_ceil(self):
+        self.assertEqual(effective_grade_range(False, 1.7, 0.9), 1.7)
+        self.assertIsNone(effective_grade_range(False, None, 0.9))
+
+    def test_auto_blends_toward_population_norm(self):
+        k = EXPOSURE_CONSTANTS["auto_grade_target"]
+        nominal = EXPOSURE_CONSTANTS["auto_grade_nominal_range"]
+        s = EXPOSURE_CONSTANTS["auto_grade_strength"]
+        expected = k * 1.6 * ((1.0 - s) + s * nominal / 1.2)
+        self.assertAlmostEqual(effective_grade_range(True, 1.6, 1.2), expected, places=6)
+
+    def test_normal_negative_is_target_times_range(self):
+        nominal = EXPOSURE_CONSTANTS["auto_grade_nominal_range"]
+        k = EXPOSURE_CONSTANTS["auto_grade_target"]
+        self.assertAlmostEqual(effective_grade_range(True, 1.8, nominal), k * 1.8, places=6)
+
+    def test_strength_zero_is_a_fixed_paper(self):
+        # The grade tracks the negative exactly like Auto Grade off, scaled by K.
+        with self._with(auto_grade_strength=0.0):
+            k = EXPOSURE_CONSTANTS["auto_grade_target"]
+            self.assertAlmostEqual(effective_grade_range(True, 2.4, 0.6), k * 2.4, places=6)
+            self.assertAlmostEqual(effective_grade_range(True, 2.4, 1.0), k * 2.4, places=6)
+
+    def test_strength_one_prints_every_textural_range_alike(self):
+        # Full normalization: slope * textural / lum_range is the same for every frame.
+        with self._with(auto_grade_strength=1.0):
+            a = effective_grade_range(True, 1.6, 0.8)
+            b = effective_grade_range(True, 2.4, 1.5)
+            self.assertAlmostEqual(a * 0.8 / 1.6, b * 1.5 / 2.4, places=6)
+
+    def test_wider_textural_softens_narrower_hardens(self):
+        normal = effective_grade_range(True, 1.6, 0.9)
+        self.assertLess(effective_grade_range(True, 1.6, 1.3), normal)
+        self.assertGreater(effective_grade_range(True, 1.6, 0.5), normal)
+
+    def test_overfill_is_capped(self):
+        # A textural range far past the norm (a rebate-polluted meter, an extreme scene)
+        # cannot print past auto_grade_max_overfill of a normal negative's print span.
+        k = EXPOSURE_CONSTANTS["auto_grade_target"]
+        nominal = EXPOSURE_CONSTANTS["auto_grade_nominal_range"]
+        cap = EXPOSURE_CONSTANTS["auto_grade_max_overfill"]
+        self.assertAlmostEqual(effective_grade_range(True, 2.4, 2.0), k * 2.4 * (nominal / 2.0) * cap, places=6)
+
+    def test_auto_degenerate_flat_is_capped(self):
+        self.assertLessEqual(effective_grade_range(True, 1.6, 0.0), 3.5 + 1e-6)
+
+    def test_auto_no_textural_falls_back_to_default(self):
+        from negpy.features.exposure.logic import default_grade_range
+
+        self.assertAlmostEqual(effective_grade_range(True, 2.4, None), default_grade_range(), places=6)
+
+
+class TestMeasureTexturalRange(unittest.TestCase):
+    def test_uniform_image_is_zero(self):
+        img_log = np.full((16, 16, 3), -1.0, dtype=np.float32)
+        self.assertAlmostEqual(measure_textural_range_from_log(img_log), 0.0, places=5)
+
+    def test_tracks_spread(self):
+        # Half the pixels at log -1.5, half at -0.5 → P10..P90 spans ~1.0.
+        col = np.where(np.arange(64) < 32, -1.5, -0.5).astype(np.float32)
+        img_log = np.repeat(col[None, :, None], 64, axis=0).repeat(3, axis=2)
+        rng = measure_textural_range_from_log(img_log)
+        self.assertAlmostEqual(rng, 1.0, places=2)
+
+    def test_positive_for_reversed_e6_style(self):
+        # Inverted densities must still yield a positive span.
+        col = np.where(np.arange(64) < 32, -0.3, -1.7).astype(np.float32)
+        img_log = np.repeat(col[None, :, None], 64, axis=0).repeat(3, axis=2)
+        self.assertGreater(measure_textural_range_from_log(img_log), 0.0)
+
+
+class TestMeasureAnchor(unittest.TestCase):
+    BOUNDS = LogNegativeBounds(floors=(-2.0, -2.0, -2.0), ceils=(0.0, 0.0, 0.0))
+
+    def _measure(self, log_val):
+        img_log = np.full((16, 16, 3), log_val, dtype=np.float32)
+        return measure_anchor_from_log(img_log, self.BOUNDS)
+
+    def test_tracks_midtone_partial(self):
+        # Linear partial metering: correction = strength * (norm - assumed).
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        strength = EXPOSURE_CONSTANTS["anchor_meter_strength"]
+
+        def expected(norm):
+            return assumed + strength * (norm - assumed)
+
+        self.assertAlmostEqual(self._measure(-1.2), expected(0.4), places=4)  # within band
+        self.assertAlmostEqual(self._measure(-0.9), expected(0.55), places=4)  # within band
+        self.assertNotAlmostEqual(self._measure(-1.2), self._measure(-0.9), places=3)
+
+    def test_statistic_is_mean_and_midpoint_of_trimmed_window(self):
+        # Boyack & Juenger (US 5,724,456): place the average of the trimmed window's mean
+        # and its midpoint, not the median. Columns 0.2/0.8/0.2/0.5 normalized: median
+        # 0.35, mean 0.425, P5-P95 midpoint 0.5 -> 0.4625.
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        strength = EXPOSURE_CONSTANTS["anchor_meter_strength"]
+        cols = np.array([-1.6, -0.4, -1.6, -1.0], dtype=np.float32)[np.arange(64) % 4]
+        img = np.repeat(cols[None, :, None], 64, axis=0).repeat(3, axis=2)
+        self.assertAlmostEqual(measure_anchor_from_log(img, self.BOUNDS), assumed + strength * (0.4625 - assumed), places=4)
+
+    def test_partial_preserves_key(self):
+        # A low-key (dark) frame's anchor leans dark but is pulled toward assumed
+        # (not all the way to the raw median), by a fixed fraction of the distance.
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        strength = EXPOSURE_CONSTANTS["anchor_meter_strength"]
+        norm = 0.4
+        low = self._measure(-1.2)  # raw norm 0.4 < assumed
+        self.assertAlmostEqual(low - assumed, strength * (norm - assumed), places=5)
+
+    def test_clamped_to_band(self):
+        band = EXPOSURE_CONSTANTS["anchor_meter_band"]
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        # Extreme frames stay within assumed +/- band (hard safety clamp); the
+        # gentle linear pull keeps the common case well inside the band.
+        hi = self._measure(-0.02)  # norm ~0.99
+        lo = self._measure(-1.98)  # norm ~0.01
+        self.assertGreater(hi, assumed)
+        self.assertLess(lo, assumed)
+        self.assertLessEqual(hi, assumed + band + 1e-6)
+        self.assertGreaterEqual(lo, assumed - band - 1e-6)
+
+    def test_e6_reversed_bounds(self):
+        # E6 normalizes with floors > ceils; anchor must stay finite and in band.
+        bounds = LogNegativeBounds(floors=(0.0, 0.0, 0.0), ceils=(-2.0, -2.0, -2.0))
+        img_log = np.full((16, 16, 3), -1.0, dtype=np.float32)
+        a = measure_anchor_from_log(img_log, bounds)
+        band = EXPOSURE_CONSTANTS["anchor_meter_band"]
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        self.assertTrue(assumed - band - 1e-6 <= a <= assumed + band + 1e-6)
+
+
+def _bordered_texture(levels, border, size=128, inner=96):
+    """Textured interior (columns cycling over `levels`) inside a flat border, like a
+    frame inside its rebate. Cells are pixels here: no block median runs at this size,
+    and the interior sits on the gate's sector grid."""
+    img = np.full((size, size, 3), border, dtype=np.float32)
+    o = (size - inner) // 2
+    cols = np.array(levels, dtype=np.float32)[np.arange(inner) % len(levels)]
+    img[o : o + inner, o : o + inner, :] = cols[None, :, None]
+    return img
+
+
+class TestActivityGate(unittest.TestCase):
+    """Both meters read textured cells only, so a flat rebate, border or sky does not vote."""
+
+    BOUNDS = LogNegativeBounds(floors=(-2.0, -2.0, -2.0), ceils=(0.0, 0.0, 0.0))
+
+    def test_textural_range_ignores_flat_border(self):
+        img = _bordered_texture([-1.5, -1.0, -0.5], border=-0.1)
+        self.assertAlmostEqual(measure_textural_range_from_log(img), 1.0, places=2)
+
+    def test_anchor_ignores_flat_border(self):
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        strength = EXPOSURE_CONSTANTS["anchor_meter_strength"]
+        img = _bordered_texture([-1.5, -1.0, -0.5], border=-0.1)
+        # Interior normalizes to 0.25/0.5/0.75; the border alone would read 0.95.
+        self.assertAlmostEqual(measure_anchor_from_log(img, self.BOUNDS), assumed + strength * (0.5 - assumed), places=2)
+
+    def test_flat_frame_falls_back_to_every_cell(self):
+        img = np.full((128, 128, 3), -1.2, dtype=np.float32)
+        assumed = EXPOSURE_CONSTANTS["assumed_anchor"]
+        strength = EXPOSURE_CONSTANTS["anchor_meter_strength"]
+        self.assertAlmostEqual(measure_anchor_from_log(img, self.BOUNDS), assumed + strength * (0.4 - assumed), places=4)
+        self.assertAlmostEqual(measure_textural_range_from_log(img), 0.0, places=5)
+
+
+class TestAutoTogglesAcrossModes(unittest.TestCase):
+    """The toggles must render valid output in every process mode (CPU path)."""
+
+    def _render(self, mode, exposure):
+        from dataclasses import replace
+
+        from negpy.domain.models import WorkspaceConfig
+        from negpy.features.process.models import ProcessConfig
+        from negpy.services.rendering.engine import DarkroomEngine
+
+        settings = replace(
+            WorkspaceConfig(),
+            process=replace(ProcessConfig(), process_mode=mode),
+            exposure=exposure,
+        )
+        img = np.random.default_rng(7).uniform(0.02, 0.9, (48, 48, 3)).astype(np.float32)
+        return DarkroomEngine().process(img, settings, f"mode_{mode}")
+
+    def test_valid_and_active_in_each_mode(self):
+        for mode in ProcessMode:
+            base = self._render(mode, ExposureConfig(auto_exposure=False, auto_normalize_contrast=False))
+            auto = self._render(mode, ExposureConfig(auto_exposure=True, auto_normalize_contrast=True))
+            self.assertTrue(np.all(np.isfinite(auto)), mode)
+            self.assertGreaterEqual(float(auto.min()), 0.0, mode)
+            self.assertLessEqual(float(auto.max()), 1.0, mode)
+            # The toggles must actually change the render.
+            self.assertFalse(np.allclose(base, auto), mode)
+
+
+class TestAnchorPivotRoundTrip(unittest.TestCase):
+    def test_metered_anchor_prints_at_target(self):
+        # compute_pivot must place the curve so the anchor tone prints at
+        # anchor_target_density (density slider neutral, no paper Dmin).
+        target = EXPOSURE_CONSTANTS["anchor_target_density"]
+        for anchor in (0.40, 0.46, 0.55):
+            slope = grade_to_slope(115.0, 1.3)
+            pivot = compute_pivot(slope, density=1.0, d_min=0.0, anchor=anchor)
+            curve = CharacteristicCurve(contrast=slope, pivot=pivot)
+            printed = float(curve(np.array([[anchor]], dtype=np.float32))[0, 0])
+            self.assertAlmostEqual(printed, target, places=3)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestShadowReach(unittest.TestCase):
+    """Auto Grade floor: the textured dark tail must print at shadow_reach_density
+    (Gindele, US 7,113,649; Ajewole, US 5,046,118). One-sided: only ever harder."""
+
+    ANCHOR = 0.46
+
+    def test_short_shadow_raises_slope_until_tail_prints_black(self):
+        k = shadow_reach_slope(2.5, self.ANCHOR, 0.8)
+        self.assertGreater(k, 2.5)
+        curve = CharacteristicCurve(k, compute_pivot(k, 1.0, anchor=self.ANCHOR))
+        self.assertAlmostEqual(float(curve(np.array([0.8]))[0]), EXPOSURE_CONSTANTS["shadow_reach_density"], places=2)
+
+    def test_tail_already_black_keeps_slope(self):
+        self.assertEqual(shadow_reach_slope(6.0, self.ANCHOR, 0.9), 6.0)
+
+    def test_clamped_to_slope_max(self):
+        self.assertEqual(shadow_reach_slope(2.5, self.ANCHOR, self.ANCHOR + 0.01), EXPOSURE_CONSTANTS["slope_max"])
+
+    def test_tail_at_or_above_anchor_keeps_slope(self):
+        self.assertEqual(shadow_reach_slope(2.5, self.ANCHOR, self.ANCHOR), 2.5)
+        self.assertEqual(shadow_reach_slope(2.5, self.ANCHOR, 0.3), 2.5)
+
+    def test_curve_params_apply_reach_only_with_auto_grade(self):
+        on = per_channel_curve_params(115.0, 1.0, True, 0.0, 1.2, 0.9, anchor=self.ANCHOR, shadow_point=0.7)
+        off = per_channel_curve_params(115.0, 1.0, False, 0.0, 1.2, 0.9, anchor=self.ANCHOR, shadow_point=0.7)
+        plain = per_channel_curve_params(115.0, 1.0, True, 0.0, 1.2, 0.9, anchor=self.ANCHOR)
+        self.assertGreater(on[0][1], plain[0][1])
+        self.assertEqual(off[0][1], per_channel_curve_params(115.0, 1.0, False, 0.0, 1.2, 0.9, anchor=self.ANCHOR)[0][1])
+
+
+class TestMeasureShadowPoint(unittest.TestCase):
+    BOUNDS = LogNegativeBounds(floors=(-2.0, -2.0, -2.0), ceils=(0.0, 0.0, 0.0))
+
+    def test_reads_dark_tail_of_textured_cells(self):
+        # Interior normalizes to 0.25/0.5/0.75; the flat border at 0.95 must not vote.
+        img = _bordered_texture([-1.5, -1.0, -0.5], border=-0.1)
+        self.assertAlmostEqual(measure_shadow_point_from_log(img, self.BOUNDS), 0.75, places=2)
+
+
+class TestHighlightHold(unittest.TestCase):
+    """Auto Grade's soft-exposure half: the brightest textured tone must hold
+    highlight_hold_density instead of printing paper white. One-sided burn via the
+    highlight zone offset; never brightens."""
+
+    ANCHOR = 0.46
+    SLOPE = 3.0
+
+    def _pivot(self):
+        return compute_pivot(self.SLOPE, 1.0, anchor=self.ANCHOR)
+
+    def test_tone_at_paper_white_is_burned_to_hold_density(self):
+        hd = highlight_hold_offset(self.SLOPE, self._pivot(), 0.05)
+        self.assertGreater(hd, 0.0)
+        curve = CharacteristicCurve(self.SLOPE, self._pivot(), highlight_density=hd)
+        self.assertAlmostEqual(float(curve(np.array([0.05]))[0]), EXPOSURE_CONSTANTS["highlight_hold_density"], places=2)
+
+    def test_tone_already_holding_is_untouched(self):
+        self.assertEqual(highlight_hold_offset(self.SLOPE, self._pivot(), 0.40), 0.0)
+
+    def test_offset_is_capped(self):
+        self.assertEqual(highlight_hold_offset(self.SLOPE, self._pivot(), -1.0), EXPOSURE_CONSTANTS["highlight_hold_max"])
+
+    def test_zero_target_disables(self):
+        saved = EXPOSURE_CONSTANTS["highlight_hold_density"]
+        EXPOSURE_CONSTANTS["highlight_hold_density"] = 0.0
+        try:
+            self.assertEqual(highlight_hold_offset(self.SLOPE, self._pivot(), 0.05), 0.0)
+        finally:
+            EXPOSURE_CONSTANTS["highlight_hold_density"] = saved
+
+    def test_metrics_helper_follows_auto_grade_toggle(self):
+        metrics = {"norm_density_range": 1.2, "metered_anchor": self.ANCHOR, "highlight_point": 0.05}
+        on = auto_highlight_from_metrics(ExposureConfig(auto_normalize_contrast=True), ProcessMode.C41, metrics)
+        off = auto_highlight_from_metrics(ExposureConfig(auto_normalize_contrast=False), ProcessMode.C41, metrics)
+        self.assertGreater(on, 0.0)
+        self.assertEqual(off, 0.0)
+        self.assertEqual(auto_highlight_from_metrics(ExposureConfig(), ProcessMode.C41, {}), 0.0)
+
+
+class TestShadowHold(unittest.TestCase):
+    """Auto Grade's shadow lift: a partial shadow zone lift once the textured dark tail runs
+    far past Shadow Reach's line. One-sided; never darkens."""
+
+    ANCHOR = 0.46
+    SLOPE = 3.0
+
+    def _pivot(self):
+        return compute_pivot(self.SLOPE, 1.0, anchor=self.ANCHOR)
+
+    def _start(self):
+        c = EXPOSURE_CONSTANTS
+        return _reference_linear_value(target=c["shadow_reach_density"]) + c["shadow_hold_overshoot"]
+
+    def test_tail_short_of_the_start_is_untouched(self):
+        point = self._pivot() + (self._start() - 0.1) / self.SLOPE
+        self.assertEqual(shadow_hold_offset(self.SLOPE, self._pivot(), point), 0.0)
+
+    def test_lift_is_strength_times_the_overshoot(self):
+        over = 0.4
+        point = self._pivot() + (self._start() + over) / self.SLOPE
+        expected = -EXPOSURE_CONSTANTS["shadow_hold_strength"] * over
+        self.assertAlmostEqual(shadow_hold_offset(self.SLOPE, self._pivot(), point, midtone_gamma=0.0), expected, places=6)
+
+    def test_lift_is_capped_and_never_darkens(self):
+        lifts = [shadow_hold_offset(self.SLOPE, self._pivot(), p) for p in np.linspace(-1.0, 4.0, 60)]
+        self.assertTrue(all(-EXPOSURE_CONSTANTS["shadow_hold_max"] - 1e-12 <= x <= 0.0 for x in lifts))
+        self.assertEqual(min(lifts), -EXPOSURE_CONSTANTS["shadow_hold_max"])
+
+    def test_lift_opens_the_tail(self):
+        point = self._pivot() + (self._start() + 0.4) / self.SLOPE
+        lift = shadow_hold_offset(self.SLOPE, self._pivot(), point)
+        held = CharacteristicCurve(self.SLOPE, self._pivot(), midtone_gamma=0.0, shadow_density=lift)
+        plain = CharacteristicCurve(self.SLOPE, self._pivot(), midtone_gamma=0.0)
+        x = np.array([self.ANCHOR + 0.2])
+        self.assertLess(float(held(x)[0]), float(plain(x)[0]))
+
+    def test_zero_strength_disables(self):
+        saved = EXPOSURE_CONSTANTS["shadow_hold_strength"]
+        EXPOSURE_CONSTANTS["shadow_hold_strength"] = 0.0
+        try:
+            self.assertEqual(shadow_hold_offset(self.SLOPE, self._pivot(), 3.0), 0.0)
+        finally:
+            EXPOSURE_CONSTANTS["shadow_hold_strength"] = saved
+
+    def test_metrics_helper_follows_auto_grade_toggle(self):
+        metrics = {"norm_density_range": 1.2, "metered_anchor": self.ANCHOR, "shadow_point": 1.6}
+        on = auto_shadow_from_metrics(ExposureConfig(auto_normalize_contrast=True), ProcessMode.C41, metrics)
+        off = auto_shadow_from_metrics(ExposureConfig(auto_normalize_contrast=False), ProcessMode.C41, metrics)
+        self.assertLess(on, 0.0)
+        self.assertEqual(off, 0.0)
+        self.assertEqual(auto_shadow_from_metrics(ExposureConfig(), ProcessMode.C41, {}), 0.0)
+
+
+class TestMeasureHighlightPoint(unittest.TestCase):
+    BOUNDS = LogNegativeBounds(floors=(-2.0, -2.0, -2.0), ceils=(0.0, 0.0, 0.0))
+
+    def test_reads_bright_tail_of_textured_cells(self):
+        # Interior normalizes to 0.25/0.5/0.75; the flat border at 0.95 must not vote.
+        img = _bordered_texture([-1.5, -1.0, -0.5], border=-0.1)
+        self.assertAlmostEqual(measure_highlight_point_from_log(img, self.BOUNDS), 0.25, places=2)
+
+
+class TestAutoTargetsThroughMidtoneGamma(unittest.TestCase):
+    """Shadow Reach, the holds and the preflash threshold aim through the paper's midtone gamma
+    and the user's Snap, as the curve prints them. Frontier carries a large one (0.25)."""
+
+    ANCHOR = 0.46
+    SLOPE = 3.0
+    PAPER = resolve_paper("frontier")
+    GAMMAS = (None, -0.3, 0.6)  # None: the paper's own
+
+    def _pivot(self, k):
+        return compute_pivot(k, 1.0, self.PAPER.d_min, anchor=self.ANCHOR, paper=self.PAPER)
+
+    def _curve(self, k, mg, **kw):
+        return CharacteristicCurve(k, self._pivot(k), d_min=self.PAPER.d_min, paper=self.PAPER, midtone_gamma=mg, **kw)
+
+    def test_shadow_reach_prints_its_target(self):
+        for mg in self.GAMMAS:
+            k = shadow_reach_slope(2.0, self.ANCHOR, 0.8, d_min=self.PAPER.d_min, paper=self.PAPER, midtone_gamma=mg)
+            printed = float(self._curve(k, mg)(np.array([0.8]))[0])
+            self.assertAlmostEqual(printed, EXPOSURE_CONSTANTS["shadow_reach_density"], places=3, msg=f"mg {mg}")
+
+    def test_highlight_hold_prints_its_target(self):
+        for mg, point in ((None, -0.2), (0.6, -0.1)):  # a burn under highlight_hold_max
+            hd = highlight_hold_offset(
+                self.SLOPE, self._pivot(self.SLOPE), point, d_min=self.PAPER.d_min, paper=self.PAPER, midtone_gamma=mg
+            )
+            self.assertTrue(0.0 < hd < EXPOSURE_CONSTANTS["highlight_hold_max"], msg=f"mg {mg}")
+            printed = float(self._curve(self.SLOPE, mg, highlight_density=hd)(np.array([point]))[0])
+            self.assertAlmostEqual(printed, EXPOSURE_CONSTANTS["highlight_hold_density"], places=2, msg=f"mg {mg}")
+
+    def test_shadow_hold_starts_where_the_tail_prints_past_reach(self):
+        c, p = EXPOSURE_CONSTANTS, self.PAPER
+        start = self._curve(self.SLOPE, None)  # the tail's density without a lift
+        begin = float(
+            CharacteristicCurve(1.0, 0.0, d_min=p.d_min, paper=p, midtone_gamma=0.0)(
+                np.array([_reference_linear_value(p.d_min, p, target=c["shadow_reach_density"]) + c["shadow_hold_overshoot"]])
+            )[0]
+        )
+        points = np.linspace(self.ANCHOR, 1.6, 400)
+        printed = np.asarray(start(points)).ravel()
+        lifts = np.array([shadow_hold_offset(self.SLOPE, self._pivot(self.SLOPE), x, d_min=p.d_min, paper=p) for x in points])
+        first = int(np.argmax(lifts < 0.0))
+        self.assertLess(printed[first - 1], begin + 1e-6)
+        self.assertGreaterEqual(printed[first], begin - 0.02)
+
+    def test_preflash_threshold_prints_the_threshold(self):
+        p = self.PAPER
+        for mg in self.GAMMAS:
+            v_th, _ = preflash_params(115.0, p.d_min, p, midtone_gamma=mg)
+            printed = float(CharacteristicCurve(1.0, 0.0, d_min=p.d_min, paper=p, midtone_gamma=mg)(np.array([v_th]))[0])
+            self.assertAlmostEqual(printed, p.d_min + EXPOSURE_CONSTANTS["preflash_threshold_density"], places=4, msg=f"mg {mg}")
+
+    def test_curve_params_aim_through_the_snap(self):
+        metrics = {"norm_density_range": 1.2, "textural_range": 0.9, "metered_anchor": self.ANCHOR, "shadow_point": 0.7}
+        exp = ExposureConfig(paper_profile="frontier", auto_normalize_contrast=True, auto_exposure=True, midtone_gamma=0.2)
+        slopes, pivots, _ = curve_params_from_metrics(exp, ProcessMode.C41, metrics)
+        curve = CharacteristicCurve(slopes[1], pivots[1], paper=self.PAPER, midtone_gamma=effective_midtone_gamma(self.PAPER, 0.2))
+        self.assertAlmostEqual(float(curve(np.array([0.7]))[0]), EXPOSURE_CONSTANTS["shadow_reach_density"], places=3)

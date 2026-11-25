@@ -28,7 +28,8 @@
 
 ## Why it's nice
 
-- **Drop and go.** Drop a roll, get good colour straight away.
+- **Drop and go.** Drop a roll, pick its film, get good colour straight away.
+- **Film-true colour.** Each stock gets the colours it takes on photo paper, worked out from its data sheet.
 - **Decluttered.** Six faders, like a lab scanner. The rest stays folded away.
 - **No library.** No projects, no catalogue, no sidecar files. Open, convert, close.
 - **Rolls match.** A roll is measured as one, so its frames share the same colour.
@@ -70,7 +71,7 @@ xattr -dr com.apple.quarantine /Applications/DumbConvert.app
 Needs Python 3.13+ and Rust (`brew install rust`).
 
 ```sh
-git clone --recurse-submodules https://github.com/jiijii0/dumbconvert.git
+git clone https://github.com/jiijii0/dumbconvert.git
 cd dumbconvert
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -89,7 +90,7 @@ request easy to merge.
 Every key, how it works and why the defaults are what they are: [docs/details.md](docs/details.md).
 
 The place search sends the text you type to [Photon](https://photon.komoot.io), a free
-OpenStreetMap search. Nothing else leaves your Mac.
+OpenStreetMap search. Nothing else leaves your computer.
 
 ## Thanks
 

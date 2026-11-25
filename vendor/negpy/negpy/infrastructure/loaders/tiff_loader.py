@@ -1,0 +1,314 @@
+import os
+from collections.abc import Callable
+import imageio.v3 as iio
+import numpy as np
+import tifffile
+from PIL import Image
+from typing import Any, ContextManager, Optional, Tuple
+from negpy.domain.interfaces import IImageLoader
+from negpy.domain.models import ColorSpace
+from negpy.kernel.image.logic import srgb_to_linear, uint8_to_float32, uint16_to_float32, working_oetf_decode
+from negpy.infrastructure.loaders.constants import IR_SIDECAR_SUFFIXES, SUPPORTED_TIFF_EXTENSIONS
+from negpy.infrastructure.loaders.helpers import (
+    NonStandardFileWrapper,
+    _tiff_preview_page,
+    bounded_tiff_page_preview,
+    fit_bounded_preview,
+    identify_color_space_from_icc,
+    read_orientation,
+)
+from negpy.features.process.capture_color import source_cam_xyz
+from negpy.infrastructure.loaders.source_encoding import PROFILE, decode_positive, resolve_decode
+from negpy.infrastructure.loaders.ir_planes import find_ir_plane, normalize_ir_to_float32
+from negpy.kernel.system.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def _ir_suffixes(token: str) -> tuple[str, ...]:
+    """`_ir` → (`_ir.tif`, `_ir.tiff`). Keeps the read side tied to the token set that
+    `is_ir_sidecar_path` hides from asset discovery."""
+    assert token in IR_SIDECAR_SUFFIXES
+    return tuple(token + e for e in sorted(SUPPORTED_TIFF_EXTENSIONS))
+
+
+def _find_sidecar(dirname: str, entries: list[str], stem_lower: str, suffixes: tuple[str, ...]) -> Optional[str]:
+    """First dir entry whose lowercased name == stem_lower + one of `suffixes` (suffixes already lowercase)."""
+    for name in entries:
+        if name.lower() in tuple(stem_lower + s for s in suffixes):
+            return os.path.join(dirname, name)
+    return None
+
+
+def _read_sidecar_ir(file_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Read an IR sidecar and its optional validity mask fail-closed. Case-insensitive on the
+    _ir token and the .tif/.tiff extension so scanner tools that emit lowercase names are picked up."""
+    base, _ = os.path.splitext(file_path)
+    dirname = os.path.dirname(file_path) or "."
+    stem_lower = os.path.basename(base).lower()
+    try:
+        entries = os.listdir(dirname)
+    except OSError:
+        return None, None
+
+    candidate = _find_sidecar(dirname, entries, stem_lower, _ir_suffixes("_ir"))
+    if candidate is None:
+        return None, None
+    try:
+        arr = tifffile.imread(candidate)
+        ir = normalize_ir_to_float32(np.asarray(arr))
+    except Exception as e:
+        logger.warning(f"Failed to read IR sidecar {candidate}: {e}")
+        return None, None
+
+    mask_candidate = _find_sidecar(dirname, entries, stem_lower, _ir_suffixes("_ir_valid"))
+    if mask_candidate is None:
+        return ir, None
+    try:
+        valid = np.asarray(tifffile.imread(mask_candidate))
+        if valid.shape != ir.shape:
+            raise ValueError(f"mask shape {valid.shape} does not match IR shape {ir.shape}")
+        if valid.dtype not in (np.dtype(np.bool_), np.dtype(np.uint8)):
+            raise ValueError(f"mask dtype {valid.dtype} is not bool or uint8")
+        if valid.dtype == np.uint8:
+            rows_per_chunk = max(1, (1 << 20) // max(1, valid.shape[1]))
+            for start in range(0, valid.shape[0], rows_per_chunk):
+                chunk = valid[start : start + rows_per_chunk]
+                if not np.all((chunk == 0) | (chunk == 1) | (chunk == 255)):
+                    raise ValueError("uint8 mask values must be 0, 1, or 255")
+        valid = valid.astype(np.bool_, copy=False)
+        ir = ir.copy()
+        ir[~valid] = 1.0
+        return ir, valid
+    except Exception as e:
+        logger.warning(f"Failed to read IR validity mask {mask_candidate}; ignoring IR sidecar {candidate}: {e}")
+        return None, None
+
+
+def _read_ir_from_extra_page(file_path: str, main_h: int, main_w: int) -> Optional[np.ndarray]:
+    """Finds a grayscale page at full resolution — SilverFast iSRD stores IR as page 2 with
+    NewSubfileType=4. Page 0 is the main image here, so it is never a candidate."""
+    try:
+        with tifffile.TiffFile(file_path) as tif:
+            return find_ir_plane(tif.pages[1:], main_h, main_w)
+    except Exception as e:
+        logger.warning(f"Failed to read extra-page IR from {file_path}: {e}")
+    return None
+
+
+def _extract_ir_from_extrasamples(file_path: str, img: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Inspects ExtraSamples; returns (rgb, ir_or_none).
+
+    Convention:
+    - ExtraSamples[0] == 0 (UNSPECIFIED) → 4th plane is IR.
+    - ExtraSamples[0] in (1, 2) (associated/unassociated alpha) → drop as alpha.
+    - ExtraSamples tag missing → treat 4th plane as IR. Many scanner stacks (Nikon
+      Coolscan via Nikon Scan, some VueScan profiles) emit 4-sample TIFFs without
+      tagging the extra plane. A trailing alpha channel from a scanner is
+      vanishingly rare; IR is the overwhelmingly common case.
+    """
+    if img.ndim != 3 or img.shape[2] != 4:
+        return img, None
+
+    extrasamples_kind: Optional[int] = None
+    tag_present = False
+    try:
+        with tifffile.TiffFile(file_path) as tif:
+            page = tif.pages[0]
+            tags = getattr(page, "tags", None)
+            tag = tags.get("ExtraSamples") if tags is not None else None
+            if tag is not None and tag.value is not None:
+                tag_present = True
+                val = tag.value
+                if isinstance(val, (tuple, list, np.ndarray)):
+                    extrasamples_kind = int(val[0]) if len(val) > 0 else None
+                else:
+                    extrasamples_kind = int(val)
+    except Exception as e:
+        logger.warning(f"Failed to read ExtraSamples tag from {file_path}: {e}")
+
+    is_ir = extrasamples_kind == 0 or not tag_present
+    if is_ir:
+        return np.ascontiguousarray(img[:, :, :3]), normalize_ir_to_float32(img[:, :, 3])
+    return np.ascontiguousarray(img[:, :, :3]), None
+
+
+def planar_to_chunky(img: np.ndarray, planarconfig: int) -> np.ndarray:
+    """(samples, H, W) from a PlanarConfiguration=2 TIFF as (H, W, samples)."""
+    if int(planarconfig) == 2 and img.ndim == 3:
+        return np.moveaxis(img, 0, -1)
+    return img
+
+
+def _planarconfig(file_path: str) -> int:
+    try:
+        with tifffile.TiffFile(file_path) as tif:
+            return int(getattr(tif.pages[0], "planarconfig", 1))
+    except Exception:
+        return 1
+
+
+# TIFF PhotometricInterpretation values the samples need decoding from.
+_MINISWHITE, _PALETTE, _SEPARATED = 0, 3, 5
+
+
+def _photometric(file_path: str) -> tuple[int, Optional[np.ndarray]]:
+    """(PhotometricInterpretation, colormap or None) of the first page; RGB when unreadable."""
+    try:
+        with tifffile.TiffFile(file_path) as tif:
+            page = tif.pages[0]
+            return int(page.photometric), page.colormap
+    except Exception:
+        return 2, None
+
+
+def decode_photometric(img: np.ndarray, photometric: int, colormap: Optional[np.ndarray]) -> np.ndarray:
+    """Samples as gray or RGB intensities: a palette expanded, MinIsWhite and CMYK inverted."""
+    top = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
+    if photometric == _PALETTE and colormap is not None and img.ndim == 2:
+        return np.ascontiguousarray(np.moveaxis(np.asarray(colormap)[:, img], 0, -1))
+    if photometric == _MINISWHITE:
+        return (top - img).astype(img.dtype)
+    if photometric == _SEPARATED and img.ndim == 3 and img.shape[2] >= 4:
+        cmy, k = img[:, :, :3].astype(np.float64), img[:, :, 3:4].astype(np.float64)
+        return ((top - cmy) * (top - k) / top).astype(img.dtype)
+    return img
+
+
+class TiffLoader(IImageLoader):
+    """
+    Loader for TIFF scans. Surfaces an IR channel via `metadata["ir"]` when present
+    (either as a 4th sample with ExtraSamples=UNSPECIFIED, or via a `_IR.tif` sidecar).
+    """
+
+    def load(
+        self, file_path: str, linear_raw: bool = False, positive_decode: str = "", load_ir: bool = True
+    ) -> Tuple[ContextManager[Any], dict]:
+        """*positive_decode* is the frame's Source Encoding on Positive (path.positive_decode); it
+        replaces the Linear RAW decision for a Positive frame."""
+        img = planar_to_chunky(iio.imread(file_path), _planarconfig(file_path))
+        img = decode_photometric(img, *_photometric(file_path))
+        ir: Optional[np.ndarray] = None
+        ir_valid_mask: Optional[np.ndarray] = None
+
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 2:
+            # Gray plus one extra sample, read like the fourth sample of an RGB scan.
+            img, ir = _extract_ir_from_extrasamples(file_path, img[:, :, [0, 0, 0, 1]])
+        elif img.ndim == 3 and img.shape[2] == 4:
+            img, ir = _extract_ir_from_extrasamples(file_path, img)
+        elif img.ndim == 3 and img.shape[2] > 4:
+            img = img[:, :, :3]
+
+        if ir is None and load_ir:
+            ir, ir_valid_mask = _read_sidecar_ir(file_path)
+
+        if ir is None and load_ir:
+            ir = _read_ir_from_extra_page(file_path, img.shape[0], img.shape[1])
+
+        icc_bytes: bytes | None = None
+        try:
+            with tifffile.TiffFile(file_path) as tif:
+                page = tif.pages[0]
+                tags = getattr(page, "tags", None)
+                tag = tags.get("InterColorProfile") if tags is not None else None
+                if tag is not None and tag.value:
+                    icc_bytes = bytes(tag.value)
+        except Exception:
+            icc_bytes = None
+
+        color_space = None
+        if positive_decode:
+            ran, decode = resolve_decode(positive_decode, icc_bytes, img.dtype)
+            # The engines take it to the working space, so Same as Source names it only for a profile.
+            color_space = identify_color_space_from_icc(icc_bytes) if ran == PROFILE else None
+            if decode.identity and img.dtype == np.uint16:
+                wrapper = NonStandardFileWrapper(source_u16=np.ascontiguousarray(img))
+            else:
+                linear, to_working = decode_positive(img, decode)
+                wrapper = NonStandardFileWrapper(linear)
+                wrapper.rgb_xyz_matrix = source_cam_xyz(to_working)
+            metadata = {
+                "orientation": read_orientation(file_path),
+                "color_space": color_space,
+                "icc_profile": icc_bytes,
+                "ir": ir,
+                "ir_valid_mask": ir_valid_mask,
+                "source_encoding": ran,
+            }
+            return wrapper, metadata
+        if not linear_raw:
+            color_space = identify_color_space_from_icc(icc_bytes)
+            if color_space is None and img.dtype == np.uint8:
+                # Untagged 8-bit is display-encoded in practice. Untagged 16-bit is scanner-raw
+                # linear, which no ColorSpace names, so it stays None.
+                color_space = ColorSpace.SRGB.value
+        decodes = color_space in (ColorSpace.SRGB.value, ColorSpace.ADOBE_RGB.value)
+        if img.dtype == np.uint16 and not decodes:
+            wrapper = NonStandardFileWrapper(source_u16=np.ascontiguousarray(img))
+        else:
+            if img.dtype == np.uint8:
+                f32 = uint8_to_float32(np.ascontiguousarray(img))
+            elif img.dtype == np.uint16:
+                f32 = uint16_to_float32(np.ascontiguousarray(img))
+            else:
+                f32 = np.clip(img.astype(np.float32), 0, 1)
+            if color_space == ColorSpace.SRGB.value:
+                f32 = srgb_to_linear(f32)
+            elif color_space == ColorSpace.ADOBE_RGB.value:
+                # Adobe RGB's TRC is the working space's own gamma, so its decode is the
+                # inverse of the pipeline OETF encode.
+                f32 = working_oetf_decode(f32)
+            wrapper = NonStandardFileWrapper(f32)
+        metadata = {
+            "orientation": read_orientation(file_path),
+            "color_space": color_space,
+            "icc_profile": icc_bytes,
+            "ir": ir,
+            "ir_valid_mask": ir_valid_mask,
+        }
+        return wrapper, metadata
+
+    def load_bounded_preview(
+        self,
+        file_path: str,
+        max_edge: int,
+        *,
+        fast_only: bool = False,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Image.Image]:
+        if should_cancel is not None and should_cancel():
+            raise InterruptedError("preview cancelled")
+        orientation = read_orientation(file_path)
+        quick = _tiff_preview_page(file_path)
+        if quick is not None:
+            return fit_bounded_preview(quick, max_edge, orientation)
+        if fast_only:
+            return None
+
+        with tifffile.TiffFile(file_path) as tif:
+            candidates = []
+            seen: set[int] = set()
+
+            def collect(page: Any) -> None:
+                offset = int(getattr(page, "offset", id(page)))
+                if offset in seen:
+                    return
+                seen.add(offset)
+                shape = tuple(int(value) for value in page.shape)
+                if len(shape) in (2, 3) and (len(shape) == 2 or shape[2] in (1, 3, 4)):
+                    channels = shape[2] if len(shape) == 3 else 1
+                    candidates.append((channels >= 3, shape[0] * shape[1], page))
+                for child in page.pages or ():
+                    collect(child)
+
+            for root in tif.pages:
+                collect(root)
+            if not candidates:
+                return None
+            page = max(candidates, key=lambda item: (item[0], item[1]))[2]
+            preview = bounded_tiff_page_preview(page, max_edge, should_cancel=should_cancel)
+        if preview is None:
+            return None
+        return fit_bounded_preview(preview, max_edge, orientation)

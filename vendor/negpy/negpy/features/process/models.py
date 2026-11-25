@@ -1,0 +1,470 @@
+from dataclasses import dataclass, replace
+from enum import StrEnum
+from typing import TYPE_CHECKING, Optional
+
+from negpy.domain.migrations import CROSSTALK_PROFILE_RENAMES
+from negpy.kernel.system.i18n import mark
+from negpy.features.exposure.models import EXPOSURE_CONSTANTS, ExposureConfig
+
+if TYPE_CHECKING:
+    from negpy.domain.models import WorkspaceConfig
+
+
+class ProcessMode(StrEnum):
+    C41 = "Color Negative"
+    BW = "B&W Negative"
+    E6 = "Transparency"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "ProcessMode":
+        """Legacy chemistry codes (the values before the rename), and anything stale.
+
+        An unrecognised mode has always rendered as color negative — every branch in
+        the pipeline reads `if BW / elif E6 / else` — so a corrupt saved value stays
+        non-fatal here rather than raising on load.
+        """
+        return _LEGACY_MODES.get(str(value), cls.C41)
+
+
+_LEGACY_MODES = {"C41": ProcessMode.C41, "B&W": ProcessMode.BW, "E-6": ProcessMode.E6}
+
+
+class SensorUnmix(StrEnum):
+    """How the sensor matrix is applied to the linear capture."""
+
+    LINEAR = "linear"
+    TWO_SCALE = "two_scale"
+    DENSITY = "density"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "SensorUnmix":
+        return cls.TWO_SCALE
+
+    @property
+    def label(self) -> str:
+        return {"linear": "Linear", "two_scale": "Two-Scale", "density": "Density"}[self.value]
+
+
+class DemosaicMode(StrEnum):
+    """CFA interpolation, mapped to rawpy in loaders/helpers.py. AUTO keeps NegPy's own
+    choice per path. Availability is asked of rawpy at runtime, never assumed here."""
+
+    AUTO = "Auto"
+    LINEAR = "Linear"
+    VNG = "VNG"
+    PPG = "PPG"
+    AHD = "AHD"
+    DCB = "DCB"
+    DHT = "DHT"
+    AAHD = "AAHD"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "DemosaicMode":
+        """A value this build cannot run, or a stale one, decodes as AUTO rather than raising."""
+        return cls.AUTO
+
+
+def cast_removal_for_mode(mode: str, strength: float) -> float:
+    """The Cast Removal strength `mode` starts at, given the strength carried in.
+
+    A transparency starts at 0 and a negative at the shipped default: on a negative the
+    control removes the cast the stretch leaves, while on a slide it corrects a faded
+    original's crossover — a deliberate act, since a slide's cast can be the photograph. Only the other mode's default is rewritten, so a strength the user
+    chose survives a mode switch.
+    """
+    default = float(ExposureConfig.cast_removal_strength)
+    if mode == ProcessMode.E6:
+        return 0.0 if strength == default else strength
+    return default if strength == 0.0 else strength
+
+
+def auto_meter_for_mode(mode: str, current: bool) -> bool:
+    """The value Auto Density/Auto Grade's toggle carries after a switch into Film Mode *mode*.
+
+    A negative starts metered (True): its exposure has no meaning until printed, so a meter
+    is what makes it printable at all. A slide starts unmetered (False): it was exposed
+    deliberately, and a meter would make a bracket converge. Only the other mode's default is
+    rewritten, so a toggle the user chose survives the switch (mirrors cast_removal_for_mode).
+    """
+    negative_default, slide_default = True, False
+    if mode == ProcessMode.E6:
+        return slide_default if current == negative_default else current
+    return negative_default if current == slide_default else current
+
+
+def mode_aware_exposure_reset(mode: str, base: ExposureConfig) -> ExposureConfig:
+    """`base` (typically the shipped default exposure section) with Cast Removal and Auto
+    Density/Auto Grade at *mode*'s own defaults instead of the flat values `base` carries.
+    Single source for every reset path that resets a whole exposure section rather than one
+    field at a time."""
+    return replace(
+        base,
+        cast_removal_strength=cast_removal_for_mode(mode, base.cast_removal_strength),
+        auto_exposure=auto_meter_for_mode(mode, base.auto_exposure),
+        auto_normalize_contrast=auto_meter_for_mode(mode, base.auto_normalize_contrast),
+    )
+
+
+class SourceEncoding(StrEnum):
+    """How a Positive TIFF's samples encode light. AUTO reads the file: its profile, else linear above 8 bits and sRGB at 8 bits. LINEAR and GAMMA_22 override it."""
+
+    AUTO = "auto"
+    LINEAR = "linear"
+    GAMMA_22 = "gamma22"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "SourceEncoding":
+        return cls.AUTO
+
+
+# Lookup keys: display them through tr.
+SOURCE_ENCODING_LABELS = {
+    SourceEncoding.AUTO: mark("Auto"),
+    SourceEncoding.LINEAR: mark("Linear"),
+    SourceEncoding.GAMMA_22: mark("2.2"),
+}
+
+
+# Built-in fallback crosstalk matrix (row-major 3x3) used when no profile is baked.
+DEFAULT_CROSSTALK_MATRIX = (1.0, -0.05, -0.02, -0.04, 1.0, -0.08, -0.01, -0.1, 1.0)
+
+
+#: Fade Restoration's fields that reach the pixels, in the engines' cache-key order.
+FADE_RENDER_FIELDS = (
+    "fade_ratio_r",
+    "fade_density_shift",
+    "fade_ratio_g",
+    "fade_ratio_b",
+    "fade_white_anchor",
+    "fade_white_r",
+    "fade_white_g",
+    "fade_white_b",
+    "fade_white_space",
+    "fade_crossover",
+    "fade_crossover_table",
+    "fade_crossover_space",
+)
+#: The fade fields a frame's bounds measurement reads: the crossover table is set from them.
+FADE_METER_FIELDS = tuple(f for f in FADE_RENDER_FIELDS if f not in ("fade_crossover_table", "fade_crossover_space"))
+#: Every field of the Fade Restoration card.
+FADE_CARD_FIELDS = FADE_RENDER_FIELDS + ("fade_auto_red", "fade_neutrals_mix")
+
+
+@dataclass(frozen=True)
+class ProcessConfig:
+    """
+    Core film/sensor processing parameters.
+    """
+
+    process_mode: ProcessMode = ProcessMode.C41
+    # The scan is of color film, measured once on load and stored. A B&W print takes its
+    # contrast filter only from a color source. None = not measured yet.
+    source_color: Optional[bool] = None
+    linear_raw: bool = False
+    # One white balance (R, G, B multipliers) to decode a camera RAW on instead of its own as-shot
+    # one: a roll pins its frames to it, since a camera left in auto white balance balances every
+    # frame differently and the same film base would read differently on each. None = the file's own.
+    decode_wb: Optional[tuple] = None
+    # The source is a finished positive (a scanned print, an export from other software, a
+    # scanner's own positive) rather than a raw capture. Slide only, held in __post_init__.
+    # A TIFF decodes by source_encoding; it skips metering, negative inversion, the
+    # baseline lift and the filmic curve. See path.render_path and path.positive_decode.
+    positive_source: bool = False
+    source_encoding: SourceEncoding = SourceEncoding.AUTO
+    # Render the slide in black and white: B&W reversal film, or a color slide through the
+    # B&W Filter. Slide only, held in __post_init__. See path.is_mono.
+    slide_bw: bool = False
+    # See loaders/helpers.get_best_demosaic_algorithm for what AUTO resolves to on each path.
+    demosaic_preview: DemosaicMode = DemosaicMode.AUTO
+    demosaic_export: DemosaicMode = DemosaicMode.AUTO
+    # libraw HighlightMode: 0=Clip (current behaviour), 2=Blend, 3-9=Reconstruct(level).
+    # 1 (Ignore) is reserved for a separate decode-correctness fix and is never valid here.
+    # Only meaningful on the positive path; see effective_highlight_reconstruction.
+    highlight_reconstruction: int = 0
+    analysis_buffer: float = 0.05
+    # Optional freehand analysis region, normalized in the transformed (display)
+    # image, the same space as the manual crop rect. When set it is the exact area the
+    # black/white-point meters read. None falls back to the analysis_buffer slider.
+    analysis_rect: Optional[tuple] = None
+    # On a frame with no crop, the picture box the meters read instead of the whole frame: Auto
+    # Crop's rect, when the film sits in an opaque holder or on bare light (resolve_meter_rect).
+    # None meters the whole frame. meter_key is the detection it was resolved under, frozen like
+    # an auto crop.
+    meter_rect: Optional[tuple] = None
+    meter_key: str = ""
+    # Meter the scan as loaded: before turn, flip, straightening and crop, inside the picture box
+    # found on it (meter_rect, in that space). Framing then never moves the bounds; an
+    # analysis_rect still meters the framed image.
+    meter_as_loaded: bool = False
+    # The clear film base picked on this frame with no roll open, as per-channel raw log10
+    # transmittance; a roll's picked base (rolls.roll_film_base) wins inside that roll. Only the
+    # preview's base readouts use it.
+    film_base: Optional[tuple] = None
+    # Manual Pick Points: per-channel log10 in the bounds (unmixed) space. Dmin replaces the
+    # analyzed thin end (ceils), Dmax the dense end (floors). None keeps that end auto.
+    manual_dmin: Optional[tuple] = None
+    manual_dmax: Optional[tuple] = None
+    # Where each end was picked, content-normalized in the uncropped pick-tool view; only the canvas marks read it.
+    manual_dmin_at: Optional[tuple] = None
+    manual_dmax_at: Optional[tuple] = None
+    # Two normalization clip axes: luma sets the black/white-point span, color sets
+    # the per-channel balance clip (orange-mask cast removal).
+    luma_range_clip: float = 0.0
+    color_range_clip: float = float(EXPOSURE_CONSTANTS["base_color_clip"])
+    # Roll-wide baseline applied independently per axis: luma (span) and color (cast).
+    use_luma_average: bool = False
+    use_color_average: bool = False
+    locked_floors: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    locked_ceils: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # The roll's dye contrast per channel (pool_dye_slopes): how the color baseline follows a
+    # frame's exposure. None moves every channel alike.
+    locked_slope: Optional[tuple] = None
+    local_floors: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    local_ceils: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Roll/scene Cast Removal: the pooled neutral axis in raw log, in the meter's own shape
+    # (midtone, shadow, highlight or None, confidence) plus an offset weight
+    # (pool_neutral_axis). Color Negative only.
+    use_cast_average: bool = False
+    locked_neutral_axis: Optional[tuple] = None
+
+    white_point_offset: float = 0.0
+    black_point_offset: float = 0.0
+    # Per-layer trims on the global white/black point: scanner-style per-channel levels.
+    white_point_trim_red: float = 0.0
+    white_point_trim_green: float = 0.0
+    white_point_trim_blue: float = 0.0
+    black_point_trim_red: float = 0.0
+    black_point_trim_green: float = 0.0
+    black_point_trim_blue: float = 0.0
+
+    # Spectral crosstalk (dye unmix) on the raw NEGATIVE densities, before bounds
+    # analysis and the stretch. That is the correct domain: by Beer-Lambert the
+    # secondary dye absorptions are linear in negative dye density. Matrix is 9
+    # floats row-major, baked from a crosstalk profile. Legacy `color_separation`
+    # is migrated in WorkspaceConfig.from_flat_dict.
+    crosstalk_strength: float = 0.0
+    crosstalk_matrix: Optional[tuple] = None
+    crosstalk_profile: str = "Generic C41"
+    # Film process the crosstalk profile was derived for, baked at selection so the
+    # render can gate on it without disk access. The dye set differs between C-41 and
+    # E-6, so a mismatch resolves to identity instead of mixing in the wrong matrix.
+    crosstalk_process: str = ProcessMode.C41
+
+    # Fade Restoration (`fade.fade_density`; docs/PIPELINE.md has the math). Survivals: red's own,
+    # green and blue relative to red; all 1.0 is the identity. The shift is Restore Range's.
+    fade_ratio_r: float = 1.0
+    fade_density_shift: float = 0.0
+    fade_ratio_g: float = 1.0
+    fade_ratio_b: float = 1.0
+    # Remove Stain: the whites are log transmittance (<= 0) that Estimate measures.
+    fade_white_anchor: bool = False
+    fade_white_r: float = 0.0
+    fade_white_g: float = 0.0
+    fade_white_b: float = 0.0
+    # The decode space the whites were measured in (`fade.fade_white_space`); another space ignores them.
+    fade_white_space: str = ""
+    # Crossover share (0 is off) and its table, tagged with `fade.crossover_space`; a render measures
+    # a table only when it is None.
+    fade_crossover: float = 0.0
+    fade_crossover_table: Optional[tuple] = None
+    fade_crossover_space: str = ""
+    # Restore Range: Red Survival and the shift come from `fade_auto_red.auto_red`.
+    fade_auto_red: bool = False
+    # Gray Mix: Estimate's grays from the gray finder (0) to the tone bands (1) (`fade.gray_refs`).
+    fade_neutrals_mix: float = 0.0
+
+    # Sensor (CFA) crosstalk unmix on the LINEAR capture, before inversion. A
+    # per-setup property calibrated from three bare-light R/G/B exposures
+    # (features/process/sensor.py). 9 floats row-major; None = off.
+    sensor_matrix: Optional[tuple] = None
+    sensor_profile: str = "None"
+    sensor_unmix: SensorUnmix = SensorUnmix.TWO_SCALE
+
+    # Light-source hue rotation in degrees, applied to the print in CIELAB a*b*
+    # (features/process/hue.py); 0.0 = off.
+    hue_trim: float = 0.0
+
+    lock_bounds: bool = False
+
+    roll_name: Optional[str] = None
+    # Where locked_floors/ceils came from: "roll:<roll id>", "scene:<scene id>" or "frame:<file name>".
+    baseline_source: str = ""
+
+    def __post_init__(self) -> None:
+        """
+        Ensure JSON-loaded lists are converted back to tuples.
+        """
+        # Not a MIGRATIONS entry: the old mode names also reach us from sticky settings
+        # and asset dicts, not only a loaded flat config, so this runs on every build.
+        object.__setattr__(self, "process_mode", ProcessMode(self.process_mode))
+        if self.decode_wb is not None:                     # a saved edit brings a list back
+            object.__setattr__(self, "decode_wb", tuple(float(v) for v in self.decode_wb))
+        object.__setattr__(self, "source_encoding", SourceEncoding(self.source_encoding))
+        object.__setattr__(self, "sensor_unmix", SensorUnmix(self.sensor_unmix))
+        # Same reach for renamed crosstalk profiles: roll defaults overlay this field
+        # raw through dataclasses.replace, so the rename must run on every build too.
+        if isinstance(self.crosstalk_profile, str) and self.crosstalk_profile in CROSSTALK_PROFILE_RENAMES:
+            object.__setattr__(self, "crosstalk_profile", CROSSTALK_PROFILE_RENAMES[self.crosstalk_profile])
+        # Slide-only, and every path into a config -- saved row, sticky settings, roll
+        # default, asset dict -- has to land where the panel does.
+        if self.positive_source and self.process_mode != ProcessMode.E6:
+            object.__setattr__(self, "positive_source", False)
+        if self.slide_bw and self.process_mode != ProcessMode.E6:
+            object.__setattr__(self, "slide_bw", False)
+        object.__setattr__(self, "locked_floors", tuple(self.locked_floors))
+        object.__setattr__(self, "locked_ceils", tuple(self.locked_ceils))
+        if self.locked_slope is not None:
+            object.__setattr__(self, "locked_slope", tuple(float(v) for v in self.locked_slope))
+        object.__setattr__(self, "local_floors", tuple(self.local_floors))
+        object.__setattr__(self, "local_ceils", tuple(self.local_ceils))
+        if self.locked_neutral_axis is not None:
+            object.__setattr__(self, "locked_neutral_axis", neutral_axis_tuple(self.locked_neutral_axis))
+        if self.crosstalk_matrix is not None:
+            object.__setattr__(self, "crosstalk_matrix", tuple(self.crosstalk_matrix))
+        if self.sensor_matrix is not None:
+            object.__setattr__(self, "sensor_matrix", tuple(self.sensor_matrix))
+        if self.fade_crossover_table is not None:
+            object.__setattr__(self, "fade_crossover_table", tuple(float(v) for v in self.fade_crossover_table))
+        if self.analysis_rect is not None:
+            object.__setattr__(self, "analysis_rect", tuple(self.analysis_rect))
+        if self.meter_rect is not None:
+            object.__setattr__(self, "meter_rect", tuple(self.meter_rect))
+        if self.film_base is not None:
+            object.__setattr__(self, "film_base", tuple(float(v) for v in self.film_base))
+        for name in ("manual_dmin", "manual_dmax", "manual_dmin_at", "manual_dmax_at"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, tuple(float(v) for v in getattr(self, name)))
+
+    @property
+    def is_local_initialized(self) -> bool:
+        """Checks if per-file auto-exposure has been performed."""
+        return any(v != 0.0 for v in self.local_floors)
+
+    @property
+    def is_locked_initialized(self) -> bool:
+        """Checks if a roll-wide baseline is available."""
+        return any(v != 0.0 for v in self.locked_floors)
+
+
+def neutral_axis_tuple(axis) -> tuple:
+    """A neutral axis read back from JSON as nested tuples; a pooled one carries a fifth
+    element, its offset weight."""
+    mid, shadow, highlight, *scalars = axis
+    return (tuple(mid), tuple(shadow), tuple(highlight) if highlight is not None else None, *(float(v) for v in scalars))
+
+
+def pooled_neutral_axis(process: ProcessConfig) -> Optional[tuple]:
+    """The roll/scene neutral axis this frame renders Cast Removal with, or None to meter its own."""
+    if process.use_cast_average and process.process_mode == ProcessMode.C41:
+        return process.locked_neutral_axis
+    return None
+
+
+def invalidate_local_bounds(process: ProcessConfig) -> dict:
+    """Returns kwargs for dataclasses.replace that clear local bounds; no-op when lock_bounds=True."""
+    if process.lock_bounds:
+        return {}
+    return {"local_floors": (0.0, 0.0, 0.0), "local_ceils": (0.0, 0.0, 0.0)}
+
+
+def with_process_mode(config: "WorkspaceConfig", mode: str) -> "WorkspaceConfig":
+    """*config* switched to Film Mode *mode*: the Cast Removal and Auto Density/Auto Grade
+    defaults move with it, and leaving Slide drops Positive. Every path that sets a frame's mode
+    goes through here. The same mode returns *config* unchanged, since the default rewrites
+    would read a slide's deliberate negative-default value as untouched."""
+    proc, exp = config.process, config.exposure
+    mode = ProcessMode(mode)
+    if mode == proc.process_mode:
+        return config
+    exp = replace(
+        exp,
+        cast_removal_strength=cast_removal_for_mode(mode, exp.cast_removal_strength),
+        auto_exposure=auto_meter_for_mode(mode, exp.auto_exposure),
+        auto_normalize_contrast=auto_meter_for_mode(mode, exp.auto_normalize_contrast),
+    )
+    slide = mode == ProcessMode.E6
+    proc = replace(
+        proc,
+        process_mode=mode,
+        positive_source=proc.positive_source and slide,
+        slide_bw=proc.slide_bw and slide,
+        **invalidate_local_bounds(proc),
+    )
+    return replace(config, process=proc, exposure=exp)
+
+
+def with_positive_source(config: "WorkspaceConfig", checked: bool) -> "WorkspaceConfig":
+    """*config* with Positive set to *checked*. Unchanged outside Slide, where Positive does not apply."""
+    proc = config.process
+    if proc.process_mode != ProcessMode.E6 or proc.positive_source == checked:
+        return config
+    return replace(config, process=replace(proc, positive_source=checked, **invalidate_local_bounds(proc)))
+
+
+def with_slide_bw(config: "WorkspaceConfig", checked: bool) -> "WorkspaceConfig":
+    """*config* with the Slide's B&W set to *checked*. Unchanged outside Slide."""
+    proc = config.process
+    if proc.process_mode != ProcessMode.E6 or proc.slide_bw == checked:
+        return config
+    return replace(config, process=replace(proc, slide_bw=checked))
+
+
+def with_film_fields(config: "WorkspaceConfig", fields: dict) -> "WorkspaceConfig":
+    """*config* with the Film card's fields in *fields* applied through with_process_mode,
+    with_positive_source, with_slide_bw and with_source_encoding, popping them from *fields* so the caller
+    overlays only the rest."""
+    if "process_mode" in fields:
+        config = with_process_mode(config, fields.pop("process_mode"))
+    if "positive_source" in fields:
+        config = with_positive_source(config, fields.pop("positive_source"))
+    if "slide_bw" in fields:
+        config = with_slide_bw(config, fields.pop("slide_bw"))
+    if "source_encoding" in fields:
+        config = with_source_encoding(config, fields.pop("source_encoding"))
+    return config
+
+
+def with_source_encoding(config: "WorkspaceConfig", encoding: str) -> "WorkspaceConfig":
+    """*config* decoding by *encoding*; the local bounds were measured on the old decode."""
+    proc = config.process
+    if proc.source_encoding == SourceEncoding(encoding):
+        return config
+    return replace(config, process=replace(proc, source_encoding=SourceEncoding(encoding), **invalidate_local_bounds(proc)))
+
+
+# The print stocks the scanning-setup wizard picks between; a frame on any other stock keeps it.
+SCAN_SETUP_PAPERS = ("neutral", "pakon")
+
+
+def scan_setup_values(capture: str, light: str) -> tuple[bool, str]:
+    """(linear_raw, paper_profile) for a scanning rig — capture is "auto"/"camera"/"scanner", light
+    is "white"/"narrowband". A camera under white light is the only combination that wants the
+    as-shot-WB decode; Auto decodes as a camera, since a scanner's TIFF takes no RAW decode.
+    Narrowband light prints on the Pakon minilab stock, white light on Digital."""
+    return capture == "scanner" or light != "white", "pakon" if light == "narrowband" else "neutral"
+
+
+def scan_setup_rig(saved) -> tuple[str, str]:
+    """(capture, light) from the saved scanning setup; Auto under white light when none is saved."""
+    saved = saved if isinstance(saved, dict) else {}
+    capture, light = str(saved.get("capture")), str(saved.get("light"))
+    return (capture if capture in ("auto", "camera", "scanner") else "auto"), (light if light in ("white", "narrowband") else "white")
+
+
+def per_channel_point_offsets(process: ProcessConfig) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """
+    Per-channel white/black point offsets: global + per-layer trim. Single source of truth
+    for the CPU normalization and the GPU uniform pack; a slide negates them
+    (transparency.logic.transfer_point_offsets).
+    """
+    wp3 = (
+        process.white_point_offset + process.white_point_trim_red,
+        process.white_point_offset + process.white_point_trim_green,
+        process.white_point_offset + process.white_point_trim_blue,
+    )
+    bp3 = (
+        process.black_point_offset + process.black_point_trim_red,
+        process.black_point_offset + process.black_point_trim_green,
+        process.black_point_offset + process.black_point_trim_blue,
+    )
+    return wp3, bp3

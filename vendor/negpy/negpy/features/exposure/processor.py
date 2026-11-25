@@ -1,0 +1,473 @@
+from typing import Any, Dict, Optional
+
+import negpy_core
+import numpy as np
+
+from negpy.domain.interfaces import PipelineContext
+from negpy.domain.types import ImageBuffer
+from negpy.features.exposure.analysis import density_histogram, density_parade, scan_full_scale_columns
+from negpy.features.exposure.logic import (
+    black_hold_taper,
+    apply_characteristic_curve,
+    apply_flat_curve,
+    cast_solve_inputs,
+    contrast_mask_coeffs,
+    contrast_mask_ev,
+    effective_midtone_gamma,
+    filtration_offsets,
+    flat_curve_params,
+    grade_coupled_shape,
+    split_grade_deltas,
+    local_ev_scale,
+    channel_density_ranges,
+    local_grade_factor_map,
+    highlight_hold_offset,
+    shadow_hold_offset,
+    per_channel_curve_params,
+)
+from negpy.features.exposure.bw_filter import BW_FILTER_WEIGHTS, collapse_matrix
+from negpy.features.exposure.models import EXPOSURE_CONSTANTS, BwFilter, ExposureConfig, RenderIntent
+from negpy.features.exposure.papers import effective_paper_profile, resolve_flat_matrix
+from negpy.features.exposure.placement import limited_mask_params
+from negpy.features.exposure.normalization import (
+    _rect_roi,
+    LogNegativeBounds,
+    analyze_log_exposure_bounds_from_log,
+    blend_neutral_axis,
+    density_above_base,
+    luma_source_bounds,
+    luminance_density_range,
+    measure_anchor_from_log,
+    measure_highlight_point_from_log,
+    measure_clip_fractions,
+    measure_neutral_axis_from_log,
+    measure_shadow_point_from_log,
+    measure_textural_range_from_log,
+    normalize_log_image,
+    prefilter_log_grid,
+    resolve_analysis_region,
+    resolve_bounds_detailed,
+    effective_crosstalk_matrix,
+    unmix_log_image,
+)
+from negpy.features.local.logic import compute_local_maps
+from negpy.features.local.models import LocalAdjustmentsConfig
+from negpy.features.process.models import ProcessConfig, ProcessMode, per_channel_point_offsets, pooled_neutral_axis
+from negpy.kernel.image.logic import get_luminance
+
+
+class NormalizationProcessor:
+    """
+    Converts linear RAW to normalized log-density. `context.metrics["base_log"]`, the clear
+    base the engine reads once per source, feeds `density_above_base`; absent, that metric is None.
+    """
+
+    def __init__(self, config: ProcessConfig):
+        self.config = config
+
+    def _unmix_key(self) -> tuple:
+        c = self.config
+        return (c.crosstalk_strength, c.crosstalk_matrix, c.crosstalk_process)
+
+    def process(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
+        # No upper clamp, mirroring normalization.wgsl, which clamps only the low side. Values
+        # above 1.0 occur only with flat-field gain and must match the GPU.
+        img_log = negpy_core.log_density_open(np.ascontiguousarray(image, dtype=np.float32))
+        # Shared prefilter, once for all five meters, with the ROI and buffer applied here. A
+        # freehand analysis_rect overrides the crop ROI and centered buffer for the metered region.
+        source = context.meter_source if self.config.meter_as_loaded and self.config.analysis_rect is None else None
+        if source is not None:
+            # the scan as loaded: framing does not reach the meters, nor the render's size (a draft, the
+            # preview, a zoom and the export all read it at the preview's size, as the GPU engine does)
+            context.meter_source = None
+            from negpy.kernel.system.config import APP_CONFIG
+
+            limit = int(APP_CONFIG.preview_render_size)
+            if max(source.shape[:2]) > limit:
+                k = limit / max(source.shape[:2])
+                size = (max(1, int(source.shape[1] * k)), max(1, int(source.shape[0] * k)))
+                source = negpy_core.resize_area(np.ascontiguousarray(source, dtype=np.float32), size)
+            an_roi = _rect_roi(source.shape, self.config.meter_rect) if self.config.meter_rect is not None else None
+            an_buffer = self.config.analysis_buffer
+            prefiltered = prefilter_log_grid(source, an_roi, an_buffer)
+            context.metrics["scan_clip_fractions"] = measure_clip_fractions(source, an_roi, an_buffer)
+        else:
+            an_roi, an_buffer = resolve_analysis_region(
+                image.shape, context.active_roi, self.config.analysis_buffer, self.config.analysis_rect, self.config.meter_rect
+            )
+            prefiltered = prefilter_log_grid(image, an_roi, an_buffer)
+            context.metrics["scan_clip_fractions"] = measure_clip_fractions(image, an_roi, an_buffer)
+        region = (self.config.analysis_rect, self.config.meter_rect, source is not None)
+
+        # Capture-side dye unmix on the negative densities, before any metering, so the bounds,
+        # anchor and cast refs all read the unmixed film.
+        unmix = effective_crosstalk_matrix(self.config, context.process_mode)
+        img_log = unmix_log_image(img_log, unmix)
+        prefiltered = unmix_log_image(prefiltered, unmix)
+
+        def analyze_base() -> LogNegativeBounds:
+            cached_buffer = context.metrics.get("log_bounds_buffer_val")
+            cached_rect = context.metrics.get("log_bounds_rect_val")
+            cached_mode = context.metrics.get("log_bounds_mode_val")
+
+            cached_clip = context.metrics.get("log_bounds_clip_val")
+            cached_color_clip = context.metrics.get("log_bounds_color_clip_val")
+            cached_unmix = context.metrics.get("log_bounds_crosstalk_val")
+            needs_reanalysis = (
+                "log_bounds" not in context.metrics
+                or cached_buffer is None
+                or abs(cached_buffer - self.config.analysis_buffer) > 1e-5
+                or cached_rect != region
+                or cached_clip is None
+                or abs(cached_clip - self.config.luma_range_clip) > 1e-6
+                or cached_color_clip is None
+                or abs(cached_color_clip - self.config.color_range_clip) > 1e-6
+                or cached_mode != context.process_mode
+                or cached_unmix != self._unmix_key()
+            )
+
+            if not needs_reanalysis:
+                return context.metrics["log_bounds"]
+
+            analyzed = analyze_log_exposure_bounds_from_log(
+                prefiltered,
+                None,
+                0.0,
+                percentile_clip=self.config.luma_range_clip,
+                color_clip=self.config.color_range_clip,
+            )
+            context.metrics["log_bounds"] = analyzed
+            context.metrics["log_bounds_buffer_val"] = self.config.analysis_buffer
+            context.metrics["log_bounds_rect_val"] = region
+            context.metrics["log_bounds_clip_val"] = self.config.luma_range_clip
+            context.metrics["log_bounds_color_clip_val"] = self.config.color_range_clip
+            context.metrics["log_bounds_mode_val"] = context.process_mode
+            context.metrics["log_bounds_crosstalk_val"] = self._unmix_key()
+            return analyzed
+
+        bounds, base_bounds = resolve_bounds_detailed(self.config, analyze_base)
+        context.metrics["log_bounds_base"] = base_bounds
+        # Cast Removal analyses the film's inherent cast, a source property. The neutral axis
+        # below uses the pre-trim bounds, so creative WP/BP trims do not perturb it. Mirrors the
+        # GPU, which measures before adj_floors.
+        pre_trim_bounds = bounds
+
+        context.metrics["norm_density_range"] = luminance_density_range(bounds)
+        context.metrics["density_above_base"] = density_above_base(context.metrics.get("base_log"), pre_trim_bounds, prefiltered, unmix)
+
+        wp3, bp3 = per_channel_point_offsets(self.config)
+        if any(v != 0.0 for v in wp3 + bp3):
+            adj_floors = (
+                bounds.floors[0] + wp3[0],
+                bounds.floors[1] + wp3[1],
+                bounds.floors[2] + wp3[2],
+            )
+            adj_ceils = (
+                bounds.ceils[0] + bp3[0],
+                bounds.ceils[1] + bp3[1],
+                bounds.ceils[2] + bp3[2],
+            )
+            bounds = LogNegativeBounds(floors=adj_floors, ceils=adj_ceils)
+
+        res = normalize_log_image(img_log, bounds)
+
+        # Neutral axis for the two-point Cast Removal gray balance. Colour only: B&W
+        # collapses to one density and has no channels to balance. Published as None there,
+        # as the GPU does, so a merged metrics dict drops the last colour render's axis.
+        context.metrics["neutral_axis_refs"] = None
+        if context.process_mode != ProcessMode.BW:
+            own = measure_neutral_axis_from_log(prefiltered, pre_trim_bounds, None, 0.0)
+            pooled = pooled_neutral_axis(self.config)
+            context.metrics["neutral_axis_refs"] = blend_neutral_axis(own, pooled) if pooled is not None else own
+
+        # Per-frame exposure anchor, measured against the same final bounds the image is
+        # normalized with. Stored unconditionally, since the block grid is cheap.
+        # PhotometricProcessor uses it only when auto_exposure is on.
+        anchor_bounds = luma_source_bounds(self.config, base_bounds)
+        context.metrics["metered_anchor"] = measure_anchor_from_log(prefiltered, anchor_bounds, None, 0.0)
+        context.metrics["textural_range"] = measure_textural_range_from_log(prefiltered, None, 0.0)
+        context.metrics["shadow_point"] = measure_shadow_point_from_log(prefiltered, anchor_bounds, None, 0.0)
+        context.metrics["highlight_point"] = measure_highlight_point_from_log(prefiltered, anchor_bounds, None, 0.0)
+
+        context.metrics["final_bounds"] = bounds
+        context.metrics["pre_trim_bounds"] = pre_trim_bounds
+        context.metrics["normalized_log"] = res
+        context.metrics["histogram_density"] = density_histogram(res, context.active_roi)
+        # The Crop tool shows the whole frame, so the parade's columns span it too (the GPU's full_frame).
+        # Export and batch thumbnails render with stage caching off and skip it.
+        if context.cache_stages:
+            parade_roi = None if context.crop_preview_full else context.active_roi
+            context.metrics["density_parade"] = density_parade(img_log, parade_roi)
+            context.metrics["scan_full_scale"] = scan_full_scale_columns(image, parade_roi)
+        return res
+
+
+class PhotometricProcessor:
+    """
+    Applies H&D curve simulation; dodge/burn masks enter as per-pixel
+    print-exposure offsets.
+    """
+
+    def __init__(
+        self,
+        config: ExposureConfig,
+        local_config: Optional[LocalAdjustmentsConfig] = None,
+        bw_weights: tuple[float, float, float] = BW_FILTER_WEIGHTS[BwFilter.NONE],
+    ):
+        self.config = config
+        self.local_config = local_config
+        self.bw_weights = bw_weights
+
+    def _build_local_maps(self, image: ImageBuffer, context: PipelineContext) -> Optional[np.ndarray]:
+        if self.local_config is None or not self.local_config.masks:
+            return None
+        h, w = image.shape[:2]
+        geo = context.metrics.get("geometry_params", {})
+        return compute_local_maps(
+            self.local_config,
+            h,
+            w,
+            orig_shape=context.original_size,
+            rotation=geo.get("rotation", 0),
+            fine_rotation=geo.get("fine_rotation", 0.0),
+            flip_horizontal=geo.get("flip_horizontal", False),
+            flip_vertical=geo.get("flip_vertical", False),
+            distortion_k1=context.metrics.get("distortion_k1", 0.0),
+            converge_v=geo.get("converge_v", 0.0),
+            converge_h=geo.get("converge_h", 0.0),
+        )
+
+    def process(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
+        if self.config.render_intent == RenderIntent.FLAT:
+            return self._process_flat(image, context)
+
+        paper = effective_paper_profile(self.config.paper_profile, context.process_mode)
+        d_min = paper.d_min if self.config.paper_dmin else 0.0
+        anchor = context.metrics.get("metered_anchor") if self.config.auto_exposure else None
+        lum_range = context.metrics.get("norm_density_range")
+        final_bounds = context.metrics.get("final_bounds")
+        strength, neutral_axis_norm = cast_solve_inputs(
+            final_bounds,
+            context.metrics.get("neutral_axis_refs"),
+            self.config.cast_removal_strength,
+        )
+        mg = effective_midtone_gamma(paper, self.config.midtone_gamma)
+        slopes, pivots, curvatures = per_channel_curve_params(
+            self.config.grade,
+            self.config.density,
+            self.config.auto_normalize_contrast,
+            strength,
+            lum_range,
+            context.metrics.get("textural_range"),
+            d_min=d_min,
+            anchor=anchor,
+            paper=paper,
+            neutral_axis_norm=neutral_axis_norm,
+            grade_trims=(self.config.grade_trim_red, self.config.grade_trim_green, self.config.grade_trim_blue),
+            shadow_point=context.metrics.get("shadow_point"),
+            midtone_gamma=mg,
+        )
+        context.metrics["print_slopes"] = slopes
+        hl_point = context.metrics.get("highlight_point")
+        hl_auto = (
+            highlight_hold_offset(
+                slopes[1],
+                pivots[1],
+                hl_point,
+                d_min=d_min,
+                paper=paper,
+                preflash=self.config.preflash,
+                grade=self.config.grade,
+                midtone_gamma=mg,
+            )
+            if self.config.auto_normalize_contrast and hl_point is not None
+            else 0.0
+        )
+        sh_point = context.metrics.get("shadow_point")
+        sh_auto = (
+            shadow_hold_offset(slopes[1], pivots[1], sh_point, d_min=d_min, paper=paper, midtone_gamma=mg)
+            if self.config.auto_normalize_contrast and sh_point is not None
+            else 0.0
+        )
+
+        cmy_max = EXPOSURE_CONSTANTS["cmy_max_density"]
+        cmy_offsets = filtration_offsets(
+            (self.config.wb_cyan, self.config.wb_magenta, self.config.wb_yellow),
+            final_bounds,
+        )
+        # Manual shadow CMY only; auto neutralization is Cast Removal (slope balance).
+        shadow_cmy = (
+            self.config.shadow_cyan * cmy_max,
+            self.config.shadow_magenta * cmy_max,
+            self.config.shadow_yellow * cmy_max,
+        )
+        highlight_cmy = (
+            self.config.highlight_cyan * cmy_max,
+            self.config.highlight_magenta * cmy_max,
+            self.config.highlight_yellow * cmy_max,
+        )
+
+        toe_eff, shoulder_eff = grade_coupled_shape(slopes[1], self.config.toe, self.config.shoulder)
+        sg_deltas, hg_deltas = split_grade_deltas(
+            self.config.grade,
+            self.config.shadow_grade,
+            self.config.highlight_grade,
+            shadow_trims=(
+                self.config.shadow_grade_trim_red,
+                self.config.shadow_grade_trim_green,
+                self.config.shadow_grade_trim_blue,
+            ),
+            highlight_trims=(
+                self.config.highlight_grade_trim_red,
+                self.config.highlight_grade_trim_green,
+                self.config.highlight_grade_trim_blue,
+            ),
+        )
+
+        if context.process_mode == ProcessMode.BW:
+            # Collapse to a single density before the curve, so the curve shapes one channel
+            # instead of mixing three.
+            image = negpy_core.matmul_3x3(np.ascontiguousarray(image, dtype=np.float32), collapse_matrix(self.bw_weights))
+
+        local_maps = self._build_local_maps(image, context)
+        if local_maps is not None:
+            local_maps = np.ascontiguousarray(local_maps, dtype=np.float32)
+        ev_map = None if local_maps is None else negpy_core.extract_channel(local_maps, 0)
+        # The mask is a print-exposure input like a dodge, so it rides the same map.
+        mask_coeffs = contrast_mask_coeffs(
+            self.config.contrast_mask_strength,
+            context.metrics.get("contrast_mask_centre", 0.5),
+            slopes,
+            pivots,
+            cmy_offsets,
+            lum_range or 0.0,
+        )
+        mask_ev = contrast_mask_ev(
+            context.metrics.get("contrast_mask_plane"),
+            mask_coeffs,
+            image.shape[:2],
+            context.metrics.get("contrast_mask_roi"),
+        )
+        if mask_ev is not None:
+            ev_map = mask_ev if ev_map is None else negpy_core.add(ev_map, mask_ev)
+        grade_map = None
+        if local_maps is not None and negpy_core.channel_any(local_maps, 1):
+            grade_map = local_grade_factor_map(negpy_core.extract_channel(local_maps, 1), self.config.grade)
+        flash_map = None
+        if local_maps is not None and negpy_core.channel_any(local_maps, 2):
+            flash_map = negpy_core.extract_channel(local_maps, 2)
+        diff_kw: Dict[str, Any] = {}
+        diff_plane = context.metrics.get("diffusion_plane")
+        if self.config.diffusion > 0.0 and diff_plane is not None:
+            h, w = image.shape[:2]
+            y1, y2, x1, x2 = context.metrics.get("diffusion_roi") or (0, h, 0, w)
+            diff_kw = {
+                "diffusion": self.config.diffusion,
+                "diffusion_plane": diff_plane,
+                "diffusion_rect": (float(x1), float(y1), float(x2 - x1), float(y2 - y1)),
+                "diffusion_range": channel_density_ranges(final_bounds),
+            }
+        key_kw: Dict[str, Any] = {}
+        if local_maps is not None and local_maps.shape[2] > 3 and self.local_config is not None:
+            key_kw = {
+                "key_alpha": local_maps[:, :, 3:],
+                "key_params": limited_mask_params(self.local_config, self.config, context.process_mode, context.metrics),
+                "grade_deltas": local_maps[:, :, 1],
+            }
+
+        img_pos = apply_characteristic_curve(
+            image,
+            params_r=(pivots[0], slopes[0]),
+            params_g=(pivots[1], slopes[1]),
+            params_b=(pivots[2], slopes[2]),
+            toe=toe_eff,
+            toe_width=self.config.toe_width,
+            shoulder=shoulder_eff,
+            shoulder_width=self.config.shoulder_width,
+            shadow_cmy=shadow_cmy,
+            highlight_cmy=highlight_cmy,
+            cmy_offsets=cmy_offsets,
+            d_min=d_min,
+            midtone_gamma=effective_midtone_gamma(paper, self.config.midtone_gamma),
+            curvatures=curvatures,
+            paper=paper,
+            ev_map=ev_map,
+            ev_scale=local_ev_scale(final_bounds),
+            grade_map=grade_map,
+            bpc=not self.config.paper_black,
+            black_hold=black_hold_taper(self.config, paper),
+            toe_trims=(self.config.toe_trim_red, self.config.toe_trim_green, self.config.toe_trim_blue),
+            shoulder_trims=(self.config.shoulder_trim_red, self.config.shoulder_trim_green, self.config.shoulder_trim_blue),
+            snap_trims=(
+                self.config.midtone_gamma_trim_red,
+                self.config.midtone_gamma_trim_green,
+                self.config.midtone_gamma_trim_blue,
+            ),
+            toe_width_trims=(
+                self.config.toe_width_trim_red,
+                self.config.toe_width_trim_green,
+                self.config.toe_width_trim_blue,
+            ),
+            shoulder_width_trims=(
+                self.config.shoulder_width_trim_red,
+                self.config.shoulder_width_trim_green,
+                self.config.shoulder_width_trim_blue,
+            ),
+            shadow_density=self.config.shadow_density + sh_auto,
+            highlight_density=self.config.highlight_density + hl_auto,
+            shadow_grade_deltas=sg_deltas,
+            highlight_grade_deltas=hg_deltas,
+            # B&W collapses to one density before this call, with all channels equal, so the matrix is
+            # already a no-op there. Skip it explicitly anyway to avoid the wasted per-pixel 3x3
+            # multiply.
+            dye_separation=1.0 if context.process_mode == ProcessMode.BW else self.config.dye_separation,
+            dye_separation_trims=(0.0, 0.0, 0.0)
+            if context.process_mode == ProcessMode.BW
+            else (
+                self.config.dye_separation_trim_red,
+                self.config.dye_separation_trim_green,
+                self.config.dye_separation_trim_blue,
+            ),
+            separation_damping=0.0 if context.process_mode == ProcessMode.BW else self.config.separation_damping,
+            frame_grade=self.config.grade,
+            preflash=self.config.preflash,
+            flash_map=flash_map,
+            **diff_kw,
+            **key_kw,
+        )
+
+        if context.process_mode == ProcessMode.BW:
+            return negpy_core.gray_to_rgb(get_luminance(img_pos))
+
+        return img_pos
+
+    def _process_flat(self, image: ImageBuffer, context: PipelineContext) -> ImageBuffer:
+        """
+        Flat log-master render: emits the normalized log signal directly (a flat,
+        milky log-video look), dropping all creative print decisions — no auto
+        density/grade, cast removal, toe/shoulder. A fixed gain/lift
+        keeps the master consistent across a roll and holds maximal editing latitude.
+
+        Manual global white balance (the WB picker / CMY global) is still honoured
+        because it is an explicit, per-roll-consistent user choice, not automatic
+        grading. So is a color print stock, as its density 3×3 (resolve_flat_matrix).
+        """
+        gain, lift = flat_curve_params()
+
+        cmy_offsets = filtration_offsets(
+            (self.config.wb_cyan, self.config.wb_magenta, self.config.wb_yellow),
+            context.metrics.get("final_bounds"),
+        )
+
+        is_bw = context.process_mode == ProcessMode.BW
+
+        if is_bw:
+            image = negpy_core.matmul_3x3(np.ascontiguousarray(image, dtype=np.float32), collapse_matrix(self.bw_weights))
+
+        stock_matrix = None if is_bw else resolve_flat_matrix(effective_paper_profile(self.config.paper_profile, context.process_mode))
+        img_pos = apply_flat_curve(image, gain, lift, cmy_offsets=cmy_offsets, stock_matrix=stock_matrix)
+
+        if is_bw:
+            return negpy_core.gray_to_rgb(get_luminance(img_pos))
+
+        return img_pos

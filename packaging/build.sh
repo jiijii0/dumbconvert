@@ -13,8 +13,8 @@ rm -rf build dist
   --collect-submodules negpy.kernel --collect-submodules negpy.domain --collect-submodules negpy.infrastructure \
   --collect-all negpy_core --collect-all rawpy --collect-all imagecodecs --collect-all pillow_heif \
   --collect-all tifffile --collect-all wgpu \
-  --exclude-module PyQt6 --exclude-module negpy.desktop --exclude-module pypdf --exclude-module pdfminer \
-  --exclude-module matplotlib --exclude-module tkinter \
+  --exclude-module PyQt6 --exclude-module pypdf --exclude-module pdfminer \
+  --exclude-module matplotlib --exclude-module tkinter --exclude-module cryptography \
   --add-data "$N/negpy/features/exposure/shaders:negpy/features/exposure/shaders" \
   --add-data "$N/negpy/features/exposure/print_luts:negpy/features/exposure/print_luts" \
   --add-data "$N/negpy/features/geometry/shaders:negpy/features/geometry/shaders" \
@@ -30,6 +30,8 @@ rm -rf build dist
   --add-data "LICENSE:." \
   --add-data "simpleneg/icons:simpleneg/icons" \
   packaging/dumbconvert.py
+# What the app never uses (unused image codecs, Qt's PDF/QML/virtual keyboard); stops if anything still needs it
+.venv/bin/python packaging/slim.py dist/DumbConvert.app
 # Memory: macOS gives freed picture memory back at once instead of caching gigabytes of it
 # (see main() in simpleneg/app.py). Must be in the Info.plist: it is read when the app starts.
 VERSION=$(.venv/bin/python -c "import simpleneg; print(simpleneg.__version__)")

@@ -1,0 +1,225 @@
+import errno
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
+from typing import Optional
+
+
+def get_resource_path(relative_path: str) -> str:
+    """
+    Get absolute path to resource, works for dev and for PyInstaller.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        base_path = sys._MEIPASS
+    elif getattr(sys, "frozen", False):
+        base_path = os.path.dirname(sys.executable)
+    else:
+        # this file is at src/kernel/system/paths.py, so the root is 3 levels up
+        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+    # Callers pass forward-slash relatives ("icc/sRGB-v4.icc"), and normpath keeps the result
+    # in the platform's own separators instead of a mixed form.
+    return os.path.normpath(os.path.join(base_path, relative_path))
+
+
+def _usable_user_dir(base: Path) -> Optional[str]:
+    """
+    The NegPy dir under `base` if `base` is usable, else None.
+
+    When `base` already exists this touches nothing (the app creates its
+    subdirectories at startup). When it's missing, creatability has to be proven
+    by actually creating — a registered-but-absent folder is indistinguishable
+    from a creatable one until CreateDirectory runs.
+    """
+    target = base / "NegPy"
+    try:
+        if os.path.isdir(base):
+            return str(target.absolute())
+        os.makedirs(target, exist_ok=True)
+        return str(target.absolute())
+    except OSError:
+        return None
+
+
+def get_default_user_dir() -> str:
+    """Resolve the user directory, defaulting to Documents/NegPy with platform-native detection."""
+    env_path = os.getenv("NEGPY_USER_DIR")
+    if env_path:
+        # expanduser before abspath: a bare "~/dev" would otherwise become a literal "~"
+        # directory under the working directory, silently, and the app would run out of it.
+        return os.path.abspath(os.path.expanduser(env_path))
+
+    docs_dir: Optional[Path] = None
+
+    if sys.platform == "win32":
+        from negpy.kernel.system.user_directory import saved_user_directory
+
+        saved = saved_user_directory()
+        if saved is not None:
+            return str(saved)
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            # CSIDL_PERSONAL = 5
+            res = ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf)
+            if res == 0 and buf.value:
+                docs_dir = Path(buf.value)
+        except Exception:
+            pass
+
+    elif sys.platform == "linux":
+        xdg_docs = os.getenv("XDG_DOCUMENTS_DIR")
+        if xdg_docs:
+            docs_dir = Path(xdg_docs)
+
+        # fallback to xdg-user-dir
+        if not docs_dir:
+            try:
+                out = subprocess.check_output(["xdg-user-dir", "DOCUMENTS"], stderr=subprocess.DEVNULL)
+                path_str = out.decode("utf-8").strip()
+                if path_str:
+                    docs_dir = Path(path_str)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+
+        # fallback to user-dirs.dirs
+        if not docs_dir:
+            config_home = os.getenv("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+            user_dirs_file = os.path.join(config_home, "user-dirs.dirs")
+            if os.path.exists(user_dirs_file):
+                try:
+                    with open(user_dirs_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.startswith("XDG_DOCUMENTS_DIR="):
+                                # Line format: XDG_DOCUMENTS_DIR="$HOME/doc"
+                                path = line.split("=", 1)[1].strip().strip('"')
+                                path = path.replace("$HOME", os.path.expanduser("~"))
+                                if os.path.isabs(path):
+                                    docs_dir = Path(path)
+                                    break
+                except Exception:
+                    pass
+
+    elif sys.platform == "darwin":
+        docs_dir = Path.home() / "Documents"
+
+    home = Path(os.path.expanduser("~"))
+    if not docs_dir:
+        docs_dir = home / "Documents"
+
+    # The registered Documents folder can point at a location that does not exist on disk,
+    # most often a OneDrive-backed Documents after OneDrive is unlinked, signed out or not yet
+    # synced. Trusting it blindly made the startup os.makedirs die with WinError 2 (#441).
+    # Validate the candidate and fall back to plain local locations that always exist.
+    candidates = list(dict.fromkeys([docs_dir, home / "Documents", home]))
+    for base in candidates:
+        usable = _usable_user_dir(base)
+        if usable is not None:
+            return usable
+
+    # Last resort: home always exists in practice; let startup surface any error.
+    return str((home / "NegPy").absolute())
+
+
+def _read_umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+# Read once, at import on the main thread: os.umask can only be read by setting it, and a file
+# another thread created in between would take the temporary mask.
+_UMASK = _read_umask()
+
+
+def apply_umask_mode(path: str) -> None:
+    """Give a file the mode a newly created file gets under the umask. A tempfile file is always
+    0600, and a rename keeps it, so a file written through one would be private to its owner."""
+    os.chmod(path, 0o666 & ~_UMASK)
+
+
+def replace_file(src: str, dst: str, *, timeout: float = 2.0, interval: float = 0.02) -> None:
+    """Atomically replace dst with src.
+
+    On Windows, retry transient sharing violations and access errors that occur when
+    external processes (such as antivirus scanners, indexers, or file watchers like
+    Adobe Bridge) momentarily hold an open handle to the newly written temporary file
+    or destination. If dst is marked read-only on Windows, its read-only attribute
+    is cleared before replacing.
+    """
+    if sys.platform != "win32":
+        os.replace(src, dst)
+        return
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    delay = max(0.005, interval)
+
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as err:
+            if os.path.exists(dst):
+                try:
+                    mode = os.stat(dst).st_mode
+                    if not (mode & stat.S_IWRITE):
+                        os.chmod(dst, mode | stat.S_IWRITE)
+                        os.replace(src, dst)
+                        return
+                except OSError:
+                    pass
+
+            winerror = getattr(err, "winerror", None)
+            if winerror not in (5, 32) and err.errno not in (errno.EACCES, errno.EBUSY):
+                raise
+
+            if time.monotonic() >= deadline:
+                raise
+
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.2)
+
+
+def safe_unlink(path: Optional[str], *, timeout: float = 0.5) -> None:
+    """Silently remove a file, retrying briefly on Windows if locked and ignoring missing files."""
+    if not path:
+        return
+    try:
+        if not os.path.exists(path):
+            return
+    except OSError:
+        return
+
+    if sys.platform != "win32":
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    delay = 0.02
+
+    while True:
+        try:
+            mode = os.stat(path).st_mode
+            if not (mode & stat.S_IWRITE):
+                os.chmod(path, mode | stat.S_IWRITE)
+        except OSError:
+            pass
+
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.1)

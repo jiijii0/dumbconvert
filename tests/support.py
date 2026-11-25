@@ -40,7 +40,7 @@ for _module in (app, keys, exif_panel):
 app.MainWindow._recovery_path = staticmethod(lambda: TMP / "recovery.json")
 
 qapp = QApplication.instance() or QApplication([])
-qapp.setStyleSheet(app.make_style("Menlo"))
+qapp.setStyleSheet(app.make_style())
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +62,8 @@ PATCHES = {                                             # name -> (scene colour 
 }
 _BASE = np.array([0.78, 0.47, 0.30])                   # orange mask: what clear film passes
 _GAMMA = np.array([0.55, 0.62, 0.70])                  # dye layers of different contrast (like real film)
+_BW_BASE = np.array([0.55, 0.54, 0.50])                # B&W base plus fog, under a slightly warm light
+_BW_GAMMA = np.array([0.65, 0.65, 0.65])
 _FILES: dict = {}
 
 
@@ -77,20 +79,27 @@ def scene(h: int, w: int) -> np.ndarray:
     return np.clip(img, 0.02, 1.0)
 
 
-def negative(path: Path, size=(1200, 1800), portrait=False, exposure=1.0, dust=True, border=True) -> Path:
-    """Write a 16-bit TIFF negative of `scene` and return its path."""
+def negative(path: Path, size=(1200, 1800), portrait=False, exposure=1.0, dust=True, border=True,
+             flat=1.0, bw=False) -> Path:
+    """Write a 16-bit TIFF negative of `scene` and return its path.
+    `flat` below 1 squeezes the scene's tones toward a mid grey, like fog or an overcast day.
+    `bw`: a B&W negative, a grey film base (base plus fog) instead of the orange mask."""
+    base, gamma = (_BW_BASE, _BW_GAMMA) if bw else (_BASE, _GAMMA)
     h, w = size
     if portrait:
         h, w = w, h
     film = np.empty((h, w, 3))
-    film[:] = _BASE
+    film[:] = base
     m = (int(h * 0.08), int(w * 0.07)) if border else (0, 0)          # film border around the picture
     ih, iw = h - 2 * m[0], w - 2 * m[1]
-    pic = scene(ih, iw) * exposure
-    film[m[0]:m[0] + ih, m[1]:m[1] + iw] = _BASE * np.clip(pic, 1e-3, None) ** (-_GAMMA) * 0.08
+    pic = scene(ih, iw)
+    pic = 0.35 * (pic / 0.35) ** flat * exposure
+    if bw:
+        pic = pic.mean(-1, keepdims=True)
+    film[m[0]:m[0] + ih, m[1]:m[1] + iw] = base * np.clip(pic, 1e-3, None) ** (-gamma) * 0.08
     # grain: colour speckle like a real scan, the same every run
     film *= 1.0 + 0.04 * np.random.default_rng(7).standard_normal((h, w, 3))
-    film = np.clip(film, 0.002, _BASE)
+    film = np.clip(film, 0.002, base)
     scan = np.ones((h, w, 3)) if border else film                      # the light panel around the film
     if border:
         e = (int(h * 0.04), int(w * 0.035))
@@ -146,8 +155,13 @@ def idle(win, timeout: float = 120.0) -> bool:
     raise TimeoutError("the window kept working for too long")
 
 
+_OPEN: list = []
+
+
 def window(width: int = 1440, height: int = 900):
     win = app.MainWindow()
+    _OPEN.append(win)
+    win.spotlight_enabled = False      # a roll without a film darkens the window; tests that click turn it off
     win.resize(width, height)
     win.show()
     win.activateWindow()
@@ -156,11 +170,20 @@ def window(width: int = 1440, height: int = 900):
 
 
 def close(win):
+    import shiboken6
+    if not shiboken6.isValid(win):
+        return
+    if win in _OPEN:
+        _OPEN.remove(win)
     idle(win)
     win._unsaved_ok = True if hasattr(win, "_unsaved_ok") else None
     win.hide()
     win.deleteLater()
     pump(0.1)
+    # processEvents() never runs deferred deletes: without this every test's window stayed alive,
+    # its app-wide event filters with it, and the suite slowed down test after test.
+    from PySide6.QtCore import QCoreApplication, QEvent
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
 
 def shown_picture(win) -> np.ndarray:
@@ -168,3 +191,10 @@ def shown_picture(win) -> np.ndarray:
     img = win.preview.source.toImage().convertToFormat(win.preview.source.toImage().Format.Format_RGB888)
     a = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.bytesPerLine())
     return a[:, :img.width() * 3].reshape(img.height(), img.width(), 3).copy()
+
+
+def close_all():
+    """Every window a test opened and left open."""
+    for win in list(_OPEN):
+        close(win)
+    _OPEN.clear()

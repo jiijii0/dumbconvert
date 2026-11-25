@@ -41,7 +41,7 @@ fi
 
 echo "== 2. NegPy's Rust core for Windows"
 rm -rf "$TOOLS/negpy_core" "$TOOLS/wheels"
-rsync -a --exclude target vendor/negpy/negpy_core/ "$TOOLS/negpy_core/"     # a copy: the submodule stays untouched
+rsync -a --exclude target vendor/negpy/negpy_core/ "$TOOLS/negpy_core/"     # built from a copy, so vendor/negpy stays clean
 (cd "$TOOLS/negpy_core" && maturin build -q --release --target "$TARGET" --zig \
    --features python,pyo3/generate-import-lib -o "$TOOLS/wheels")
 

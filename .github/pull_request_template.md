@@ -1,6 +1,6 @@
 ## What this fixes
 
-<!-- One fix per pull request. Link the issue or Reddit comment if there is one. -->
+<!-- One fix per pull request. Link the issue if there is one. -->
 
 ## How I tested it
 

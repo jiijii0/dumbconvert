@@ -1,0 +1,2724 @@
+import hashlib
+import os
+import ctypes
+import threading
+import rawpy
+import imagecodecs
+import negpy_core
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace as dc_replace
+from functools import lru_cache
+from PIL import Image, ImageCms
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from negpy.kernel.system.logging import get_logger
+from negpy.kernel.system.config import APP_CONFIG, render_scale_factor
+from negpy.domain.types import ImageBuffer
+from negpy.domain.models import (
+    WorkspaceConfig,
+    ExportConfig,
+    ExportFormat,
+    ExportResolutionMode,
+    ColorSpace,
+    ProofIntent,
+)
+from negpy.features.altprocess.models import AltProcess
+from negpy.features.process.capture_color import is_source_profile, wb_only_cam_xyz
+from negpy.features.process.models import DemosaicMode, ProcessMode, invalidate_local_bounds
+from negpy.features.process.path import RenderPath, is_mono, positive_decode, render_path
+from negpy.features.process.logic import (
+    decode_wb,
+    demosaic_token,
+    effective_highlight_reconstruction,
+    effective_linear_raw,
+    highlight_reconstruction_bakes_wb,
+    highlight_reconstruction_bakes_wb_token,
+    highlight_reconstruction_bright_gain,
+    highlight_reconstruction_token,
+    linear_raw_token,
+)
+from negpy.features.process.sensor import apply_sensor_correction, effective_sensor_matrix, sensor_token
+from negpy.features.exposure.analysis import COLOR_HIST_BINS
+from negpy.features.exposure.models import RenderIntent
+from negpy.features.flatfield.logic import apply_flatfield, flatfield_token
+from negpy.features.lab.logic import apply_resize_sharpening
+from negpy.services.rendering.lens import flatfield_source, lens_decode_token, metadata_lens_corrections, prepare_lens_source
+from negpy.features.geometry.logic import autocrop_detection_key, meter_detection_key, resolve_autocrop_rect, resolve_meter_rect
+from negpy.features.geometry.models import GeometryConfig, crops_frame, squares_on_arm
+from negpy.features.geometry.skew import squared_geometry
+from negpy.features.retouch.logic import (
+    apply_hair_inpaint,
+    apply_ir_attenuation,
+    apply_score_repair,
+    compute_dust_stats,
+    detect_luma_score,
+    drop_exclusions,
+    exclusion_token,
+    film_scale,
+    downsample_ir,
+    hair_bake_token,
+    ir_bake_token,
+    luma_bake_token,
+    ir_defect_score,
+    ir_detect_cutoff,
+    ir_detect_target,
+    ir_ratio_and_gain,
+    lines_to_score,
+    manual_bake_token,
+    repair_components,
+    repair_coverage,
+    route_wide_defects,
+    strokes_to_score,
+)
+from negpy.features.retouch.clone import apply_clone_strokes, clone_token
+from negpy.features.rgbscan.logic import merge_rgb_triplet, rgbscan_token
+from negpy.features.rgbscan.models import RgbScanConfig, is_rgb_triplet
+from negpy.features.stitch.logic import stitch_composite
+from negpy.features.hdr.logic import merge_bracket
+from negpy.features.hdr.models import hdr_active, hdr_token
+from negpy.features.stitch.models import stitch_has_triplets, stitch_token
+from negpy.domain.interfaces import PipelineContext
+from negpy.services.rendering.base_read import NOT_READ, base_log_for, cached_base_log
+from negpy.services.rendering.engine import DarkroomEngine
+from negpy.services.rendering.gpu_engine import GPUEngine
+from negpy.infrastructure.capture.raw_demosaic import _user_sat
+from negpy.infrastructure.gpu.device import GPUDevice
+from negpy.kernel.system import timing
+from negpy.kernel.image.logic import (
+    apply_exif_orientation,
+    float_to_uint8,
+    float_to_uint16,
+    ensure_rgb,
+    uint16_to_float32,
+    float_to_uint_luma,
+    working_oetf_decode,
+)
+from negpy.infrastructure.loaders.factory import loader_factory
+from negpy.infrastructure.loaders.helpers import (
+    NonStandardFileWrapper,
+    camera_wb_multipliers,
+    decodes_camera_wb,
+    camera_xyz_matrix,
+    get_best_demosaic_algorithm,
+    is_xtrans,
+)
+from negpy.features.metadata.resolution import Resolution
+from negpy.services.export.print import PrintService
+from negpy.services.export.encoders import encode_jpeg, encode_jxl, encode_png, encode_tiff, encode_webp
+from negpy.infrastructure.display.color_spaces import ColorSpaceRegistry, WORKING_COLOR_SPACE
+from negpy.infrastructure.display.icc_lut import DEFAULT_LUT_SIZE, apply_icc_u16_rgb, apply_matrix_trc_u16, apply_matrix_trc_u8
+
+# Preview soft-proof LUT grid. Finer than the display LUT because the proof clips at the
+# output gamut boundary, and interpolating across that kink is where the error is.
+PROOF_LUT_SIZE = 65
+# 8-bit round-trip displacement below which a color counts as printable. A v4 LUT
+# profile's own interpolation moves an in-gamut color: against a destination that cannot
+# clip anything the noise reaches 14 levels, while genuinely clipped colors move much
+# further. Sitting on the noise ceiling misses colors just barely outside and raises no
+# false alarms, which is the right bias for a warning.
+GAMUT_ROUND_TRIP_TOLERANCE = 14
+
+# Mid grey for the gamut warning: neutral, so it reads as "no color here" against any
+# picture, and mid, so it stays visible in both a shadow and a highlight.
+GAMUT_WARNING_COLOR = np.float32(0.5)
+
+# ProofIntent -> the lcms intent it names.
+_PROOF_INTENTS = {
+    ProofIntent.PERCEPTUAL.value: ImageCms.Intent.PERCEPTUAL,
+    ProofIntent.RELATIVE_COLORIMETRIC.value: ImageCms.Intent.RELATIVE_COLORIMETRIC,
+    ProofIntent.SATURATION.value: ImageCms.Intent.SATURATION,
+}
+
+logger = get_logger(__name__)
+
+
+_CMS_STRIPS = 16
+
+# Busy-toast labels for the dust bakes. With an exclusion in play the pass is re-deciding
+# what to repair, so the plain "repairing dust" would contradict the click that started it.
+_DUST_STEP = "repairing dust"
+_DUST_STEP_EXCLUDED = "updating dust removal"
+
+
+def _dust_step_label(retouch) -> str:
+    return _DUST_STEP_EXCLUDED if retouch.dust_exclusion_strokes else _DUST_STEP
+
+
+def _cms_transform_strips(img_u16: np.ndarray, src_bytes: bytes, dst_bytes: bytes) -> np.ndarray:
+    """lcms2 relative-colorimetric transform on row strips in parallel. lcms is per-pixel and
+    imagecodecs releases the GIL, so the strips are exact and scale with cores."""
+    kwargs = dict(colorspace="RGB", outcolorspace="RGB", intent=1, flags=0x2000)  # BLACKPOINTCOMPENSATION
+    h = img_u16.shape[0]
+    n = min(_CMS_STRIPS, os.cpu_count() or 1, h)
+    if n <= 1:
+        return imagecodecs.cms_transform(img_u16, src_bytes, dst_bytes, **kwargs)
+    out = np.empty_like(img_u16)
+
+    def run(i: int) -> None:
+        a, b = i * h // n, (i + 1) * h // n
+        out[a:b] = imagecodecs.cms_transform(img_u16[a:b], src_bytes, dst_bytes, **kwargs)
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(run, range(n)))
+    return out
+
+
+@lru_cache(maxsize=8)
+def _grey_reencode_lut(working_color_space: Optional[str], bits: int) -> np.ndarray:
+    """The greyscale export re-encode as a table over every uint16 luma code: working TRC
+    decode, sRGB OETF, 16-bit, then 8-bit for ``bits`` 8. None keeps the working TRC."""
+    codes = np.arange(65536, dtype=np.uint16)
+    out = codes
+    if working_color_space is not None:
+        lin = np.clip(np.asarray(working_oetf_decode(codes.astype(np.float32) / 65535.0)), 0.0, 1.0)
+        gray = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+        out = np.clip(gray * 65535.0 + 0.5, 0.0, 65535.0).astype(np.uint16)
+    if bits == 8:
+        out = _u16_to_u8_lut()[out]
+    out = np.ascontiguousarray(out)
+    out.setflags(write=False)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _u16_to_u8_lut() -> np.ndarray:
+    """Round every uint16 code to the nearest uint8 code, as a table for negpy_core.lut_u16."""
+    out = np.clip(np.round(np.arange(65536, dtype=np.float32) / 257.0), 0.0, 255.0).astype(np.uint8)
+    out.setflags(write=False)
+    return out
+
+
+@lru_cache(maxsize=16)
+def _read_icc_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# (photometric, primaries, transfer) for JXL's enumerated color encoding (D65 white only,
+# no ICC). Other spaces must hard-fail. Transfers verified against the bundled icc/*.icc:
+# Rec 2020 uses the BT.2020 OETF, and GrayGamma2.2.icc holds the sRGB TRC despite its name.
+_JXL_COLOR = {
+    ColorSpace.SRGB.value: ("RGB", "SRGB", "SRGB"),
+    ColorSpace.P3_D65.value: ("RGB", "P3", "SRGB"),
+    ColorSpace.REC2020.value: ("RGB", "BT2100", "BT709"),
+    ColorSpace.GREYSCALE.value: ("GRAY", None, "SRGB"),
+}
+
+# Pinned wb_override for a decode with no white-balance gain applied at all.
+_NEUTRAL_WB = (1.0, 1.0, 1.0, 1.0)
+
+
+class ArmedCrop(NamedTuple):
+    """What an armed Auto Crop resolved, for the controller to freeze."""
+
+    rect: Optional[Tuple[float, float, float, float]]  # None when no crop was found
+    key: str  # autocrop_detection_key of the geometry the rect was found on
+    skew: Optional[Tuple[float, float, float]]  # Fine Rotation, Tilt, Swing squared to; None if not measured
+    squared: bool  # Square Before Crop ran for this arm
+
+
+def _resolve_armed_autocrop(img: np.ndarray, settings: WorkspaceConfig) -> Tuple[WorkspaceConfig, Optional[ArmedCrop]]:
+    """Turn an armed Auto Crop (no rect yet, or a stale key) into a rect, once, before either
+    engine runs: per render, a preview and a full-res export can find different edges. Returns
+    this render's settings (marked squared when Square Before Crop ran) and what to freeze, or None."""
+    geom = settings.geometry
+    if not geom.crop_from_auto:
+        return settings, None
+    key = autocrop_detection_key(geom)
+    if geom.crop_rect is not None and geom.crop_detect_key == key:
+        return settings, None
+    skew = None
+    tried = squares_on_arm(geom)
+    if tried:
+        fit = squared_geometry(img, geom, settings.process.process_mode)
+        if fit is not None:
+            geom = fit[0]
+            skew = (geom.fine_rotation, geom.converge_v, geom.converge_h)
+            key = autocrop_detection_key(geom)
+        # Marked here too, so a later resolver call on these settings (export, then its own
+        # pipeline) does not fit again.
+        geom = dc_replace(geom, autocrop_squared=True)
+    rect = resolve_autocrop_rect(img, geom, APP_CONFIG.preview_render_size)
+    if rect is None and not tried:
+        return settings, None
+    if rect is not None:
+        geom = dc_replace(geom, crop_rect=rect, crop_detect_key=key)
+    return dc_replace(settings, geometry=geom), ArmedCrop(rect, key, skew, tried)
+
+
+class _SmallSources:
+    """Decodes shrunk to tile size, shared by every processor (render_display_array keep_small)."""
+
+    CAPACITY = 128
+    MAX_BYTES = 320 * 1024 * 1024        # thumbnails are small, a viewer's draft decode is not
+
+    def __init__(self) -> None:
+        self._items: "Dict[tuple, Tuple[np.ndarray, Optional[np.ndarray]]]" = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _size(item: Tuple[np.ndarray, Optional[np.ndarray]]) -> int:
+        return item[0].nbytes + (item[1].nbytes if item[1] is not None else 0)
+
+    def get(self, key: tuple) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        with self._lock:
+            item = self._items.pop(key, None)
+            if item is None:
+                return None
+            self._items[key] = item              # most recent last
+        f32, ir = item                           # copies: the pipeline may work on its buffer in place
+        return f32.copy(), (ir.copy() if ir is not None else None)
+
+    def put(self, key: tuple, item: Tuple[np.ndarray, Optional[np.ndarray]]) -> None:
+        with self._lock:
+            self._items.pop(key, None)
+            self._items[key] = item
+            total = sum(self._size(v) for v in self._items.values())
+            while len(self._items) > 1 and (len(self._items) > self.CAPACITY or total > self.MAX_BYTES):
+                total -= self._size(self._items.pop(next(iter(self._items))))
+
+
+_small_sources = _SmallSources()
+
+_METER_MEMO_SIZE = 64
+
+
+class MeterBox(NamedTuple):
+    """The meter rect a render resolved, for the controller to freeze."""
+
+    rect: Optional[Tuple[float, float, float, float]]  # None when the film fills the frame
+    key: str  # meter_detection_key it was found under
+    geometry_key: str  # autocrop_detection_key of that geometry, which the controller can check
+
+
+def _resolve_meter_rect(
+    img: np.ndarray, settings: WorkspaceConfig, memo: Optional[Dict[Tuple[str, str], Any]] = None, source_key: str = ""
+) -> Tuple[WorkspaceConfig, Optional[MeterBox]]:
+    """Find the picture box once on a frame with no crop, so its meters skip a holder or bare light. Bounds
+    measured without the new box are dropped, so this render meters again. Returns this render's settings and
+    what to freeze, or None. `memo` holds detections by (source_key, key) for renders that arrive before
+    the freeze, which would otherwise each detect again."""
+    geom, proc = settings.geometry, settings.process
+    if proc.meter_as_loaded and proc.analysis_rect is None:
+        geom = GeometryConfig()                  # found on the scan as loaded, whatever the framing
+    elif crops_frame(geom) or geom.crop_from_auto or proc.analysis_rect is not None:
+        return settings, None
+    key = meter_detection_key(geom, img.shape)
+    if proc.meter_key == key:
+        return settings, None
+    if memo is not None and (source_key, key) in memo:
+        rect = memo[(source_key, key)]
+    else:
+        rect = resolve_meter_rect(img, geom, APP_CONFIG.preview_render_size)
+        if memo is not None:
+            if len(memo) >= _METER_MEMO_SIZE:
+                memo.pop(next(iter(memo)))
+            memo[(source_key, key)] = rect
+    stale = invalidate_local_bounds(proc) if rect != proc.meter_rect else {}
+    resolved = dc_replace(proc, meter_rect=rect, meter_key=key, **stale)
+    return dc_replace(settings, process=resolved), MeterBox(rect, key, autocrop_detection_key(geom))
+
+
+def _camera_token(cam_xyz: Optional[list], camera_wb: Optional[list]) -> str:
+    """The camera matrix and as-shot WB a slide's transfer reads; an Input ICC swaps them."""
+    if cam_xyz is None and camera_wb is None:
+        return ""
+    rows = np.asarray(cam_xyz).tolist() if cam_xyz is not None else None
+    return "|cam" + hashlib.md5(repr((rows, is_source_profile(cam_xyz), camera_wb)).encode()).hexdigest()[:12]
+
+
+def _use_half_size_decode(raw: Any) -> bool:
+    """half_size aliases the X-Trans 6x6 CFA; must match the PreviewManager fast path."""
+    return not isinstance(raw, NonStandardFileWrapper) and not is_xtrans(raw)
+
+
+_DERIVE_RESOLUTION: Any = object()
+
+
+def _tiff_resolution(resolution: Optional[Resolution], export_settings) -> Resolution:
+    """TIFF cannot say "no resolution". Leaving the tags out makes tifffile write
+    XResolution (1, 1) with ResolutionUnit NONE, which readers report as 1 DPI, so a
+    file with nothing to preserve states the export's own resolution instead. Being
+    unable to stay silent is not a licence to state something false."""
+    if resolution is None:
+        return Resolution.from_dpi(PrintService.resolution_tag_dpi(export_settings))
+    return resolution
+
+
+def _downsample_to_long_edge(buf: np.ndarray, long_px: int) -> np.ndarray:
+    """Shrink so the long edge is at most long_px; never upscales."""
+    h, w = buf.shape[:2]
+    long_edge = max(h, w)
+    if long_px <= 0 or long_edge <= long_px:
+        return buf
+    s = long_px / long_edge
+    return negpy_core.resize_area(np.ascontiguousarray(buf, dtype=np.float32), (max(1, int(round(w * s))), max(1, int(round(h * s)))))
+
+
+def _detection_downsample(buf: np.ndarray) -> np.ndarray:
+    """The plane optical dust detection reads: min-pooled like the IR plane, since a speck
+    is a minimum in transmittance that area averaging dilutes below the grain, and at the
+    resolution the IR path detects at for a buffer this size (``ir_detect_target``)."""
+    return downsample_ir(buf, ir_detect_target(max(buf.shape[:2]), APP_CONFIG.preview_render_size))
+
+
+HEAL_REFINE_PASSES = 2
+
+
+def _refine_heal(out: np.ndarray, heal_strokes: tuple, dust_spots: tuple) -> np.ndarray:
+    """One fill lands a speck only part of the way at full buffer resolution (the fill's fine
+    rungs sit inside the defect), so what still stands out under the strokes is measured again
+    and filled again. Clean film reads clean and is left alone, so the passes stop early."""
+    for _ in range(HEAL_REFINE_PASSES):
+        again = strokes_to_score(out, heal_strokes, dust_spots)
+        if again is None or not (again < 1.0).any():
+            break
+        out = np.asarray(repair_components(out, again, floor=False, factor=film_scale(out.shape[:2])))
+    return out
+
+
+def _without_ir(score: Optional[np.ndarray], hairs: List[np.ndarray], ir_mask: np.ndarray) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
+    """Optical detections with the IR-corrected pixels released to clean."""
+    out_score = None
+    if score is not None:
+        covered = _resize_mask(ir_mask, score.shape[:2])
+        out_score = np.where(covered, np.float32(1.0), score).astype(np.float32)
+        if not (out_score < 1.0).any():
+            out_score = None
+    out_hairs = []
+    for m in hairs:
+        kept = np.where(_resize_mask(ir_mask, m.shape[:2]), 0, m).astype(m.dtype)
+        if kept.any():
+            out_hairs.append(kept)
+    return out_score, out_hairs
+
+
+def _resize_mask(mask: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+    if mask.shape[:2] == tuple(shape):
+        return mask > 0
+    return negpy_core.resize_nearest(mask.astype(np.uint8), (shape[1], shape[0])) > 0
+
+
+def preview_takes_unmix(params: WorkspaceConfig) -> bool:
+    """Whether a preview source gets the sensor unmix. Triplet composites take each channel
+    from its own single-band exposure, so unmixing them would inject crosstalk that was never
+    captured; that holds for a stitch with a triplet part too."""
+    return not is_rgb_triplet(params.rgbscan) and not stitch_has_triplets(params.stitch)
+
+
+def precorrect_key(
+    source_hash: str, shape: tuple, settings: WorkspaceConfig, skip_flatfield: bool, gain_slices: tuple, source_orientation: int
+) -> tuple:
+    """Identity of a preview source after flat-field and sensor unmix. Shape and the decode
+    tokens are in it: HQ, Linear RAW and a demosaic change re-decode under an unchanged source_hash."""
+    return (
+        source_hash,
+        shape,
+        linear_raw_token(settings.process),
+        demosaic_token(settings.process.demosaic_preview),
+        positive_decode(settings.process),
+        skip_flatfield,
+        gain_slices,
+        source_orientation,
+        metadata_lens_corrections(settings),
+        flatfield_token(settings.flatfield),
+        sensor_token(settings.process),
+        rgbscan_token(settings.rgbscan),
+        stitch_token(settings.stitch),
+        hdr_token(settings.hdr),
+    )
+
+
+def precorrect_source(img: ImageBuffer, settings: WorkspaceConfig, gain_slices: tuple = (), source_orientation: int = 1) -> ImageBuffer:
+    """Flat-field, then the sensor unmix: the source pre-corrections, before geometry and crop."""
+    img = flatfield_source(img, settings, gain_slices, orientation=source_orientation)
+    if preview_takes_unmix(settings):
+        img = apply_sensor_correction(img, effective_sensor_matrix(settings.process), settings.process.sensor_unmix)
+    return img
+
+
+def read_source_base(img: ImageBuffer, settings: WorkspaceConfig, source_hash: str, source_orientation: int = 1) -> Optional[tuple]:
+    """The clear-base read `run_pipeline` would take for a whole-frame preview of `img`, for the prefetch."""
+    key = precorrect_key(source_hash, img.shape, settings, False, (), source_orientation)
+    found = cached_base_log(key)
+    return found if found is not NOT_READ else base_log_for(key, precorrect_source(img, settings, (), source_orientation))
+
+
+def _unmix_source(f32_buffer: np.ndarray, params: WorkspaceConfig) -> np.ndarray:
+    """The unmix `_load_source_f32(unmix=False)` left out, on the whole source or on one half,
+    as the preview unmixes a half alone. Triplets are never unmixed; a stitch holding one
+    unmixes its other parts alone."""
+    if (is_rgb_triplet(params.rgbscan) and not hdr_active(params.hdr)) or stitch_has_triplets(params.stitch):
+        return f32_buffer
+    return apply_sensor_correction(f32_buffer, effective_sensor_matrix(params.process), params.process.sensor_unmix)
+
+
+def _part_params(params: WorkspaceConfig, index: int) -> WorkspaceConfig:
+    """Params for stitch part ``index``, carrying that part's own R/G/B exposures.
+
+    Empty ``stitch_triplets`` (composites registered before triplet support) falls back
+    to ``params.rgbscan``."""
+    triplets = params.stitch.stitch_triplets
+    if index >= len(triplets):
+        return params
+    green, blue = triplets[index]
+    rgbscan = (
+        RgbScanConfig(enabled=True, green_path=green, blue_path=blue, align=params.stitch.stitch_align)
+        if (green and blue)
+        else RgbScanConfig()
+    )
+    return dc_replace(params, rgbscan=rgbscan)
+
+
+class ImageProcessor:
+    """
+    Coordinates multi-backend image processing.
+    Seamlessly switches between CPU (DarkroomEngine) and GPU (GPUEngine).
+    """
+
+    def __init__(self, use_gpu: bool = True) -> None:
+        self.engine_cpu = DarkroomEngine()
+        self.engine_gpu: Optional[GPUEngine] = None
+
+        # Last decoded full-res source (decode+flatfield), so a repeat export skips the
+        # decode. One entry only, since full-res buffers are large. Read-only downstream.
+        self._source_cache_key: Optional[tuple] = None
+        self._source_cache_value: Optional[Tuple[np.ndarray, Optional[np.ndarray], str]] = None
+        # Decoder XYZ->camera matrix per source path, filled during decode. Small and
+        # append-only: one 3x3 per file the session has exported.
+        self._cam_xyz_by_path: Dict[str, Tuple[Optional[list], Optional[list]]] = {}
+
+        # Flat-field + sensor-unmix corrected source: full-buffer passes that no
+        # creative slider moves.
+        self._precorrect_key: Optional[tuple] = None
+        self._precorrect_value: Optional[np.ndarray] = None
+        self._meter_memo: Dict[Tuple[str, str], Any] = {}
+
+        # Source-space dust detection cache. Geometry is out of the key because strokes are
+        # source-normalized, and resolution is out so an export reuses the preview regions.
+        self._retouch_detect_key: Optional[tuple] = None
+        self._retouch_detect_value: Optional[tuple] = None
+        # Threshold-independent stat maps: they survive threshold-slider drags.
+        self._dust_stats_key: Optional[tuple] = None
+        self._dust_stats_value: Optional[tuple] = None
+        # IR ratio + gain map at detection scale, keyed on source only so it survives
+        # threshold drags. Shared by the attenuation bake and IR detection.
+        self._ir_gain_key: Optional[tuple] = None
+        self._ir_gain_value: Optional[tuple] = None
+        # Inpainted source for hairs, keyed on (source+detection params, buffer res)
+        # so creative-slider drags reuse it instead of re-inpainting every frame.
+        self._hair_key: Optional[tuple] = None
+        self._hair_value: Optional[np.ndarray] = None
+        # IR-baked source (division + score-weighted fill) and its routed mask, keyed
+        # like _hair so creative-slider drags reuse the baked buffer.
+        self._ir_recon_key: Optional[tuple] = None
+        self._ir_recon_value: Optional[tuple] = None
+        # Repaired source for detected specks and for painted strokes. Same keying as
+        # _hair: a creative-slider drag reuses the buffer, a new stroke invalidates it
+        # through the manual token in source_hash.
+        self._luma_key: Optional[tuple] = None
+        self._luma_value: Optional[np.ndarray] = None
+        self._manual_key: Optional[tuple] = None
+        self._manual_value: Optional[tuple] = None
+        # Incremental baseline for _manual_bake: the (score, out) reached by the strokes/
+        # spots/lines baked so far, so painting one more stroke costs that stroke alone
+        # rather than redoing every earlier one. Reset whenever the new state is not a
+        # strict append of this baseline (an undo, an edit, a new source).
+        # Identity, not source_key: source_key folds in manual_bake_token, a hash of the
+        # whole stroke list, so it changes on every single stroke by design (it also
+        # invalidates the GPU/CPU engine's uploaded source) and could never match here.
+        # Nothing upstream of the manual bake reads the strokes, so the same decoded
+        # buffer object recurs across a painting session; identity is what to key on.
+        self._manual_inc_img: Optional[np.ndarray] = None
+        self._manual_inc_heal_strokes: tuple = ()
+        self._manual_inc_dust_spots: tuple = ()
+        self._manual_inc_lines: tuple = ()
+        self._manual_inc_threshold: Optional[float] = None
+        self._manual_inc_score: Optional[np.ndarray] = None
+        self._manual_inc_out: Optional[np.ndarray] = None
+        # Clone cache, keyed on input identity like the manual baseline; a strict append extends it.
+        self._clone_img: Optional[np.ndarray] = None
+        self._clone_strokes: tuple = ()
+        self._clone_out: Optional[np.ndarray] = None
+
+        # Prefetched export source for the batch worker. The gate serializes the
+        # prepare compute: the decode/bake caches above are single-slot.
+        self._prepare_gate = threading.Lock()
+        self._prepare_slot: Optional[Tuple[tuple, Tuple[np.ndarray, str, str]]] = None
+
+        # Called with a label when a slow uncached step starts, for a UI busy cue. Set by
+        # RenderWorker. The caller runs on the render thread, so keep it to a signal emit.
+        self.on_slow_step: Optional[Callable[[str], None]] = None
+
+        if use_gpu and APP_CONFIG.use_gpu:
+            gpu = GPUDevice.get()
+            if gpu.is_available:
+                self.engine_gpu = GPUEngine()
+                logger.info("ImageProcessor: Acceleration backend ready")
+            else:
+                logger.warning("ImageProcessor: GPU unavailable, using CPU fallback")
+
+    @property
+    def backend_name(self) -> str:
+        if self.engine_gpu:
+            return self.engine_gpu.gpu.backend_name or "WEBGPU"
+        return "CPU"
+
+    @staticmethod
+    def _is_flat(settings: WorkspaceConfig) -> bool:
+        """Flat (digital-intermediate) renders run on the CPU engine only, so the
+        master is numerically exact and never subject to the looser GPU parity."""
+        return settings.exposure.render_intent == RenderIntent.FLAT
+
+    @staticmethod
+    def _cpu_only(settings: WorkspaceConfig) -> bool:
+        """Renders the GPU engine cannot make: flat ones."""
+        return ImageProcessor._is_flat(settings)
+
+    def _slow_step(self, label: str) -> None:
+        if self.on_slow_step is not None:
+            self.on_slow_step(label)
+
+    def _ir_ratio_gain(self, ir_buffer: np.ndarray, img: np.ndarray, source_key: str) -> tuple:
+        """Cached (ratio_det, gain_det, degenerate, gammas) at detection scale."""
+        # Detection follows the buffer it will repair (capped). The score is upsampled onto
+        # that buffer, so a coarse detection writes a fat mask and averages over a wide
+        # support. See _IR_MAX_UPSAMPLE.
+        target = ir_detect_target(max(img.shape[:2]), APP_CONFIG.preview_render_size)
+        # Key on the source shape: downsample_ir is deterministic in it, so this
+        # discriminates like the detection shape but resolves before the downsample runs.
+        # Keying on the result made the second caller repay a full-res erode to build a
+        # key it then hit.
+        key = (source_key, ir_buffer.shape, target)
+        if key == self._ir_gain_key and self._ir_gain_value is not None:
+            return self._ir_gain_value
+        # Min-preserving, not _downsample_to_long_edge: INTER_AREA averages a sub-pixel
+        # hair's dip away. A no-op on the preview path, where preview_ir already arrives
+        # min-pooled at this scale.
+        ir_det = downsample_ir(np.ascontiguousarray(ir_buffer, dtype=np.float32), target)
+        val = ir_ratio_and_gain(ir_det, _downsample_to_long_edge(img, target))
+        self._ir_gain_key = key
+        self._ir_gain_value = val
+        return val
+
+    def _ir_bake(
+        self,
+        img: np.ndarray,
+        ir_buffer: Optional[np.ndarray],
+        settings: WorkspaceConfig,
+        source_key: str,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], bool, Optional[np.ndarray]]:
+        """IR correction baked in source transmittance space before the engine (mirrors
+        apply_flatfield; the GPU re-uploads source each frame, so the bake reaches it
+        parity-free): division attenuation for semi-transparent dust, score-weighted
+        fill for opaque cores. Returns (corrected_img, corrected_mask_or_None, degenerate,
+        routed_mask_or_None) — the routed mask goes to _hair_inpaint."""
+        ret = settings.retouch
+        if self._is_flat(settings) or ir_buffer is None or not ret.ir_dust_remove:
+            return img, None, False, None
+        # The ratio and gain do not depend on the threshold or the attenuation toggle, so their
+        # cache is keyed without the IR token and survives a slider drag.
+        ratio_det, gain_det, degenerate, _ = self._ir_ratio_gain(ir_buffer, img, source_key.replace(ir_bake_token(ret, True), ""))
+        if degenerate:
+            return img, None, True, None
+        key = (source_key, round(float(ret.ir_threshold), 6), bool(ret.ir_attenuation), img.shape)
+        if key == self._ir_recon_key and self._ir_recon_value is not None:
+            out, routed = self._ir_recon_value
+        else:
+            self._slow_step("removing IR dust")
+            score_det = ir_defect_score(ratio_det, ir_detect_cutoff(ret.ir_threshold, ret.ir_attenuation))
+            out = apply_ir_attenuation(img, gain_det) if ret.ir_attenuation else img
+            out = apply_score_repair(out, score_det)
+            routed = route_wide_defects(score_det)
+            self._ir_recon_key = key
+            self._ir_recon_value = (out, routed)
+        return out, (ratio_det < 0.97), False, routed
+
+    def _hair_inpaint(self, img: np.ndarray, hair_masks: List[np.ndarray], cache_key: str, label: str = _DUST_STEP) -> np.ndarray:
+        """Structure-following inpaint of detected hairs, baked into the source before
+        the engine (like _ir_bake; the GPU re-uploads source each frame, so it reaches
+        both paths parity-free). Cached per (source+params, resolution)."""
+        ckey = (cache_key, img.shape)
+        if ckey == self._hair_key and self._hair_value is not None:
+            return self._hair_value
+        self._slow_step(label)
+        out = apply_hair_inpaint(img, hair_masks)
+        self._hair_key = ckey
+        self._hair_value = out
+        return out
+
+    def _detect_luma(
+        self,
+        settings: WorkspaceConfig,
+        img: np.ndarray,
+        source_key: str,
+        detect_buffer: Optional[np.ndarray] = None,
+    ) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
+        """Source-space luma dust detection → ``(detection-scale score, hair masks)``.
+        ``detect_buffer`` is a min-pooled plane prepared at load for a preview buffer that
+        arrives area-averaged; a full-resolution buffer min-pools itself."""
+        ret = settings.retouch
+        if self._is_flat(settings) or not ret.dust_remove:
+            return None, []
+
+        small = detect_buffer if detect_buffer is not None else _detection_downsample(img)
+        key = (
+            source_key,
+            round(float(ret.dust_threshold), 6),
+            round(float(ret.dust_hair_threshold), 6),
+            int(ret.dust_size),
+            exclusion_token(ret),
+            settings.process.process_mode,
+            small.shape,
+        )
+        if key == self._retouch_detect_key and self._retouch_detect_value is not None:
+            return self._retouch_detect_value
+
+        stats_key = (source_key, int(ret.dust_size), small.shape)
+        if stats_key == self._dust_stats_key and self._dust_stats_value is not None:
+            stats = self._dust_stats_value
+        else:
+            stats = compute_dust_stats(small, ret.dust_size)
+            self._dust_stats_key = stats_key
+            self._dust_stats_value = stats
+        score, hair_luma = detect_luma_score(small, ret.dust_threshold, ret.dust_size, stats=stats, hair_threshold=ret.dust_hair_threshold)
+        score, hair_luma = drop_exclusions(score, hair_luma, ret.dust_exclusion_strokes)
+        value = (score, [hair_luma] if hair_luma is not None else [])
+        self._retouch_detect_key = key
+        self._retouch_detect_value = value
+        return value
+
+    def _luma_bake(self, img: np.ndarray, score: Optional[np.ndarray], cache_key: str, label: str = _DUST_STEP) -> np.ndarray:
+        """Detected specks repaired into the linear source, ahead of the meters (mirrors
+        _ir_bake). Cached per (source+detection params, resolution)."""
+        if score is None:
+            return img
+        ckey = (cache_key, img.shape)
+        if ckey == self._luma_key and self._luma_value is not None:
+            return self._luma_value
+        self._slow_step(label)
+        out = np.asarray(repair_components(img, score))
+        self._luma_key = ckey
+        self._luma_value = out
+        return out
+
+    def _manual_bake(self, img: np.ndarray, settings: WorkspaceConfig, source_key: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Painted strokes and traced scratch lines repaired into the linear source, by the
+        same fill the IR and luma paths use (mirrors _ir_bake; the GPU re-uploads source each
+        frame, so the bake reaches both engines parity-free). Both hold raw-frame coordinates,
+        so this runs before geometry and needs no mapping. Returns the buffer and the mask of
+        defects too wide for the fill, for the caller to inpaint."""
+        ret = settings.retouch
+        lines = tuple(getattr(ret, "scratch_lines", []))
+        heal_strokes = tuple(ret.manual_heal_strokes)
+        dust_spots = tuple(ret.manual_dust_spots)
+        threshold = getattr(ret, "scratch_threshold", 0.5)
+        if self._is_flat(settings) or not (heal_strokes or dust_spots or lines):
+            return img, None
+        key = (source_key, img.shape)
+        if key == self._manual_key and self._manual_value is not None:
+            return self._manual_value
+
+        self._slow_step("repairing dust")
+        score, out = self._manual_bake_incremental(img, heal_strokes, dust_spots, lines, threshold)
+        if score is None:
+            value: Tuple[np.ndarray, Optional[np.ndarray]] = (img, None)
+        else:
+            value = (out, route_wide_defects(score, budget=None))
+        self._manual_key = key
+        self._manual_value = value
+        return value
+
+    def _clone_bake(self, img: np.ndarray, settings: WorkspaceConfig) -> np.ndarray:
+        """The last source bake: a clone copies film that is already clean."""
+        strokes = tuple(getattr(settings.retouch, "clone_strokes", ()))
+        if self._is_flat(settings) or not strokes:
+            return img
+        done = self._clone_strokes
+        if self._clone_img is img and self._clone_out is not None and strokes[: len(done)] == done:
+            if len(strokes) == len(done):
+                return self._clone_out
+            out = apply_clone_strokes(self._clone_out, strokes[len(done) :])
+        else:
+            self._slow_step("cloning")
+            out = apply_clone_strokes(img, strokes)
+        self._clone_img, self._clone_strokes, self._clone_out = img, strokes, out
+        return out
+
+    def _manual_bake_incremental(
+        self,
+        img: np.ndarray,
+        heal_strokes: tuple,
+        dust_spots: tuple,
+        lines: tuple,
+        threshold: float,
+    ) -> Tuple[Optional[np.ndarray], np.ndarray]:
+        """(combined_score, filled_buffer) for the current strokes/spots/lines.
+
+        A painted session is almost always additive — one more stroke on top of the ones
+        already there — so when every list is a strict extension of what was baked last
+        time (same source image, same scratch threshold), only the *new* entries run
+        through detection, and `repair_components` only re-fills the connected components
+        they actually touch; everything else is copied from the previous fill unchanged.
+        Repainting from scratch costs the same as before either way: undoing past the
+        cached baseline, or a fresh source, falls back to it below.
+        """
+        can_extend = (
+            self._manual_inc_img is img
+            and threshold == self._manual_inc_threshold
+            and heal_strokes[: len(self._manual_inc_heal_strokes)] == self._manual_inc_heal_strokes
+            and dust_spots[: len(self._manual_inc_dust_spots)] == self._manual_inc_dust_spots
+            and lines[: len(self._manual_inc_lines)] == self._manual_inc_lines
+            and self._manual_inc_score is not None
+        )
+        if can_extend:
+            new_strokes = heal_strokes[len(self._manual_inc_heal_strokes) :]
+            new_spots = dust_spots[len(self._manual_inc_dust_spots) :]
+            new_lines = lines[len(self._manual_inc_lines) :]
+            base_score = self._manual_inc_score
+            base_out = self._manual_inc_out
+        else:
+            new_strokes, new_spots, new_lines = heal_strokes, dust_spots, lines
+            base_score, base_out = None, None
+
+        # One pass for both hand-placed sources: whichever calls a pixel more damaged wins,
+        # and the fill sees every hole at once.
+        parts = [
+            s
+            for s in (
+                strokes_to_score(img, new_strokes, new_spots),
+                lines_to_score(img, new_lines, threshold),
+            )
+            if s is not None
+        ]
+        delta = parts[0] if len(parts) == 1 else (np.minimum(*parts) if parts else None)
+
+        if base_score is None:
+            score = delta
+            dirty = None  # nothing cached yet: repair_components fills every component
+        elif delta is None:
+            # The new entries alone found nothing worth repairing (clean film, or a stroke
+            # too faint) — the bake is unchanged from the cached baseline.
+            score, dirty = base_score, np.zeros(base_score.shape, dtype=bool)
+        else:
+            score = np.minimum(base_score, delta)
+            dirty = delta < 1.0
+
+        if score is None:
+            out = img
+        elif base_out is not None and not dirty.any():
+            out = base_out
+        else:
+            # floor=False: a scratch has lost emulsion and reads brighter than the film
+            # around it, so a painted repair must be free to darken as well as lighten.
+            # Film-footprint supports, not the buffer's own pixels: a painted score arrives
+            # at full buffer resolution, where the fill's fine rungs sit at grain scale,
+            # entirely inside the defect. Their candidate is then the defect's own value and
+            # the repair only half-lands. The IR path measures its score coarse instead.
+            # dirty=None here means "nothing cached to reuse", not "nothing changed" — the
+            # None-vs-empty-array distinction repair_components relies on to skip the whole
+            # incremental path when there is no base_out to reuse from.
+            out = np.asarray(repair_components(img, score, floor=False, factor=film_scale(img.shape[:2]), base_out=base_out, dirty=dirty))
+            if new_strokes or new_spots:
+                out = _refine_heal(out, new_strokes, new_spots)    # the new entries only: the rest is cached
+
+        self._manual_inc_img = img
+        self._manual_inc_heal_strokes = heal_strokes
+        self._manual_inc_dust_spots = dust_spots
+        self._manual_inc_lines = lines
+        self._manual_inc_threshold = threshold
+        self._manual_inc_score = score
+        self._manual_inc_out = out
+        return score, out
+
+    def run_pipeline(
+        self,
+        img: ImageBuffer,
+        settings: WorkspaceConfig,
+        source_hash: str,
+        render_size_ref: float,
+        metrics: Optional[Dict[str, Any]] = None,
+        prefer_gpu: bool = True,
+        readback_metrics: bool = True,
+        ir_buffer: Optional[np.ndarray] = None,
+        detect_buffer: Optional[np.ndarray] = None,
+        crop_preview_full: bool = False,
+        wants_uv_grid: bool = True,
+        skip_flatfield: bool = False,
+        cam_xyz: Optional[list] = None,
+        camera_wb: Optional[list] = None,
+        cache_stages: bool = True,
+        gain_slices: tuple = (),
+        source_orientation: int = 1,
+        film_base: Optional[tuple] = None,
+        wants_fade_grid: bool = False,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Executes rendering pipeline. Returns result (ndarray/GPUTexture) and metrics. ``skip_flatfield``: the export CPU
+        fallbacks pass an already flat-fielded buffer. ``gain_slices``: the ``slice_half`` cuts that took *img* out of the
+        decoded frame. ``source_orientation``: the EXIF orientation baked into *img*. The flat-field gain takes both."""
+        # Flat-field is a source pre-correction, before geometry and crop. Folding its token
+        # into source_hash invalidates the engine cache when it changes. Stitch buffers arrive
+        # per-part flat-fielded, because correcting the composite canvas as one frame would
+        # stretch the gain map across the seam. Shape is in the key: HQ re-decodes the same
+        # file larger under an unchanged source_hash.
+        pre_key = precorrect_key(source_hash, img.shape, settings, skip_flatfield, gain_slices, source_orientation)
+        if self._precorrect_key == pre_key and self._precorrect_value is not None:
+            img = self._precorrect_value
+        else:
+            source = img
+            # skip_flatfield buffers come from _load_source_f32, which already applied both.
+            if not skip_flatfield:
+                img = precorrect_source(img, settings, gain_slices, source_orientation)
+            # Both no-op'd: caching would pin a second reference to the same buffer.
+            if img is not source:
+                self._precorrect_key = pre_key
+                self._precorrect_value = img
+        timing.lap("flat-field/unmix")
+        source_base = NOT_READ
+        if film_base is None and render_path(settings.process) is RenderPath.PRINT:
+            source_base = base_log_for(pre_key, img) if readback_metrics and cache_stages else cached_base_log(pre_key)
+        timing.lap("base read")
+        h_orig, w_cols = img.shape[:2]
+        # Fold the buffer resolution into source_hash: toggling HQ re-decodes the same file
+        # at full resolution with unchanged settings, so without this the engine cache
+        # reports "nothing changed" and returns the stale low-res render.
+        heal_token = manual_bake_token(settings.retouch)
+        base_hash = (
+            source_hash
+            + flatfield_token(settings.flatfield)
+            + lens_decode_token(metadata_lens_corrections(settings), settings.flatfield)
+            + rgbscan_token(settings.rgbscan)
+            + stitch_token(settings.stitch)
+            + hdr_token(settings.hdr)
+            + linear_raw_token(settings.process)
+            + highlight_reconstruction_token(settings.process)
+            + highlight_reconstruction_bakes_wb_token(settings.process)
+            + sensor_token(settings.process)
+            + demosaic_token(settings.process.demosaic_preview)
+            + ir_bake_token(settings.retouch, ir_buffer is not None)
+            + heal_token
+            + luma_bake_token(settings.retouch)
+        )
+        # Each bake keys only on what runs ahead of it, so a heal or clone stroke re-runs only its own pass.
+        auto_hash = base_hash.replace(heal_token, "", 1) if heal_token else base_hash
+        clone_tok = clone_token(settings.retouch)
+        base_hash += clone_tok
+        repair_hash = base_hash[: len(base_hash) - len(clone_tok)]
+
+        # Bake the IR correction before detection so meters/stats see the corrected buffer.
+        # Gated: the bake caches are single-slot and the export prefetch bakes on a helper thread.
+        want_ir = settings.retouch.ir_dust_remove and ir_buffer is not None and not self._is_flat(settings)
+        with self._prepare_gate:
+            timing.lap("wait for prefetch")
+            img, ir_corrected_mask, ir_degenerate, ir_routed = self._ir_bake(img, ir_buffer, settings, auto_hash)
+            timing.lap("IR repair")
+
+            orig_ret = settings.retouch
+            detected_dust, hair_masks = self._detect_luma(settings, img, auto_hash, detect_buffer)
+            if ir_corrected_mask is not None and (detected_dust is not None or hair_masks):
+                # What IR already repaired is not repaired again from the visible.
+                detected_dust, hair_masks = _without_ir(detected_dust, hair_masks, ir_corrected_mask)
+            dust_label = _dust_step_label(orig_ret)
+            timing.lap("dust detect")
+            img = self._luma_bake(img, detected_dust, auto_hash + hair_bake_token(orig_ret), dust_label)
+            timing.lap("dust repair")
+            img, manual_routed = self._manual_bake(img, settings, repair_hash)
+            timing.lap("heal")
+            extra = [m for m in (ir_routed, manual_routed) if m is not None]
+            if extra:
+                hair_masks = hair_masks + extra  # never mutate the cached list
+            # Inpaint long/twisted hairs into the source, where both engines see it. The token
+            # invalidates the base stage when detection params change.
+            hair_token = hair_bake_token(orig_ret) if hair_masks else ""
+            if hair_masks:
+                img = self._hair_inpaint(img, hair_masks, repair_hash + hair_token, dust_label)
+            timing.lap("hair repair")
+            img = self._clone_bake(img, settings)
+            timing.lap("clone")
+
+        source_hash = base_hash + hair_token + f"|res{w_cols}x{h_orig}" + _camera_token(cam_xyz, camera_wb)
+
+        scale_factor = render_scale_factor(img.shape)
+
+        settings, resolved_crop = _resolve_armed_autocrop(img, settings)
+        settings, resolved_meter = _resolve_meter_rect(img, settings, self._meter_memo, source_hash)
+        timing.lap("auto crop/meter area")
+
+        context = PipelineContext(
+            scale_factor=scale_factor,
+            original_size=(h_orig, w_cols),
+            process_mode=settings.process.process_mode,
+            crop_preview_full=crop_preview_full,
+            wants_uv_grid=wants_uv_grid,
+            cam_xyz=cam_xyz,
+            camera_wb=camera_wb,
+            cache_stages=cache_stages,
+            readback_metrics=readback_metrics,
+            wants_fade_grid=wants_fade_grid,
+        )
+        if metrics:
+            context.metrics.update(metrics)
+        if film_base is not None:
+            context.metrics["film_base"] = tuple(film_base)
+        if source_base is not NOT_READ:
+            context.metrics["source_base_log"] = source_base
+        # The crop this render detected, for the controller to freeze into the edit. The key
+        # rides along so a freeze that lands after the user moved on is discarded.
+        if resolved_crop is not None:
+            context.metrics["autocrop_resolved"] = resolved_crop
+        if resolved_meter is not None:
+            context.metrics["meter_resolved"] = resolved_meter
+        # Overlay data, written even when empty: the controller merges metrics into the last
+        # frame's, so an absent key keeps the previous frame's marks.
+        dust_mask = detected_dust < 1.0 if detected_dust is not None else None
+        context.metrics["detected_dust_mask"] = dust_mask
+        context.metrics["hair_inpaint_masks"] = hair_masks
+        context.metrics["ir_corrected_mask"] = ir_corrected_mask
+        # The B&W/Kodachrome guard.
+        if want_ir:
+            context.metrics["ir_degenerate"] = ir_degenerate
+        # Read-out of how much of the scan each route rewrote. Costs a reduction per live
+        # mask; a scan with nothing repaired passes None and costs nothing.
+        context.metrics["repair_fractions"] = repair_coverage(
+            ir_corrected_mask if want_ir else None,
+            dust_mask,
+            hair_masks,
+        )
+
+        if self._cpu_only(settings):
+            prefer_gpu = False
+
+        needs_tiling = bool(prefer_gpu and self.engine_gpu and self.engine_gpu.requires_tiling(img, settings, render_size_ref))
+        if needs_tiling and crop_preview_full:
+            prefer_gpu = False
+
+        if prefer_gpu and self.engine_gpu:
+            try:
+                with timing.step("GPU"):
+                    if needs_tiling:
+                        processed, gpu_metrics = self.engine_gpu.process(
+                            img,
+                            settings,
+                            scale_factor=scale_factor,
+                            readback_metrics=readback_metrics,
+                            source_hash=source_hash,
+                            analysis_source_hash=source_hash,
+                            cam_xyz=cam_xyz,
+                            camera_wb=camera_wb,
+                            film_base=film_base,
+                            source_base_log=source_base,
+                            memory_bounded=True,
+                            render_size_ref=render_size_ref,
+                        )
+                    else:
+                        self.engine_gpu.evict_stale_textures(destroy=False)
+                        processed, gpu_metrics = self.engine_gpu.process_to_texture(
+                            img,
+                            settings,
+                            scale_factor=scale_factor,
+                            render_size_ref=render_size_ref,
+                            readback_metrics=readback_metrics,
+                            source_hash=source_hash,
+                            analysis_source_hash=source_hash,
+                            cam_xyz=cam_xyz,
+                            camera_wb=camera_wb,
+                            film_base=film_base,
+                            source_base_log=source_base,
+                            full_frame=crop_preview_full,
+                        )
+                context.metrics.update(gpu_metrics)
+                return processed, context.metrics
+            except Exception:
+                logger.exception("Hardware acceleration failed, falling back to CPU")
+                self.engine_gpu.cleanup(collect=False)
+                context.metrics["gpu_fallback"] = True
+
+        with timing.step("CPU"):
+            processed = self.engine_cpu.process(img, settings, source_hash, context)
+        return processed, context.metrics
+
+    def buffer_to_pil(self, buffer: Any, settings: WorkspaceConfig, bit_depth: int = 8) -> Image.Image:
+        """Converts float32 buffer to calibrated PIL Image."""
+        if not isinstance(buffer, np.ndarray):
+            raise ValueError("Direct GPU textures cannot be converted to PIL without readback.")
+
+        t = settings.toning
+        # Any toner or split tint makes a B&W print chromatic, so collapsing to a single
+        # luma plane here would discard the toning.
+        is_toned = (
+            t.selenium_strength != 0.0
+            or t.sepia_strength != 0.0
+            or t.gold_strength != 0.0
+            or t.blue_strength != 0.0
+            or t.copper_strength != 0.0
+            or t.vanadium_strength != 0.0
+            or t.shadow_tint_strength != 0.0
+            or t.highlight_tint_strength != 0.0
+            # A Sabattier print is plain silver; lith and cyanotype carry their own color.
+            or (
+                settings.process.process_mode == ProcessMode.BW
+                and settings.altproc.alt_process not in (AltProcess.NONE, AltProcess.SABATTIER)
+            )
+        )
+        is_bw = is_mono(settings.process) and not is_toned
+
+        if is_bw:
+            img_int = float_to_uint_luma(np.ascontiguousarray(buffer), bit_depth=bit_depth)
+            return Image.fromarray(img_int)
+
+        if bit_depth == 8:
+            return Image.fromarray(float_to_uint8(buffer))
+        elif bit_depth == 16:
+            if buffer.ndim == 2 or (buffer.ndim == 3 and buffer.shape[2] == 1):
+                return Image.fromarray(float_to_uint16(buffer))
+            return Image.fromarray(float_to_uint8(buffer))
+        raise ValueError(f"Unsupported bit depth: {bit_depth}")
+
+    def _decode_sensor_rgb(
+        self,
+        file_path: str,
+        linear_raw: bool,
+        fast: bool = False,
+        wb_override: Optional[Sequence[float]] = None,
+        demosaic: str = DemosaicMode.AUTO,
+        positive_decode: str = "",
+        highlight_mode: int = 0,
+        bake_camera_wb: bool = False,
+        load_ir: bool = True,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Decode one RAW to sensor-native (output_color=raw), linear RGB.
+
+        `fast` allows a half-size decode (contact-sheet tiles); ignored where
+        half_size would distort colors (see _use_half_size_decode).
+
+        `wb_override` decodes on someone else's white balance instead of this file's own.
+        Frames of one bracket must share a scale or the exposure ratios solved between them
+        absorb the difference, and `use_camera_wb` reads each *file's* as-shot multipliers —
+        which differ per frame on a camera left in auto white balance.
+
+        `highlight_mode` is libraw's own reconstruction level; the caller resolves it via
+        `effective_highlight_reconstruction` so this method never has to re-derive the gate.
+
+        `bake_camera_wb` applies this file's own white balance even though `linear_raw` is
+        true, resolved by the caller via `highlight_reconstruction_bakes_wb` — reconstruction's
+        clip thresholds read the decode's own multipliers, which are all neutral on a plain
+        `linear_raw` decode. `wb_override` still wins when both are set, so a bracket sibling
+        pins to the reference frame's white balance rather than reading its own.
+
+        A non-Clip `highlight_mode` makes libraw scale the whole decode down against its
+        widest channel multiplier instead of its narrowest, so whatever real white balance
+        reaches this decode (camera or override) is offset back out via `bright` —
+        see `highlight_reconstruction_bright_gain`.
+
+        Returns (rgb, loader_metadata): uint16 from a camera RAW or a linear 16-bit source,
+        float32 in [0, 1] from any other source.
+        """
+        ctx_mgr, metadata = loader_factory.get_loader(file_path, linear_raw=linear_raw, positive_decode=positive_decode, load_ir=load_ir)
+        with ctx_mgr as raw:
+            algo = get_best_demosaic_algorithm(raw, demosaic)
+            # Read before postprocess: camera_whitebalance is sensor metadata, unaffected by it,
+            # and highlight_reconstruction_bright_gain needs it ahead of the postprocess call.
+            camera_wb = camera_wb_multipliers(raw)
+            if wb_override is not None:
+                # rawpy's user_wb is [R, G, B, G2]; camera_wb_multipliers only ever supplies
+                # [R, G, B], so pad with G2=G rather than pass rawpy a length it rejects.
+                user_wb: Optional[list] = list(wb_override)
+                if len(user_wb) == 3:
+                    user_wb.append(user_wb[1])
+                use_camera_wb_flag = False
+                wb_for_gain: Optional[Sequence[float]] = user_wb
+            elif decodes_camera_wb(raw, bake_camera_wb or not linear_raw):
+                user_wb = None
+                use_camera_wb_flag = True
+                wb_for_gain = camera_wb
+            else:
+                user_wb = [1, 1, 1, 1]
+                use_camera_wb_flag = False
+                wb_for_gain = None
+            post_kw: Dict[str, Any] = {"half_size": True} if fast and _use_half_size_decode(raw) else {}
+            # NonStandardFileWrapper has no camera calibration to read; its postprocess ignores user_sat anyway.
+            user_sat = None if isinstance(raw, NonStandardFileWrapper) else _user_sat(raw)
+            rgb = raw.postprocess(
+                gamma=(1, 1),
+                no_auto_bright=True,
+                adjust_maximum_thr=0.0,  # fixed white level, never the frame's own max
+                user_sat=user_sat,  # calibrated linearity limit, not the format's generic max
+                use_camera_wb=use_camera_wb_flag,
+                user_wb=user_wb,
+                output_bps=16,
+                output_color=rawpy.ColorSpace.raw,
+                demosaic_algorithm=algo,
+                user_flip=0,
+                highlight_mode=highlight_mode,
+                bright=highlight_reconstruction_bright_gain(wb_for_gain, highlight_mode),
+                **post_kw,
+            )
+            rgb = ensure_rgb(rgb)
+            # Sensor-native decode leaves the buffer in camera primaries, and the
+            # transparency transfer needs the matrix to reach the working space.
+            metadata["cam_xyz"] = camera_xyz_matrix(raw)
+            metadata["camera_wb"] = camera_wb
+        return rgb, metadata
+
+    @staticmethod
+    def _source_key(file_path: str, params: WorkspaceConfig, fast_decode: bool, unmix: bool) -> tuple:
+        """Everything a decode depends on: the same key gives the same decoded buffer."""
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            mtime = 0.0
+        return (
+            file_path,
+            mtime,
+            lens_decode_token(metadata_lens_corrections(params), params.flatfield),
+            effective_linear_raw(params.process),
+            positive_decode(params.process),
+            effective_highlight_reconstruction(params.process),
+            highlight_reconstruction_bakes_wb(params.process),
+            rgbscan_token(params.rgbscan),
+            stitch_token(params.stitch),
+            hdr_token(params.hdr),
+            flatfield_token(params.flatfield),
+            sensor_token(params.process),
+            decode_wb(params.process),
+            demosaic_token(params.process.demosaic_export),
+            fast_decode,
+            unmix,
+            params.retouch.ir_dust_remove,
+        )
+
+    def _load_source_f32(
+        self, file_path: str, params: WorkspaceConfig, fast_decode: bool = False, unmix: bool = True
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], str]:
+        """Decode a source file to a flatfield-corrected, EXIF-oriented float32 buffer → (f32, ir, source color space). A
+        stitch replays the registration in ``params.stitch``, each part with its own rgbscan config. ``unmix=False`` leaves
+        out the sensor unmix that `_unmix_source` applies to the whole buffer."""
+        is_triplet = is_rgb_triplet(params.rgbscan) or stitch_has_triplets(params.stitch)
+        # Narrowband triplet channels don't survive half_size CFA binning.
+        fast_decode = fast_decode and not is_triplet
+        cache_key = self._source_key(file_path, params, fast_decode, unmix)
+        if cache_key == self._source_cache_key and self._source_cache_value is not None:
+            return self._source_cache_value
+
+        if params.stitch.stitch_enabled and params.stitch.stitch_paths:
+            # libraw/tifffile release the GIL, so the parts decode concurrently.
+            all_paths = (file_path, *params.stitch.stitch_paths)
+            # The sensor unmix reads the film base from the frame, so a stitch is unmixed once,
+            # assembled, or each part would read its own base.
+            whole = not stitch_has_triplets(params.stitch)
+            with ThreadPoolExecutor(max_workers=min(3, len(all_paths))) as pool:
+                decoded = list(
+                    pool.map(
+                        lambda ip: self._decode_oriented_f32(ip[1], _part_params(params, ip[0]), fast_decode, unmix=not whole),
+                        enumerate(all_paths),
+                    )
+                )
+            parts = [f32 for f32, _ir, _cs in decoded]
+            irs = [ir for _f32, ir, _cs in decoded]
+            source_cs = decoded[0][2]
+            f32_buffer, ir_full = stitch_composite(parts, irs, params.stitch)
+            if whole and unmix:
+                f32_buffer = _unmix_source(f32_buffer, params)
+            result = (f32_buffer, ir_full, source_cs)
+        else:
+            result = self._decode_oriented_f32(file_path, params, fast_decode, unmix=unmix)
+
+        self._source_cache_key = cache_key
+        self._source_cache_value = result
+        return result
+
+    def _decode_oriented_f32(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        fast_decode: bool = False,
+        wb_override: Optional[Sequence[float]] = None,
+        unmix: bool = True,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], str]:
+        """Single-file decode tail: sensor RGB -> float32 -> EXIF orientation -> flatfield.
+
+        Stitch registration is estimated on buffers produced here, so any decode
+        the transforms are replayed against must come through here too.
+
+        `wb_override` decodes on another file's white balance. The bracket merge below
+        pins its own frames, but the *solve* reaches this method one frame at a time with
+        `hdr` cleared, so it cannot: it passes the pin in from outside.
+        """
+        linear_raw = effective_linear_raw(params.process)
+        highlight_mode = effective_highlight_reconstruction(params.process)
+        bake_wb = highlight_reconstruction_bakes_wb(params.process)
+        demosaic = params.process.demosaic_export
+        rgbcfg = params.rgbscan
+        # A bracket wins over a triplet. The UI refuses the two together, and the export
+        # decode branches in this order, so an asset carrying both must not assemble
+        # differently on the two paths.
+        is_triplet = is_rgb_triplet(rgbcfg) and not hdr_active(params.hdr)
+
+        decoded: Dict[str, np.ndarray] = {}
+        if is_triplet:
+            # Each exposure is a single narrowband channel: only one raw channel carries real
+            # signal, and a WB gain applied to it corrects nothing, since there is no scene
+            # spanning the spectrum for it to describe. Unlike the bracket merge below, which
+            # pins every frame to one WB because they share one real scene white balance to
+            # agree on, a triplet has none to agree on even if every frame's gains matched.
+            for label, path in (("green", rgbcfg.green_path), ("blue", rgbcfg.blue_path)):
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"RGB-scan {label} exposure not found: {path}")
+            siblings = [p for p in dict.fromkeys((rgbcfg.green_path, rgbcfg.blue_path)) if p != file_path]
+            with ThreadPoolExecutor(max_workers=1 + len(siblings)) as pool:
+                primary_future = pool.submit(
+                    self._decode_sensor_rgb,
+                    file_path,
+                    linear_raw,
+                    fast=fast_decode,
+                    wb_override=_NEUTRAL_WB,
+                    demosaic=demosaic,
+                    positive_decode=positive_decode(params.process),
+                    highlight_mode=highlight_mode,
+                )
+                decoded = dict(
+                    zip(
+                        siblings,
+                        pool.map(
+                            lambda p: self._decode_sensor_rgb(
+                                p,
+                                linear_raw,
+                                wb_override=_NEUTRAL_WB,
+                                demosaic=demosaic,
+                                positive_decode=positive_decode(params.process),
+                                highlight_mode=highlight_mode,
+                            )[0],
+                            siblings,
+                        ),
+                    )
+                )
+                rgb, metadata = primary_future.result()
+        else:
+            rgb, metadata = self._decode_sensor_rgb(
+                file_path,
+                linear_raw,
+                fast=fast_decode,
+                wb_override=wb_override if wb_override is not None else decode_wb(params.process),
+                demosaic=demosaic,
+                positive_decode=positive_decode(params.process),
+                highlight_mode=highlight_mode,
+                bake_camera_wb=bake_wb,
+                load_ir=params.retouch.ir_dust_remove,
+            )
+        # No embedded profile (scanner-raw linear, sensor-native RAW) means the buffer is
+        # already in the working space, so "Same as Source" exports without converting.
+        source_cs = str(metadata.get("color_space") or WORKING_COLOR_SPACE)
+        # Memoized rather than returned: several callers unpack the 3-tuple positionally,
+        # and only the export render and the bracket solve need this. None for a triplet:
+        # its as-shot camera_wb is one narrowband exposure's gain, not a scene white balance
+        # the assembled frame has, so it must never reach the capture-matrix fold downstream
+        # (see camera_to_working_matrix) — not even the primary's alone, and not a value all
+        # three exposures happened to share.
+        self._cam_xyz_by_path[file_path] = (metadata.get("cam_xyz"), None if is_triplet else metadata.get("camera_wb"))
+        ir_full = metadata.get("ir")
+
+        if is_triplet:
+            # Merged in float, as the preview merges: the align's cubic warp overshoots the
+            # sensor ceiling, and a cast of the merge back to uint16 wraps it to black.
+            def _decode(path: str) -> np.ndarray:
+                return uint16_to_float32(rgb if path == file_path else decoded[path])
+
+            f32_buffer = merge_rgb_triplet(_decode, file_path, rgbcfg.green_path, rgbcfg.blue_path, align=rgbcfg.align)
+        elif hdr_active(params.hdr):
+            # Merged straight to float32: the recovered detail sits below the reference
+            # exposure's quantization step, so a uint16 round-trip would discard it. This
+            # runs before flat-field and the sensor unmix, both applied below. The decode
+            # pins the white level (adjust_maximum_thr=0.0), so saturation is exactly 1.0
+            # and the merge's exclusion threshold means what it says. A gain map applied
+            # first moves that point and skews the weights.
+            #
+            # Every frame decodes on the reference's white balance, never its own. The
+            # transfer path already decodes neutral, but it is pinned here anyway, because
+            # a bracket whose frames sit on different white balances solves wrong ratios
+            # and reports nothing. An active reconstruction bakes the reference's real white
+            # balance in (see highlight_reconstruction_bakes_wb), so siblings pin to that too.
+            bracket_wb = metadata.get("camera_wb") if (bake_wb or not linear_raw) else None
+            # fast_decode must ride along: a half-size primary against full-size
+            # siblings is a shape mismatch, not just a slow merge.
+            hdr_siblings = [p for p in dict.fromkeys(params.hdr.hdr_paths) if p != file_path]
+            with ThreadPoolExecutor(max_workers=min(3, max(1, len(hdr_siblings)))) as pool:
+                hdr_decoded = dict(
+                    zip(
+                        hdr_siblings,
+                        pool.map(
+                            lambda p: self._decode_sensor_rgb(
+                                p,
+                                linear_raw,
+                                fast=fast_decode,
+                                wb_override=bracket_wb,
+                                demosaic=demosaic,
+                                positive_decode=positive_decode(params.process),
+                                highlight_mode=highlight_mode,
+                            )[0],
+                            hdr_siblings,
+                        ),
+                    )
+                )
+            f32_buffer = merge_bracket(
+                lambda p: rgb if p == file_path else hdr_decoded[p],
+                file_path,
+                params.hdr,
+            )
+        else:
+            f32_buffer = uint16_to_float32(rgb)
+
+        if ir_full is not None and ir_full.shape[:2] != f32_buffer.shape[:2]:
+            # Defensive: no current IR carrier half-sizes, but a mismatched plane must be
+            # rescaled or the IR bake skips it. Routed through downsample_ir, not
+            # INTER_AREA, so a sub-pixel hair keeps its dip.
+            ih, iw = f32_buffer.shape[:2]
+            ir_full = downsample_ir(ir_full, max(ih, iw), dims=(iw, ih))
+
+        orientation = metadata.get("orientation", 1)
+        f32_buffer = apply_exif_orientation(f32_buffer, orientation)
+        if metadata_lens_corrections(params):
+            f32_buffer = prepare_lens_source(f32_buffer, metadata, params.flatfield, metadata_lens_corrections(params))
+        else:
+            f32_buffer = apply_flatfield(f32_buffer, params.flatfield, orientation=orientation)
+        if unmix and not is_triplet:
+            f32_buffer = apply_sensor_correction(f32_buffer, effective_sensor_matrix(params.process), params.process.sensor_unmix)
+        if ir_full is not None:
+            ir_full = apply_exif_orientation(ir_full, orientation)
+        return f32_buffer, ir_full, source_cs
+
+    def camera_wb_for(self, file_path: str) -> Optional[Sequence[float]]:
+        """As-shot multipliers of a file this processor has already decoded, else None.
+
+        Read from the decode memo rather than re-opening the RAW. The bracket solve uses it
+        to put every frame on one file's white balance, the way `merge_bracket` does.
+        """
+        return self._cam_xyz_by_path.get(file_path, (None, None))[1]
+
+    @staticmethod
+    def _slice_half_source(
+        f32_buffer: np.ndarray,
+        ir_full: Optional[np.ndarray],
+        half: int,
+        split_x: float,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """Slice a decoded source down to one half-frame; copies so the shared
+        per-file decode cache is never mutated downstream. No-op when half == 0."""
+        if not half:
+            return f32_buffer, ir_full
+        from negpy.services.assets.half_frame import slice_half
+
+        f32_buffer = np.ascontiguousarray(
+            slice_half(f32_buffer, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis)
+        )
+        if ir_full is not None:
+            ir_full = np.ascontiguousarray(
+                slice_half(ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis)
+            )
+        return f32_buffer, ir_full
+
+    def _prepare_export_source(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        source_hash: str,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+    ) -> Tuple[np.ndarray, str, str]:
+        """Decode, slice and bake one frame for export: (f32_buffer, source color
+        space, bake token for the engine hash). Served from the handoff slot when
+        prefetched, computed under the gate otherwise."""
+        key = (file_path, source_hash, params, half, split_x, crop_rect, gutter_thickness, split_axis)
+        slot = self._prepare_slot
+        if slot is not None and slot[0] == key:
+            timing.lap("source (prefetched)")
+            return slot[1]
+        with self._prepare_gate:
+            timing.lap("wait for prefetch")
+            slot = self._prepare_slot
+            if slot is not None and slot[0] == key:
+                return slot[1]
+            return self._prepare_export_source_locked(
+                file_path, params, source_hash, half, split_x, crop_rect, gutter_thickness, split_axis
+            )
+
+    def _prepare_export_source_locked(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        source_hash: str,
+        half: int,
+        split_x: float,
+        crop_rect: Optional[tuple[float, float, float, float]],
+        gutter_thickness: float,
+        split_axis: str = "x",
+    ) -> Tuple[np.ndarray, str, str]:
+        f32_buffer, ir_full, source_cs = self._load_source_f32(file_path, params, unmix=not half)
+        timing.lap("decode/flat-field/unmix")
+        f32_buffer, ir_full = self._slice_half_source(
+            f32_buffer, ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis
+        )
+        if half:
+            f32_buffer = _unmix_source(f32_buffer, params)
+        timing.lap("half slice")
+        # Same shape as run_pipeline's base_hash, so an export of a frame previewed at full
+        # resolution with the same demosaic finds every bake already in the caches.
+        detect_key = (
+            source_hash
+            + flatfield_token(params.flatfield)
+            + lens_decode_token(metadata_lens_corrections(params), params.flatfield)
+            + rgbscan_token(params.rgbscan)
+            + stitch_token(params.stitch)
+            + hdr_token(params.hdr)
+            + linear_raw_token(params.process)
+            + highlight_reconstruction_token(params.process)
+            + highlight_reconstruction_bakes_wb_token(params.process)
+            + sensor_token(params.process)
+            + demosaic_token(params.process.demosaic_export)
+            + ir_bake_token(params.retouch, ir_full is not None)
+            + manual_bake_token(params.retouch)
+            + luma_bake_token(params.retouch)
+            + clone_token(params.retouch)
+        )
+        f32_buffer, _, _, ir_routed = self._ir_bake(f32_buffer, ir_full, params, detect_key)
+        timing.lap("IR repair")
+        orig_ret = params.retouch
+        detected, hair_masks = self._detect_luma(params, f32_buffer, detect_key)
+        timing.lap("dust detect")
+        dust_label = _dust_step_label(orig_ret)
+        f32_buffer = self._luma_bake(f32_buffer, detected, detect_key + hair_bake_token(orig_ret), dust_label)
+        timing.lap("dust repair")
+        f32_buffer, manual_routed = self._manual_bake(f32_buffer, params, detect_key)
+        timing.lap("heal")
+        extra = [m for m in (ir_routed, manual_routed) if m is not None]
+        if extra:
+            hair_masks = hair_masks + extra
+        if hair_masks:
+            f32_buffer = self._hair_inpaint(f32_buffer, hair_masks, detect_key + hair_bake_token(orig_ret), dust_label)
+        timing.lap("hair repair")
+        f32_buffer = self._clone_bake(f32_buffer, params)
+        timing.lap("clone")
+        export_token = detect_key + (hair_bake_token(orig_ret) if hair_masks else "")
+        return f32_buffer, source_cs, export_token
+
+    def prefetch_export_source(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        source_hash: str,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+    ) -> None:
+        """Prepare a source into the handoff slot ahead of its render. Failures are
+        dropped; the render's own prepare raises them where they are reported."""
+        key = (file_path, source_hash, params, half, split_x, crop_rect, gutter_thickness, split_axis)
+        slot = self._prepare_slot
+        if slot is not None and slot[0] == key:
+            return
+        try:
+            with self._prepare_gate:
+                slot = self._prepare_slot
+                if slot is not None and slot[0] == key:
+                    return
+                with timing.collect() as times:
+                    value = self._prepare_export_source_locked(
+                        file_path, params, source_hash, half, split_x, crop_rect, gutter_thickness, split_axis
+                    )
+                self._prepare_slot = (key, value)
+            logger.info("export-timing prefetch %s | %s", timing.summary(times), os.path.basename(file_path))
+        except Exception:
+            logger.exception(f"Export source prefetch failed for {file_path}")
+
+    def _render_export_buffer(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        export_settings,  # ExportConfig or ExportPreset
+        source_hash: str,
+        metrics: Optional[Dict[str, Any]] = None,
+        prefer_gpu: bool = True,
+        bounds_override: Optional[Any] = None,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+    ) -> Tuple[np.ndarray, str, Optional[Tuple[int, int, int, int]]]:
+        """Full-res render of one frame; returns the float buffer, its color space and the
+        (x, y, w, h) the picture fills inside the mat."""
+        f32_buffer, source_cs, export_token = self._prepare_export_source(
+            file_path,
+            params,
+            source_hash,
+            half=half,
+            split_x=split_x,
+            crop_rect=crop_rect,
+            gutter_thickness=gutter_thickness,
+            split_axis=split_axis,
+        )
+        # Ensure both GPU and CPU paths use the same export settings.
+        params = dc_replace(params, export=export_settings)
+        cam_xyz, camera_wb = self._cam_xyz_by_path.get(file_path, (None, None))
+        # An Input ICC supplies its own primaries rotation; the camera's own must come
+        # out as identity or the ICC's matrix at encode time corrects primaries twice.
+        # The decode still needs the white-balance fold, so cam_xyz stands in rather
+        # than nulling outright — see wb_only_cam_xyz.
+        if params.export.icc_input_path:
+            cam_xyz = wb_only_cam_xyz(cam_xyz)
+        target_cs = export_settings.export_color_space
+        if target_cs == ColorSpace.SAME_AS_SOURCE.value:
+            target_cs = source_cs
+        color_space = str(target_cs)
+
+        h_raw, w_raw = f32_buffer.shape[:2]
+        export_scale = render_scale_factor(f32_buffer.shape)
+
+        # Only hits detection for an edit never previewed (armed by copy-settings or an old
+        # sidecar); a previewed edit arrives with its rect frozen, so the export matches it.
+        params, _ = _resolve_armed_autocrop(f32_buffer, params)
+        params, _ = _resolve_meter_rect(f32_buffer, params)
+        timing.lap("auto crop/meter area")
+
+        if self._cpu_only(params):
+            prefer_gpu = False
+        # A resized export sharpens after the resize, so the radius is in exported pixels as it is
+        # in the preview's own pixels.
+        sharpen_after = self._sharpens_after_resize(params)
+        render_params = dc_replace(params, lab=dc_replace(params.lab, sharpen=0.0)) if sharpen_after else params
+
+        if prefer_gpu and self.engine_gpu:
+            # Mirrors run_pipeline's base_hash, so a multi-preset batch of one frame
+            # reuses the source upload and the meter cache.
+            export_hash = export_token + f"|res{w_raw}x{h_raw}|half{half}:{split_x}:{crop_rect}:{gutter_thickness}"
+            with timing.step("GPU"):
+                buffer, _gpu_metrics = self.engine_gpu.process(
+                    f32_buffer,
+                    render_params,
+                    scale_factor=export_scale,
+                    bounds_override=bounds_override,
+                    readback_metrics=False,
+                    cam_xyz=cam_xyz,
+                    camera_wb=camera_wb,
+                    source_hash=export_hash,
+                    analysis_source_hash=export_hash,
+                )
+            content_rect = _gpu_metrics.get("content_rect")
+        else:
+            buffer, _ = self.run_pipeline(
+                f32_buffer,
+                render_params,
+                source_hash,
+                render_size_ref=float(APP_CONFIG.preview_render_size),
+                metrics=metrics or {"log_bounds": bounds_override} if bounds_override else metrics,
+                prefer_gpu=False,
+                wants_uv_grid=False,
+                cache_stages=False,
+                skip_flatfield=True,  # f32_buffer already flat-fielded by _load_source_f32
+                cam_xyz=cam_xyz,
+                camera_wb=camera_wb,
+            )
+            buffer, content_rect = PrintService.apply_layout(
+                buffer,
+                params.export,
+                border_size=params.finish.border_size,
+                border_color=PrintService.effective_border_color(params.finish, params.toning),
+                finish=params.finish,
+            )
+            # Release full-res arrays pinned in the CPU stage cache.
+            self.engine_cpu.cache.clear()
+            timing.lap("print layout")
+
+        if sharpen_after:
+            buffer = self._sharpen_resized_content(buffer, content_rect, params)
+            timing.lap("output sharpen")
+        return buffer, color_space, content_rect
+
+    @staticmethod
+    def _sharpens_after_resize(params: WorkspaceConfig) -> bool:
+        """A Print or Pixels export with Lab Sharpening on, or any with Auto Masking, which measures
+        the whole exported image where a tiled render sees one tile. Otherwise an Original-size
+        export and a flat master sharpen in the pipeline."""
+        return (
+            params.lab.sharpen > 0.0
+            and (params.export.export_resolution_mode != ExportResolutionMode.ORIGINAL.value or params.lab.sharpen_auto_masking)
+            and not ImageProcessor._is_flat(params)
+        )
+
+    @staticmethod
+    def _sharpen_resized_content(
+        buffer: np.ndarray, content_rect: Optional[Tuple[int, int, int, int]], params: WorkspaceConfig
+    ) -> np.ndarray:
+        """The Lab Sharpening on the scaled content inside the mat, on the CPU for both engines."""
+        x, y, w, h = content_rect or (0, 0, buffer.shape[1], buffer.shape[0])
+        if not buffer.flags.writeable:
+            buffer = buffer.copy()
+        buffer[y : y + h, x : x + w] = apply_resize_sharpening(buffer[y : y + h, x : x + w], params.lab)
+        return buffer
+
+    def render_export(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        export_settings,  # ExportConfig or ExportPreset
+        source_hash: str,
+        metrics: Optional[Dict[str, Any]] = None,
+        prefer_gpu: bool = True,
+        bounds_override: Optional[Any] = None,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+        diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]] = None,
+    ) -> Tuple[Optional[np.ndarray], str]:
+        """Full-res export render; returns (float buffer, its color space) or (None, error).
+
+        ``diptych`` renders the scan's two halves with their own configs and joins them
+        back into the original geometry. Each half is sliced before the pipeline, so its
+        normalization sees the same pixels the user edited it on. ``params`` is unused
+        then — the halves own the edit.
+        """
+        with timing.collect() as times:
+            result = self._render_export(
+                file_path,
+                params,
+                export_settings,
+                source_hash,
+                metrics,
+                prefer_gpu,
+                bounds_override,
+                half,
+                split_x,
+                crop_rect,
+                gutter_thickness,
+                split_axis,
+                diptych,
+            )
+        logger.info("export-timing render %s | %s", timing.summary(times), os.path.basename(file_path))
+        return result
+
+    def render_export_view(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        export_settings,
+        source_hash: str,
+        prefer_gpu: bool = True,
+        bounds_override: Optional[Any] = None,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+        diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]] = None,
+    ) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
+        """The export render of one frame, still in the working space, and the rect its picture
+        fills inside the mat (None for a diptych). Raises on failure."""
+        if diptych is not None:
+            buffer, status = self.render_export(
+                file_path,
+                params,
+                export_settings,
+                source_hash,
+                prefer_gpu=prefer_gpu,
+                split_x=split_x,
+                crop_rect=crop_rect,
+                gutter_thickness=gutter_thickness,
+                split_axis=split_axis,
+                diptych=diptych,
+            )
+            if buffer is None:
+                raise RuntimeError(status)
+            return buffer, None
+        buffer, _, content_rect = self._render_export_buffer(
+            file_path,
+            params,
+            export_settings,
+            source_hash,
+            prefer_gpu=prefer_gpu,
+            bounds_override=bounds_override,
+            half=half,
+            split_x=split_x,
+            crop_rect=crop_rect,
+            gutter_thickness=gutter_thickness,
+            split_axis=split_axis,
+        )
+        return buffer, content_rect
+
+    def _render_export(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        export_settings,
+        source_hash: str,
+        metrics: Optional[Dict[str, Any]],
+        prefer_gpu: bool,
+        bounds_override: Optional[Any],
+        half: int,
+        split_x: float,
+        crop_rect: Optional[tuple[float, float, float, float]],
+        gutter_thickness: float,
+        split_axis: str,
+        diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]],
+    ) -> Tuple[Optional[np.ndarray], str]:
+        try:
+            if diptych is not None:
+                from negpy.services.assets.half_frame import gap_px, half_hash, join_halves
+
+                rendered = [
+                    self._render_export_buffer(
+                        file_path,
+                        cfg,
+                        export_settings,
+                        half_hash(source_hash, n),
+                        prefer_gpu=prefer_gpu,
+                        half=n,
+                        split_x=split_x,
+                        crop_rect=crop_rect,
+                        gutter_thickness=gutter_thickness,
+                        split_axis=split_axis,
+                    )
+                    for n, cfg in ((1, diptych[0]), (2, diptych[1]))
+                ]
+                (left, color_space, _), (right, _, _) = rendered
+                along = 1 if split_axis == "x" else 0
+                buffer = join_halves(left, right, gap_px(left.shape[along], right.shape[along], gutter_thickness), axis=split_axis)
+            else:
+                buffer, color_space, _ = self._render_export_buffer(
+                    file_path,
+                    params,
+                    export_settings,
+                    source_hash,
+                    metrics=metrics,
+                    prefer_gpu=prefer_gpu,
+                    bounds_override=bounds_override,
+                    half=half,
+                    split_x=split_x,
+                    crop_rect=crop_rect,
+                    gutter_thickness=gutter_thickness,
+                    split_axis=split_axis,
+                )
+            return buffer, color_space
+        except Exception as e:
+            logger.error(f"Export render failed: {e}")
+            return None, str(e)
+
+    def encode_export(
+        self,
+        buffer: np.ndarray,
+        export_settings,
+        color_space: str,
+        working_color_space: str = WORKING_COLOR_SPACE,
+        embed_plan: Optional[tuple] = None,
+        resolution: Any = _DERIVE_RESOLUTION,
+    ) -> Tuple[Optional[bytes], str]:
+        """Encode a rendered export buffer to file bytes; (bytes, format) or (None, error).
+        Touches no processor state, so it can run on the finisher thread."""
+        try:
+            return self._encode_export(
+                buffer, export_settings, color_space, working_color_space, embed_plan=embed_plan, resolution=resolution
+            )
+        except Exception as e:
+            logger.error(f"Export encode failed: {e}")
+            return None, str(e)
+
+    def process_export(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        export_settings,  # ExportConfig or ExportPreset
+        source_hash: str,
+        metrics: Optional[Dict[str, Any]] = None,
+        prefer_gpu: bool = True,
+        bounds_override: Optional[Any] = None,
+        working_color_space: str = WORKING_COLOR_SPACE,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+        diptych: Optional[Tuple[WorkspaceConfig, WorkspaceConfig]] = None,
+        embed_plan: Optional[tuple] = None,
+    ) -> Tuple[Optional[bytes], str]:
+        """Performs high-resolution export with color management.
+
+        ``embed_plan`` (from writer.export_embed_plan): TIFF/PNG embed it at the
+        first encode instead of the post-hoc rewrite.
+        """
+        buffer, color_space = self.render_export(
+            file_path,
+            params,
+            export_settings,
+            source_hash,
+            metrics=metrics,
+            prefer_gpu=prefer_gpu,
+            bounds_override=bounds_override,
+            half=half,
+            split_x=split_x,
+            crop_rect=crop_rect,
+            gutter_thickness=gutter_thickness,
+            split_axis=split_axis,
+            diptych=diptych,
+        )
+        if buffer is None:
+            return None, color_space
+        return self.encode_export(buffer, export_settings, color_space, working_color_space, embed_plan=embed_plan)
+
+    def _encode_export(
+        self,
+        buffer: np.ndarray,
+        export_settings,
+        color_space: str,
+        working_color_space: str = WORKING_COLOR_SPACE,
+        embed_plan: Optional[tuple] = None,
+        resolution: Any = _DERIVE_RESOLUTION,
+    ) -> Tuple[bytes, str]:
+        """Encodes a processed float buffer to the target format's file bytes.
+
+        Input ICC overrides the source, output ICC the destination; both are always
+        applied so the file matches the preview.
+        """
+        fmt = export_settings.export_fmt
+        icc_input = export_settings.icc_input_path
+        icc_output = export_settings.icc_output_path
+        if resolution is _DERIVE_RESOLUTION:
+            resolution = Resolution.from_dpi(PrintService.resolution_tag_dpi(export_settings))
+
+        # A target with no ICC profile (ACES/XYZ, or a stale custom name) can be neither
+        # converted to nor tagged, so the file would carry untagged working-space pixels.
+        # Export the working space itself, tagged. An output override is exempt: it
+        # supplies its own destination.
+        if ColorSpaceRegistry.get_icc_path(color_space) is None and not (icc_output and os.path.exists(icc_output)):
+            logger.warning(f"No ICC profile available for '{color_space}'; exporting as {working_color_space} instead")
+            color_space = working_color_space
+
+        is_greyscale = color_space == ColorSpace.GREYSCALE.value
+
+        buffer, bypassed = self._try_matrix_bypass(buffer, icc_input)
+        if bypassed:
+            icc_input = None
+
+        # JPEG and WebP have no higher depth, so the setting cannot reach them.
+        depth = 8 if fmt in (ExportFormat.JPEG, ExportFormat.WEBP) else int(export_settings.export_bit_depth)
+        img_out, icc_bytes = self._export_pixels(buffer, depth, is_greyscale, working_color_space, color_space, icc_output, icc_input)
+        exif_bytes, xmp_bytes = (embed_plan[0], embed_plan[1]) if embed_plan is not None else (None, None)
+
+        if fmt == ExportFormat.TIFF:
+            from negpy.features.metadata.writer import attach_exif_ifd, tiff_metadata_kwargs
+
+            meta_kwargs = {}
+            if embed_plan is not None:
+                plan_exif, plan_xmp, fold = embed_plan
+                meta_kwargs = tiff_metadata_kwargs(plan_exif, plan_xmp, fold_user_comment=fold)
+            tiff_bytes = encode_tiff(
+                img_out,
+                icc=icc_bytes,
+                resolution=_tiff_resolution(resolution, export_settings),
+                compression=export_settings.tiff_compression,
+                **meta_kwargs,
+            )
+            if exif_bytes:
+                tiff_bytes = attach_exif_ifd(tiff_bytes, exif_bytes)
+            return tiff_bytes, "tiff"
+        elif fmt == ExportFormat.PNG:
+            return (
+                encode_png(
+                    img_out,
+                    icc=icc_bytes,
+                    resolution=resolution,
+                    level=export_settings.png_compress_level,
+                    exif=exif_bytes,
+                    xmp=xmp_bytes,
+                ),
+                "png",
+            )
+        elif fmt == ExportFormat.JXL:
+            tag = _JXL_COLOR.get(color_space)
+            if tag is None:
+                raise ValueError(
+                    f"JPEG XL export does not support the {color_space} color space. "
+                    "Use sRGB, P3 D65, Rec 2020, or Greyscale, or pick another format."
+                )
+            photometric, primaries, transfer = tag
+            return (
+                encode_jxl(
+                    img_out,
+                    photometric=photometric,
+                    primaries=primaries,
+                    transfer=transfer,
+                    lossless=export_settings.jxl_lossless,
+                    distance=export_settings.jxl_distance,
+                    effort=export_settings.jxl_effort,
+                ),
+                "jxl",
+            )
+        elif fmt == ExportFormat.WEBP:
+            return (
+                encode_webp(
+                    img_out,
+                    icc=icc_bytes,
+                    lossless=export_settings.webp_lossless,
+                    quality=export_settings.webp_quality,
+                    method=export_settings.webp_method,
+                ),
+                "webp",
+            )
+        else:
+            return (
+                encode_jpeg(
+                    img_out,
+                    icc=icc_bytes,
+                    resolution=resolution,
+                    quality=export_settings.jpeg_quality,
+                    progressive=export_settings.jpeg_progressive,
+                ),
+                "jpg",
+            )
+
+    def _export_pixels(
+        self,
+        buffer: np.ndarray,
+        depth: int,
+        is_greyscale: bool,
+        working_color_space: str,
+        color_space: str,
+        icc_output: Optional[str],
+        icc_input: Optional[str],
+    ) -> Tuple[np.ndarray, Optional[bytes]]:
+        """Quantise a float buffer to *depth* and color-manage it to the target space.
+
+        Greyscale never goes through the RGB lcms transform: lcms refuses a
+        1-channel image against an RGB working profile, so both grey paths use the
+        synthetic re-encode instead.
+        """
+        if depth == 16:
+            if is_greyscale:
+                img_int = float_to_uint_luma(np.ascontiguousarray(buffer), bit_depth=16)
+                return self._apply_color_management_u16_greyscale(img_int, working_color_space, color_space, icc_output, icc_input)
+            return self._apply_color_management_u16(float_to_uint16(buffer), working_color_space, color_space, icc_output, icc_input)
+        if is_greyscale:
+            return self._greyscale_to_u8(buffer, working_color_space, color_space, icc_output, icc_input)
+        if not self._has_custom_icc(icc_input, icc_output) and working_color_space == color_space:
+            return float_to_uint8(buffer), self._get_target_icc_bytes(color_space, None)
+        # Convert at 16 bits and round to 8 once: near the destination gamut edge, one 8-bit
+        # source step moves a near-zero destination channel by many codes. The 8-bit PIL
+        # transform is the fallback when the CMS codec cannot load or refuses the profiles.
+        src_bytes = self._get_target_icc_bytes(working_color_space, icc_input)
+        dst_bytes = self._get_target_icc_bytes(color_space, icc_output)
+        if src_bytes and dst_bytes:
+            img16 = float_to_uint16(buffer)
+            out16 = apply_matrix_trc_u16(img16, src_bytes, dst_bytes)
+            if out16 is None:
+                try:
+                    out16 = _cms_transform_strips(np.ascontiguousarray(img16), src_bytes, dst_bytes)
+                except ImportError as e:
+                    self._log_cms_codec_dlopen_error()
+                    logger.warning(f"imagecodecs CMS codec unavailable on this build ({e}); using the 8-bit transform")
+                except Exception as e:
+                    logger.warning(f"16-bit CMS transform failed ({e}); using the 8-bit transform")
+            if out16 is not None:
+                return negpy_core.lut_u16(out16, _u16_to_u8_lut()), dst_bytes
+        return self.apply_color_management(float_to_uint8(buffer), working_color_space, color_space, icc_output, icc_input)
+
+    def _shrunk_source(self, file_path: str, params: WorkspaceConfig, target_long_px: int, fast_decode: bool,
+                       keep_small: bool, half: int = 0, split_x: float = 0.5, crop_rect=None,
+                       gutter_thickness: float = 0.0, split_axis: str = "x") -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """The decode shrunk to target_long_px (with its IR plane), from the shared cache when kept there."""
+        small_key = None
+        if keep_small:
+            fast = fast_decode and not (is_rgb_triplet(params.rgbscan) or stitch_has_triplets(params.stitch))
+            small_key = (self._source_key(file_path, params, fast, not half), half, split_x, crop_rect,
+                         gutter_thickness, split_axis, target_long_px)
+        small = _small_sources.get(small_key) if small_key is not None else None
+        if small is not None:
+            return small
+        f32_buffer, ir_full, _ = self._load_source_f32(file_path, params, fast_decode=fast_decode, unmix=not half)
+        f32_buffer, ir_full = self._slice_half_source(
+            f32_buffer, ir_full, half, split_x, crop_rect=crop_rect, gutter_thickness=gutter_thickness, split_axis=split_axis
+        )
+        if half:
+            f32_buffer = _unmix_source(f32_buffer, params)
+        # Proof scale: everything downstream only needs target_long_px. The cached source buffer is
+        # shared, so resize (never mutate) it.
+        f32_buffer = _downsample_to_long_edge(f32_buffer, target_long_px)
+        if ir_full is not None and ir_full.shape[:2] != f32_buffer.shape[:2]:
+            th, tw = f32_buffer.shape[:2]
+            ir_full = negpy_core.resize_area(np.ascontiguousarray(ir_full, dtype=np.float32), (tw, th))
+        if small_key is not None:
+            _small_sources.put(small_key, (f32_buffer, ir_full))
+        return f32_buffer, ir_full
+
+    def prefetch_display_source(self, file_path: str, params: WorkspaceConfig, target_long_px: int,
+                                fast_decode: bool = True) -> None:
+        """Decode and shrink a scan into the shared cache without rendering it: the next
+        render_display_array(keep_small=True) of it at that size starts from there."""
+        try:
+            self._shrunk_source(file_path, params, target_long_px, fast_decode, True)
+        finally:
+            self._source_cache_key = self._source_cache_value = None
+            self._precorrect_key = self._precorrect_value = None
+
+    def render_display_array(
+        self,
+        file_path: str,
+        params: WorkspaceConfig,
+        source_hash: str,
+        target_long_px: int,
+        prefer_gpu: bool = True,
+        working_color_space: str = WORKING_COLOR_SPACE,
+        fast_decode: bool = False,
+        half: int = 0,
+        split_x: float = 0.5,
+        crop_rect: Optional[tuple[float, float, float, float]] = None,
+        gutter_thickness: float = 0.0,
+        split_axis: str = "x",
+        keep_source: bool = False,
+        keep_small: bool = False,
+    ) -> Optional[np.ndarray]:
+        """Render a file (with its edits) to a small sRGB uint8 RGB array for tiling.
+        `keep_small` keeps the decode, shrunk to target_long_px, in a cache shared by every processor:
+        the next render of that file at that size skips decoding (thumbnails redrawn after an edit).
+
+        Mirrors the export render path but at small resolution and in display space,
+        so a contact-sheet tile matches the on-canvas look. Returns None on failure.
+
+        The source is shrunk to target_long_px *before* the pipeline runs, and the
+        paper layout is bounded to the same size. Rendering the full-res source and
+        discarding all but a tile cost ~3.5GB peak RSS (CPU) / ~8GB commit (GPU) per
+        24MP frame, so a large roll exhausted memory and tiles were silently dropped.
+        """
+        try:
+            from negpy.infrastructure.display.color_mgmt import apply_display_transform
+
+            f32_buffer, ir_full = self._shrunk_source(file_path, params, target_long_px, fast_decode, keep_small,
+                                                      half, split_x, crop_rect, gutter_thickness, split_axis)
+            # Keep the decode only for the other half of the same scan, rendered next; else it pins memory across the next decode.
+            if not keep_source:
+                self._source_cache_key = None
+                self._source_cache_value = None
+                self._precorrect_key = None
+                self._precorrect_value = None
+
+            # A Print/Target-px export setting sizes the paper from print_size x DPI, which
+            # re-inflates the tile to full print resolution right after the downsample. Bound
+            # it with the virtual-DPI trick PrintService.preview_paper_layout uses, so
+            # borders stay proportional.
+            if params.export.export_resolution_mode != ExportResolutionMode.ORIGINAL.value:
+                virtual_dpi = max(1, int((target_long_px * 2.54) / max(0.1, params.export.export_print_size)))
+                params = dc_replace(
+                    params,
+                    export=dc_replace(
+                        params.export,
+                        export_resolution_mode=ExportResolutionMode.PRINT.value,
+                        export_dpi=virtual_dpi,
+                    ),
+                )
+
+
+            detect_key = (
+                source_hash
+                + flatfield_token(params.flatfield)
+                + lens_decode_token(metadata_lens_corrections(params), params.flatfield)
+                + rgbscan_token(params.rgbscan)
+                + stitch_token(params.stitch)
+                + hdr_token(params.hdr)
+                + linear_raw_token(params.process)
+                + highlight_reconstruction_token(params.process)
+                + highlight_reconstruction_bakes_wb_token(params.process)
+                + sensor_token(params.process)
+                + ir_bake_token(params.retouch, ir_full is not None)
+                + manual_bake_token(params.retouch)
+                + luma_bake_token(params.retouch)
+                + clone_token(params.retouch)
+            )
+            f32_buffer, _, _, ir_routed = self._ir_bake(f32_buffer, ir_full, params, detect_key)
+            orig_ret = params.retouch
+            detected, hair_masks = self._detect_luma(params, f32_buffer, detect_key)
+            f32_buffer = self._luma_bake(f32_buffer, detected, detect_key + hair_bake_token(orig_ret))
+            f32_buffer, manual_routed = self._manual_bake(f32_buffer, params, detect_key)
+            extra = [m for m in (ir_routed, manual_routed) if m is not None]
+            if extra:
+                hair_masks = hair_masks + extra
+            if hair_masks:
+                f32_buffer = self._hair_inpaint(f32_buffer, hair_masks, detect_key + hair_bake_token(orig_ret))
+            f32_buffer = self._clone_bake(f32_buffer, params)
+
+            params, _ = _resolve_armed_autocrop(f32_buffer, params)
+            params, _ = _resolve_meter_rect(f32_buffer, params)
+
+            if self._cpu_only(params):
+                prefer_gpu = False
+
+            if prefer_gpu and self.engine_gpu:
+                # Keyed by every bake and the buffer's size, so a slider drag reuses the uploaded
+                # source and the film's measurement and re-runs only the stages it changes.
+                gpu_key = f"{detect_key}{hair_bake_token(orig_ret)}|{f32_buffer.shape[0]}x{f32_buffer.shape[1]}"
+                buffer, _ = self.engine_gpu.process(
+                    f32_buffer,
+                    params,
+                    # the unit of the pixel settings, as run_pipeline sets it for both engines
+                    scale_factor=render_scale_factor(f32_buffer.shape),
+                    readback_metrics=False,
+                    source_hash=gpu_key,
+                    analysis_source_hash=gpu_key,
+                    cam_xyz=self._cam_xyz_by_path.get(file_path, (None, None))[0],
+                    camera_wb=self._cam_xyz_by_path.get(file_path, (None, None))[1],
+                )
+            else:
+                buffer, _ = self.run_pipeline(
+                    f32_buffer,
+                    params,
+                    source_hash,
+                    render_size_ref=float(target_long_px),
+                    prefer_gpu=False,
+                    wants_uv_grid=False,
+                    readback_metrics=False,
+                    skip_flatfield=True,  # f32_buffer already flat-fielded by _load_source_f32
+                    cam_xyz=self._cam_xyz_by_path.get(file_path, (None, None))[0],
+                    camera_wb=self._cam_xyz_by_path.get(file_path, (None, None))[1],
+                )
+                buffer = self._apply_scaling_and_border_f32(buffer, params, params.export)
+                self.engine_cpu.cache.clear()
+
+            if isinstance(buffer, np.ndarray) and buffer.ndim == 3 and buffer.shape[2] == 4:
+                buffer = buffer[:, :, :3]
+            buffer = apply_display_transform(buffer, working_color_space)
+            # Downsample after the display transform, where the sheet compositor resamples,
+            # so the tile looks identical but smaller.
+            buffer = _downsample_to_long_edge(buffer, target_long_px)
+            return float_to_uint8(buffer)
+        except Exception as e:
+            logger.error(f"Contact-sheet tile render failed for {file_path}: {e}")
+            return None
+
+    def _apply_scaling_and_border_f32(self, img: np.ndarray, params: WorkspaceConfig, export_settings: ExportConfig) -> np.ndarray:
+        """CPU fallback for layout application."""
+        result, _ = PrintService.apply_layout(
+            img,
+            export_settings,
+            border_size=params.finish.border_size,
+            border_color=PrintService.effective_border_color(params.finish, params.toning),
+            finish=params.finish,
+        )
+        return result
+
+    def _get_target_icc_bytes(self, color_space: str, icc_path: Optional[str]) -> Optional[bytes]:
+        """Loads ICC profile data for embedding (custom output profile or target space)."""
+        if icc_path and os.path.exists(icc_path):
+            return _read_icc_bytes(icc_path)
+        path = ColorSpaceRegistry.get_icc_path(color_space)
+        if path and os.path.exists(path):
+            return _read_icc_bytes(path)
+        return None
+
+    @staticmethod
+    def _try_matrix_bypass(buffer: np.ndarray, input_icc_path: Optional[str]) -> Tuple[np.ndarray, bool]:
+        """Apply a primaries-only transform if the input ICC is a matrix/TRC profile.
+
+        Returns (transformed_buffer, True) when the bypass fired, so the caller
+        can clear icc_input and let the normal working→output CMS path run.
+        Returns (buffer, False) unchanged for LUT-based profiles.
+        """
+        if not input_icc_path or not os.path.exists(input_icc_path):
+            return buffer, False
+        try:
+            with open(input_icc_path, "rb") as f:
+                icc_data = f.read()
+            from negpy.infrastructure.display.icc_profile import (
+                extract_primaries_matrix,
+                is_matrix_trc_profile,
+            )
+
+            if not is_matrix_trc_profile(icc_data):
+                return buffer, False
+            src_to_xyz = extract_primaries_matrix(icc_data)
+            if src_to_xyz is None:
+                return buffer, False
+            from negpy.kernel.image.logic import apply_primaries_transform
+
+            return apply_primaries_transform(buffer, src_to_xyz), True
+        except Exception as e:
+            logger.warning("Matrix-TRC bypass failed, falling back to full CMS: %s", e)
+            return buffer, False
+
+    @staticmethod
+    def _has_custom_icc(input_icc_path: Optional[str], output_icc_path: Optional[str]) -> bool:
+        """True when an input or output ICC override file is present."""
+        return bool((input_icc_path and os.path.exists(input_icc_path)) or (output_icc_path and os.path.exists(output_icc_path)))
+
+    @staticmethod
+    def _resolve_src_profile(working_color_space: str, input_icc_path: Optional[str]) -> Any:
+        """Source profile: input ICC override if present, else the working space."""
+        if input_icc_path and os.path.exists(input_icc_path):
+            return ImageCms.getOpenProfile(input_icc_path)
+        path_src = ColorSpaceRegistry.get_icc_path(working_color_space)
+        return ImageCms.getOpenProfile(path_src) if path_src and os.path.exists(path_src) else ImageCms.createProfile("sRGB")
+
+    @staticmethod
+    def _resolve_dst_profile(color_space: str, output_icc_path: Optional[str]) -> Any:
+        """Destination profile: output ICC override if present, else the target space (or None)."""
+        if output_icc_path and os.path.exists(output_icc_path):
+            return ImageCms.getOpenProfile(output_icc_path)
+        path_dst = ColorSpaceRegistry.get_icc_path(color_space)
+        return ImageCms.getOpenProfile(path_dst) if path_dst and os.path.exists(path_dst) else None
+
+    @staticmethod
+    def _is_print_profile(profile: Any) -> bool:
+        """True for a paper/printer output profile (gets a paper-white soft proof)."""
+        device_class = (getattr(profile.profile, "device_class", "") or "").strip()
+        color_space = (getattr(profile.profile, "xcolor_space", "") or "").strip()
+        return device_class == "prtr" or color_space == "CMYK"
+
+    def _apply_color_management_u16_rgb(
+        self,
+        img_u16: np.ndarray,
+        working_color_space: str,
+        color_space: str,
+        output_icc_path: Optional[str],
+        input_icc_path: Optional[str] = None,
+        lut_size: int = DEFAULT_LUT_SIZE,
+    ) -> Tuple[np.ndarray, Optional[bytes]]:
+        """ICC RGB transform for 16-bit arrays (PIL has no 16-bit RGB mode).
+
+        Source is the input override or the working space; destination is the output
+        override or the target space. One src→dst transform, so the embedded profile
+        matches the pixels.
+
+        Trilinear LUT approximation, not the exact per-pixel evaluation
+        _apply_color_management_u16 gets from lcms2 via imagecodecs — this is the
+        fallback for when that codec is unavailable (see its docstring), so accuracy
+        trades off against not depending on it. ``lut_size`` lets an export ask for a
+        finer grid than the interactive display LUT needs.
+        """
+        has_custom = self._has_custom_icc(input_icc_path, output_icc_path)
+        if not has_custom and working_color_space == color_space:
+            return img_u16, self._get_target_icc_bytes(color_space, None)
+        try:
+            p_src = self._resolve_src_profile(working_color_space, input_icc_path)
+            p_dst = self._resolve_dst_profile(color_space, output_icc_path)
+            if p_dst is None:
+                return img_u16, self._get_target_icc_bytes(color_space, None)
+            result = apply_icc_u16_rgb(
+                img_u16,
+                p_src,
+                p_dst,
+                ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                ImageCms.Flags.BLACKPOINTCOMPENSATION,
+                size=lut_size,
+            )
+            return result, self._get_target_icc_bytes(color_space, output_icc_path)
+        except Exception as e:
+            logger.error(f"CMS transformation failed: {e}")
+            return img_u16, self._get_target_icc_bytes(working_color_space, input_icc_path)
+
+    def _apply_color_management_u16_greyscale(
+        self,
+        img_u16: np.ndarray,
+        working_color_space: str,
+        color_space: str,
+        output_icc_path: Optional[str],
+        input_icc_path: Optional[str] = None,
+    ) -> Tuple[np.ndarray, Optional[bytes]]:
+        """Re-encode a (H,W) uint16 luma buffer to the tagged grey profile's TRC.
+
+        The buffer is luma in the working TRC. The bundled GrayGamma2.2.icc actually
+        carries the sRGB TRC despite its name (verified against the profile; see the
+        _JXL_COLOR note), and JXL tags greyscale as SRGB transfer — so encode with the
+        sRGB OETF, not a pure 2.2 power, or the pixels won't match their own tag in
+        the shadows. An RGB working profile can't drive a 1-channel ICC transform,
+        hence this synthetic re-encode instead of lcms.
+        """
+        if working_color_space == color_space:
+            return img_u16, self._get_target_icc_bytes(color_space, output_icc_path)
+        out = negpy_core.lut_u16(np.ascontiguousarray(img_u16), _grey_reencode_lut(working_color_space, 16))
+        return out, self._get_target_icc_bytes(color_space, output_icc_path)
+
+    def _greyscale_to_u8(
+        self,
+        buffer: np.ndarray,
+        working_color_space: str,
+        color_space: str,
+        output_icc_path: Optional[str],
+        input_icc_path: Optional[str] = None,
+    ) -> Tuple[np.ndarray, Optional[bytes]]:
+        """Greyscale buffer -> color-managed 8-bit luma for JPEG/WebP.
+
+        Runs the 16-bit grey re-encode first so the 8-bit result carries the same
+        TRC (and profile bytes) as the greyscale TIFF/PNG of the same edit.
+        """
+        img16 = float_to_uint_luma(np.ascontiguousarray(buffer), bit_depth=16)
+        icc_bytes = self._get_target_icc_bytes(color_space, output_icc_path)
+        if working_color_space == color_space:
+            return negpy_core.lut_u16(img16, _grey_reencode_lut(None, 8)), icc_bytes
+        return negpy_core.lut_u16(img16, _grey_reencode_lut(working_color_space, 8)), icc_bytes
+
+    def _apply_color_management_u16(
+        self,
+        img_u16: np.ndarray,
+        working_color_space: str,
+        color_space: str,
+        output_icc_path: Optional[str],
+        input_icc_path: Optional[str] = None,
+    ) -> Tuple[np.ndarray, Optional[bytes]]:
+        """ICC RGB transform for 16-bit arrays using lcms2 via imagecodecs.
+
+        PIL has no 16-bit RGB mode so we use imagecodecs.cms_transform
+        (already a dependency for JXL) which evaluates lcms2 at full
+        16-bit precision on numpy arrays directly.
+
+        cms_transform's underlying dlopen can fail (see
+        LIBLCMS2_DYLIB_COLLISION.md for one real cause); imagecodecs' lazy
+        resolver only surfaces that as a generic ImportError, discarding the
+        real reason. Fall back to the LUT-based transform rather than
+        silently export unmanaged pixels.
+        """
+        has_custom = self._has_custom_icc(input_icc_path, output_icc_path)
+        if not has_custom and working_color_space == color_space:
+            return img_u16, self._get_target_icc_bytes(color_space, None)
+
+        try:
+            src_bytes = self._get_target_icc_bytes(working_color_space, input_icc_path)
+            dst_bytes = self._get_target_icc_bytes(color_space, output_icc_path)
+            if src_bytes is None or dst_bytes is None:
+                logger.warning("CMS skipped: ICC profile not found")
+                return img_u16, self._get_target_icc_bytes(color_space, output_icc_path)
+
+            # Matrix/TRC pairs take the exact kernel: lcms resamples a 16-bit transform to a
+            # grid, which drifts near the destination gamut edge. LUT profiles keep lcms.
+            if img_u16.ndim == 3:
+                fast = apply_matrix_trc_u16(img_u16, src_bytes, dst_bytes)
+                if fast is not None:
+                    return fast, dst_bytes
+
+            try:
+                result = _cms_transform_strips(np.ascontiguousarray(img_u16), src_bytes, dst_bytes)
+            except ImportError as e:
+                self._log_cms_codec_dlopen_error()
+                logger.warning(
+                    f"imagecodecs CMS codec unavailable on this build ({e}); falling back to the LUT-based ICC transform for this export"
+                )
+                return self._apply_color_management_u16_rgb(
+                    img_u16,
+                    working_color_space,
+                    color_space,
+                    output_icc_path,
+                    input_icc_path,
+                    lut_size=PROOF_LUT_SIZE,
+                )
+            # imagecodecs outputs uint16 [0,65535] directly
+            return result, self._get_target_icc_bytes(color_space, output_icc_path)
+        except Exception as e:
+            logger.error(f"CMS transformation failed: {e}")
+            # The pixels never left the working space, so tag them with it. Untagged,
+            # a 16-bit export reads as sRGB in every viewer.
+            return img_u16, self._get_target_icc_bytes(working_color_space, input_icc_path)
+
+    @staticmethod
+    def _log_cms_codec_dlopen_error() -> None:
+        """Log the real dlopen error behind a cms_transform ImportError, if any.
+
+        Best-effort diagnostic only, never raises: reproduces imagecodecs'
+        lazy import via ctypes.CDLL, which does not discard the OSError.
+        """
+        try:
+            codec_path = os.path.join(os.path.dirname(imagecodecs.__file__), "_cms.abi3.so")
+            ctypes.CDLL(codec_path)
+        except OSError as dlopen_error:
+            logger.warning(f"underlying dlopen error for imagecodecs' CMS codec: {dlopen_error}")
+        except Exception:
+            pass
+
+    def apply_color_management(
+        self,
+        img: np.ndarray,
+        working_color_space: str,
+        color_space: str,
+        output_icc_path: Optional[str],
+        input_icc_path: Optional[str] = None,
+    ) -> Tuple[np.ndarray, Optional[bytes]]:
+        """ICC transform of a uint8 HxWx3 or HxW export buffer. Source is the input override or
+        working space; destination is the output override or target space."""
+        has_custom = self._has_custom_icc(input_icc_path, output_icc_path)
+        if not has_custom and working_color_space == color_space:
+            return img, self._get_target_icc_bytes(color_space, None)
+
+        try:
+            p_src = self._resolve_src_profile(working_color_space, input_icc_path)
+            p_dst = self._resolve_dst_profile(color_space, output_icc_path)
+            if p_dst is None:
+                return img, self._get_target_icc_bytes(color_space, None)
+
+            if img.ndim == 3:
+                # Matrix/TRC pairs take the parallel kernel; LUT profiles (printer
+                # ICCs) return None and fall through to exact lcms.
+                src_bytes = self._get_target_icc_bytes(working_color_space, input_icc_path)
+                dst_bytes = self._get_target_icc_bytes(color_space, output_icc_path)
+                if src_bytes and dst_bytes:
+                    fast = apply_matrix_trc_u8(img, src_bytes, dst_bytes)
+                    if fast is not None:
+                        return fast, dst_bytes
+
+            pil_img = Image.fromarray(img)
+            result_pil = ImageCms.profileToProfile(
+                pil_img,
+                p_src,
+                p_dst,
+                renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                outputMode="RGB" if pil_img.mode != "L" else "L",
+                flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+            )
+            out = np.asarray(result_pil) if result_pil else img
+            return out, self._get_target_icc_bytes(color_space, output_icc_path)
+        except Exception as e:
+            logger.error(f"CMS transformation failed: {e}")
+            # The pixels never left the working space, so tag them with it (a CMYK or Gray
+            # profile cannot take RGB pixels). Untagged, the export reads as sRGB.
+            return img, self._get_target_icc_bytes(working_color_space, input_icc_path)
+
+    @staticmethod
+    def soft_proof_preview(
+        pil_img: Image.Image,
+        working_color_space: str,
+        input_icc_path: Optional[str],
+        output_icc_path: Optional[str],
+        monitor_icc_bytes: Optional[bytes] = None,
+        intent: str = ProofIntent.RELATIVE_COLORIMETRIC.value,
+        black_point: bool = True,
+        paper_white: bool = True,
+        ink_black: bool = False,
+    ) -> Image.Image:
+        """Soft-proof the preview into display space.
+
+        For a paper/printer output profile, simulate the print on screen via a proof
+        transform. For an export color space, do a gamut-only proof (relative colorimetric
+        + BPC) ending at the display. ``display`` is the monitor profile when detected
+        (``monitor_icc_bytes``), else sRGB. The output always lands in display space —
+        otherwise it would leak output-space numbers to the screen and shift per output
+        space (issue #243). The caller shows the result raw (no further display transform).
+
+        The four proof settings shape the print branch only. ``paper_white`` is the
+        absolute proof intent, which puts the paper's own tint and its lifted black on
+        screen; ``ink_black`` drops black-point compensation so the paper's real D-max
+        shows instead of being mapped onto display black. Both simulate the print's limits,
+        so both make the picture look worse and read truer.
+        """
+        try:
+            from negpy.infrastructure.display.color_mgmt import open_profile_from_bytes
+
+            # littleCMS needs RGB against the RGB working/output profiles.
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            buf_f32 = np.asarray(pil_img, dtype=np.float32) / 255.0
+            buf_f32, bypassed = ImageProcessor._try_matrix_bypass(buf_f32, input_icc_path)
+            if bypassed:
+                pil_img = Image.fromarray(np.clip(buf_f32 * 255.0 + 0.5, 0, 255).astype(np.uint8))
+                input_icc_path = None
+            p_src = ImageProcessor._resolve_src_profile(working_color_space, input_icc_path)
+            # Custom output profile, or the working space when only an input is set.
+            p_dst = ImageProcessor._resolve_dst_profile(working_color_space, output_icc_path)
+            if p_dst is None:
+                return pil_img
+            # Display the proof lands on: the monitor profile when detected, else sRGB.
+            p_display = open_profile_from_bytes(monitor_icc_bytes) if monitor_icc_bytes else ImageCms.createProfile("sRGB")
+
+            if ImageProcessor._is_print_profile(p_dst):
+                # Paper/printer profile: simulate the print on screen through a proof
+                # transform. Relative-colorimetric source to paper, then
+                # absolute-colorimetric paper to display, so paper white and Dmax show.
+                # Handles RGB and CMYK paper profiles.
+                flags = ImageCms.Flags.SOFTPROOFING
+                if black_point and not ink_black:
+                    flags |= ImageCms.Flags.BLACKPOINTCOMPENSATION
+                proof = ImageCms.buildProofTransform(
+                    p_src,
+                    p_display,
+                    p_dst,
+                    "RGB",
+                    "RGB",
+                    renderingIntent=_PROOF_INTENTS.get(intent, ImageCms.Intent.RELATIVE_COLORIMETRIC),
+                    proofRenderingIntent=(ImageCms.Intent.ABSOLUTE_COLORIMETRIC if paper_white else ImageCms.Intent.RELATIVE_COLORIMETRIC),
+                    flags=flags,
+                )
+                result = ImageCms.applyTransform(pil_img, proof)
+                return result if result is not None else pil_img
+
+            # Export color space or display-class profile: gamut-only proof. GRAY
+            # destinations need an "L" intermediate.
+            dst_space = (getattr(p_dst.profile, "xcolor_space", "RGB ") or "RGB ").strip()
+            out_mode = "L" if dst_space == "GRAY" else "RGB"
+            result = ImageCms.profileToProfile(
+                pil_img,
+                p_src,
+                p_dst,
+                renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                outputMode=out_mode,
+                flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+            )
+            if result is None:
+                return pil_img
+            # Output-to-display transform, always, or the proof leaks output-space numbers to the screen. A GRAY result goes
+            # through it from "L" (its TRC fits only an sRGB-TRC display); a display profile lcms cannot target keeps the output-space result.
+            try:
+                proofed = ImageCms.profileToProfile(
+                    result,
+                    p_dst,
+                    p_display,
+                    renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                    outputMode="RGB",
+                    flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+                )
+            except Exception as e:
+                logger.warning(f"Soft-proof display transform failed, showing the output-space proof: {e}")
+                proofed = None
+            if proofed is not None:
+                result = proofed
+            return result if result.mode == "RGB" else result.convert("RGB")
+        except Exception as e:
+            logger.error(f"Soft-proof preview failed: {e}")
+            return pil_img
+
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def soft_proof_lut(
+        working_color_space: str,
+        input_icc_path: Optional[str],
+        output_icc_path: Optional[str],
+        monitor_icc_bytes: Optional[bytes] = None,
+        size: int = PROOF_LUT_SIZE,
+        intent: str = ProofIntent.RELATIVE_COLORIMETRIC.value,
+        black_point: bool = True,
+        paper_white: bool = True,
+        ink_black: bool = False,
+        gamut_warning: bool = False,
+    ) -> Optional[np.ndarray]:
+        """``soft_proof_preview`` baked into an (N,N,N,3) LUT, for the preview only.
+
+        Built by pushing the identity grid through ``soft_proof_preview`` itself, so
+        the print-profile / export-space / GRAY branches cannot drift from it. Export
+        keeps the exact per-pixel transform.
+
+        This is why a proof control is cheap: the transform runs once per condition over
+        ``size**3`` nodes and the result is a texture the canvas samples, so no part of it
+        is per-frame or per-pixel work.
+        """
+        try:
+            axis = np.linspace(0, 255, size).round().astype(np.uint8)
+            r, g, b = np.meshgrid(axis, axis, axis, indexing="ij")
+            grid = np.ascontiguousarray(np.stack((r, g, b), axis=-1)).reshape(size, size * size, 3)
+            proofed = ImageProcessor.soft_proof_preview(
+                Image.fromarray(grid, mode="RGB"),
+                working_color_space,
+                input_icc_path,
+                output_icc_path,
+                monitor_icc_bytes,
+                intent=intent,
+                black_point=black_point,
+                paper_white=paper_white,
+                ink_black=ink_black,
+            )
+            lut = np.asarray(proofed, dtype=np.float32).reshape(size, size, size, 3) / 255.0
+            if gamut_warning:
+                # The warning is painted into the LUT the canvas already samples, so it
+                # needs no shader and cannot diverge between the GPU and CPU display paths.
+                # The sampler is trilinear, so the mark fades out over about one grid cell
+                # rather than stopping at a hard edge.
+                out = ImageProcessor.gamut_lut(working_color_space, input_icc_path, output_icc_path, size=size)
+                if out is not None and out.shape == lut.shape[:3]:
+                    lut = lut.copy()
+                    lut[out] = GAMUT_WARNING_COLOR
+            return np.ascontiguousarray(lut)
+        except Exception as e:
+            logger.warning("Soft-proof LUT build failed, falling back to the per-pixel transform", exc_info=e)
+            return None
+
+    @staticmethod
+    def gamut_lut(
+        working_color_space: str,
+        input_icc_path: Optional[str],
+        output_icc_path: Optional[str],
+        size: int = COLOR_HIST_BINS,
+    ) -> Optional[np.ndarray]:
+        """(N, N, N) boolean grid: True where the output profile cannot print that color.
+
+        Round-trips the identity grid source -> output -> source, relative colorimetric
+        with no black-point compensation. An in-gamut color returns where it started; one
+        clipped to the gamut surface on the way out cannot. Pillow exposes no alarm-code
+        API for lcms's own gamut flag, so the displacement is the test.
+
+        Grid centres, not corners: a corner node sits on the boundary, where the round trip
+        is a coin toss. A GRAY destination returns None, since every chromatic color fails
+        a mono profile and that is not the question being asked.
+        """
+        try:
+            if not (output_icc_path and os.path.exists(output_icc_path)):
+                # Without an output profile the destination falls back to the working space,
+                # an identity that nothing can be outside of. That is not an answer, it is
+                # the absence of a question.
+                return None
+            p_work = ImageProcessor._resolve_src_profile(working_color_space, None)
+            p_src = p_work if not (input_icc_path and os.path.exists(input_icc_path)) else ImageCms.getOpenProfile(input_icc_path)
+            p_dst = ImageProcessor._resolve_dst_profile(working_color_space, output_icc_path)
+            if p_dst is None:
+                return None
+            dst_space = (getattr(p_dst.profile, "xcolor_space", "RGB ") or "RGB ").strip()
+            if dst_space == "GRAY":
+                return None
+            axis = ((np.arange(size) + 0.5) / size * 255.0).round().astype(np.uint8)
+            r, g, b = np.meshgrid(axis, axis, axis, indexing="ij")
+            grid = np.ascontiguousarray(np.stack((r, g, b), axis=-1)).reshape(size, size * size, 3)
+
+            img = Image.fromarray(grid, mode="RGB")
+            to_out = ImageCms.profileToProfile(
+                img,
+                p_src,
+                p_dst,
+                renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                outputMode=dst_space if dst_space == "CMYK" else "RGB",
+            )
+            if to_out is None:
+                return None
+            # An Input ICC is a source-only profile (an input-class profile has no B2A table),
+            # so the return leg lands in the working space and the grid is carried there too.
+            back = ImageCms.profileToProfile(to_out, p_dst, p_work, renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC, outputMode="RGB")
+            if back is None:
+                return None
+            ref = (
+                grid
+                if p_work is p_src
+                else np.asarray(
+                    ImageCms.profileToProfile(img, p_src, p_work, renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC, outputMode="RGB")
+                )
+            )
+            delta = np.abs(np.asarray(back, dtype=np.int16) - ref.astype(np.int16)).max(axis=-1)
+            return np.ascontiguousarray((delta > GAMUT_ROUND_TRIP_TOLERANCE).reshape((size, size, size)))
+        except Exception as e:
+            logger.warning("Gamut LUT build failed; the printability read-out stays off", exc_info=e)
+            return None
+
+    def release_source_cache(self) -> None:
+        """Drops the decoded-source and pre-correction caches (full-res arrays)."""
+        self._source_cache_key = None
+        self._source_cache_value = None
+        self._precorrect_key = None
+        self._precorrect_value = None
+        self._prepare_slot = None
+
+    def cleanup(self, release_source_cache: bool = True, collect: bool = True, retain: Any = None) -> None:
+        """Evacuates transient GPU resources; ``retain`` survives the teardown."""
+        if release_source_cache:
+            self.release_source_cache()
+        if self.engine_gpu:
+            self.engine_gpu.cleanup(collect=collect, retain=retain)
+
+    def destroy_all(self) -> None:
+        """Teardown GPU engine."""
+        if self.engine_gpu:
+            self.engine_gpu.destroy_all()

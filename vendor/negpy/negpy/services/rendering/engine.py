@@ -1,0 +1,440 @@
+from dataclasses import replace
+from typing import Optional, Any, Callable, Tuple
+
+import numpy as np
+
+from negpy.domain.types import ImageBuffer
+from negpy.domain.interfaces import PipelineContext
+from negpy.domain.models import WorkspaceConfig
+from negpy.kernel.caching.manager import PipelineCache
+from negpy.kernel.caching.logic import calculate_config_hash, CacheEntry
+from negpy.kernel.image.validation import ensure_image
+from negpy.kernel.image.logic import working_oetf_decode, working_oetf_encode
+from negpy.kernel.system.logging import get_logger
+from negpy.features.geometry.processor import GeometryProcessor, CropProcessor
+from negpy.features.exposure import models as exposure_models
+from negpy.features.exposure.models import RenderIntent
+from negpy.features.exposure.processor import (
+    NormalizationProcessor,
+    PhotometricProcessor,
+)
+from negpy.features.exposure.bw_filter import collapse_weights, plane_weights, printed_exposure
+from negpy.features.exposure.logic import expand_mask_plane
+from negpy.features.exposure.normalization import (
+    contrast_mask_plane,
+    diffusion_grid,
+    diffusion_plane,
+    base_scan_density,
+    effective_crosstalk_matrix,
+    geometry_kwargs,
+    normalized_roi,
+)
+from negpy.features.process.fade import fade_white_target, render_white_space, with_fade_white
+from negpy.features.process.hue import apply_hue_trim
+from negpy.features.process.path import RenderPath, is_mono, render_path
+from negpy.features.transparency.logic import slide_exposure, slide_mono_weights
+from negpy.features.transparency.processor import TransferProcessor, TransparencyBaseProcessor
+from negpy.features.exposure.papers import effective_paper_profile
+from negpy.features.cyanotype.processor import CyanotypeProcessor
+from negpy.features.lith.processor import LithProcessor
+from negpy.features.sabattier.processor import SabattierProcessor
+from negpy.features.toning.processor import ToningProcessor
+from negpy.features.altprocess.models import AltProcess
+from negpy.features.process.models import FADE_RENDER_FIELDS, ProcessMode
+from negpy.features.lab.logic import apply_clahe
+from negpy.features.lab.processor import PhotoLabProcessor
+from negpy.features.finish.processor import FinishProcessor, rebate_tone
+from negpy.kernel.system.config import APP_CONFIG, render_scale_factor
+from negpy.services.view.coordinate_mapping import CoordinateMapping
+from negpy.kernel.system import timing
+from negpy.services.rendering.base_read import base_log_for
+
+logger = get_logger(__name__)
+
+
+def base_processor(settings: WorkspaceConfig) -> Any:
+    """The base stage's normalization: the negative's measured stretch, or a slide's fixed window."""
+    if render_path(settings.process) is RenderPath.PRINT:
+        return NormalizationProcessor(settings.process)
+    return TransparencyBaseProcessor(settings.process, slide_exposure(settings.process, settings.exposure).cast_removal_strength)
+
+
+def exposure_processor(settings: WorkspaceConfig, white_space: str = "") -> Any:
+    """The exposure stage's curve: the print or a slide's transfer, or the Flat master on either base."""
+    if settings.exposure.render_intent == RenderIntent.FLAT or render_path(settings.process) is RenderPath.PRINT:
+        return PhotometricProcessor(
+            printed_exposure(settings.process, settings.exposure), settings.local, collapse_weights(settings.process, settings.exposure)
+        )
+    return TransferProcessor(
+        slide_exposure(settings.process, settings.exposure),
+        settings.process.positive_source,
+        fade_white_target(settings.process, white_space),
+        slide_mono_weights(settings.process, settings.exposure),
+    )
+
+
+def print_stages(settings: WorkspaceConfig, img: ImageBuffer, context: PipelineContext) -> ImageBuffer:
+    """Alternative process, then toning, on the linear print. Each processor gates itself on
+    the film mode."""
+    paper = effective_paper_profile(settings.exposure.paper_profile, settings.process.process_mode)
+    img = LithProcessor(settings.altproc, paper).process(img, context)
+    img = CyanotypeProcessor(settings.altproc).process(img, context)
+    img = SabattierProcessor(settings.altproc, paper).process(img, context)
+    alt = settings.altproc.alt_process if settings.process.process_mode == ProcessMode.BW else AltProcess.NONE
+    return ToningProcessor(settings.toning, alt, is_mono(settings.process)).process(img, context)
+
+
+_WEDGE_PATCH_PX = 16
+
+
+def print_wedge(settings: WorkspaceConfig, enc: Any) -> np.ndarray:
+    """Display-encoded wedge patches through print_stages, as (steps, 3) RGB. Each patch is a
+    uniform block read at its center, so Sabattier's Mackie-line blur never mixes neighbors."""
+    lin = np.asarray(working_oetf_decode(np.asarray(enc, dtype=np.float32)))
+    strip = np.repeat(lin.reshape(1, -1, 1), _WEDGE_PATCH_PX, axis=1)
+    img = ensure_image(np.repeat(np.repeat(strip, _WEDGE_PATCH_PX, axis=0), 3, axis=2))
+    context = PipelineContext(original_size=(img.shape[0], img.shape[1]), scale_factor=1.0, process_mode=settings.process.process_mode)
+    out = np.asarray(working_oetf_encode(np.clip(print_stages(settings, img, context), 0.0, 1.0)))
+    half = _WEDGE_PATCH_PX // 2
+    return out[half, half::_WEDGE_PATCH_PX]
+
+
+class DarkroomEngine:
+    """
+    Runs the pipeline. Handles stage caching.
+    """
+
+    def __init__(self) -> None:
+        self.config = APP_CONFIG
+        self.cache = PipelineCache()
+        self._mask_plane: Optional[Tuple[Any, np.ndarray, float]] = None
+        self._diffusion_plane: Optional[Tuple[Tuple, np.ndarray]] = None
+
+    def _run_stage(
+        self,
+        img: ImageBuffer,
+        config: Any,
+        cache_field: str,
+        processor_fn: Callable[[ImageBuffer, PipelineContext], ImageBuffer],
+        context: PipelineContext,
+        pipeline_changed: bool,
+    ) -> Tuple[ImageBuffer, bool]:
+        if not context.cache_stages:
+            return processor_fn(img, context), True
+        conf_hash = calculate_config_hash(config)
+        cached_entry = getattr(self.cache, cache_field)
+
+        if not pipeline_changed and cached_entry and cached_entry.config_hash == conf_hash:
+            context.metrics.update(cached_entry.metrics)
+            context.active_roi = cached_entry.active_roi
+            return cached_entry.data, False
+
+        new_img = processor_fn(img, context)
+        new_entry = CacheEntry(conf_hash, new_img, context.metrics.copy(), context.active_roi)
+        setattr(self.cache, cache_field, new_entry)
+
+        return new_img, True
+
+    def _source_base_log(self, img_in: ImageBuffer, ctx: PipelineContext) -> Optional[tuple]:
+        """The clear base in raw log: the roll's picked one (the Film Base tool) wins, else the
+        source's rebate read, which `run_pipeline` takes before the defect repairs."""
+        picked = ctx.metrics.get("film_base")
+        if picked is not None:
+            return tuple(picked)
+        if "source_base_log" in ctx.metrics:
+            return ctx.metrics["source_base_log"]
+        return base_log_for(self.cache.source_hash, img_in)
+
+    def process(
+        self,
+        img: ImageBuffer,
+        settings: WorkspaceConfig,
+        source_hash: str,
+        context: Optional[PipelineContext] = None,
+    ) -> ImageBuffer:
+        img = ensure_image(img)
+        h_orig, w_cols = img.shape[:2]
+
+        if context is None:
+            context = PipelineContext(
+                scale_factor=render_scale_factor(img.shape),
+                original_size=(h_orig, w_cols),
+                process_mode=settings.process.process_mode,
+            )
+
+        if not context.cache_stages:
+            self.cache.clear()
+            self._mask_plane = None
+            self._diffusion_plane = None
+        pipeline_changed = False
+        if self.cache.source_hash != source_hash:
+            self.cache.clear()
+            self.cache.source_hash = source_hash
+            pipeline_changed = True
+
+        if self.cache.process_mode != settings.process.process_mode:
+            self.cache.process_mode = settings.process.process_mode
+            self.cache.base = None
+            self.cache.exposure = None
+            self.cache.clahe = None
+            self.cache.lab = None
+            pipeline_changed = True
+
+        current_img = img
+
+        if settings.geometry.crop_rect:
+            logger.debug(f"Engine process with crop_rect: {settings.geometry.crop_rect}")
+
+        distortion_k1 = settings.geometry.distortion_k1
+
+        def run_base(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
+            # Only a negative's preview that reads its metrics back shows the densities; an
+            # export runs with stage caching off. The base is a property of the source, read
+            # once per source before geometry.
+            if ctx.cache_stages and ctx.readback_metrics and render_path(settings.process) is RenderPath.PRINT:
+                ctx.metrics["base_log"] = self._source_base_log(img_in, ctx)
+                ctx.metrics["base_source"] = "picked" if ctx.metrics.get("film_base") is not None else "read"
+            if settings.process.meter_as_loaded:
+                ctx.meter_source = img_in
+            img_in = GeometryProcessor(settings.geometry).process(img_in, ctx)
+            return base_processor(settings).process(img_in, ctx)
+
+        # While the crop tool shows the full uncropped frame, the crop-selection fields
+        # (crop_rect, autocrop_offset) only feed context.active_roi, which is itself unused
+        # for output in that mode, since CropProcessor and uv_grid ROI slicing are both bypassed.
+        # Keying on them would force a full base, exposure, clahe, lab and local recompute on
+        # every crop-rect drag step.
+        geometry_key = (
+            (
+                settings.geometry.rotation,
+                settings.geometry.fine_rotation,
+                settings.geometry.flip_horizontal,
+                settings.geometry.flip_vertical,
+                settings.geometry.converge_v,
+                settings.geometry.converge_h,
+            )
+            if context.crop_preview_full
+            else settings.geometry
+        )
+
+        base_key = (
+            settings.process.process_mode,
+            # Routes the base and exposure stages (render_path); a change re-runs both.
+            settings.process.positive_source,
+            geometry_key,
+            settings.process.analysis_buffer,
+            settings.process.analysis_rect,
+            settings.process.meter_rect,
+            settings.process.luma_range_clip,
+            settings.process.color_range_clip,
+            settings.process.use_luma_average,
+            settings.process.use_color_average,
+            settings.process.is_local_initialized,
+            settings.process.is_locked_initialized,
+            settings.process.locked_floors,
+            settings.process.locked_ceils,
+            settings.process.local_floors,
+            settings.process.local_ceils,
+            settings.process.white_point_offset,
+            settings.process.black_point_offset,
+            settings.process.white_point_trim_red,
+            settings.process.white_point_trim_green,
+            settings.process.white_point_trim_blue,
+            settings.process.black_point_trim_red,
+            settings.process.black_point_trim_green,
+            settings.process.black_point_trim_blue,
+            settings.process.crosstalk_strength,
+            settings.process.crosstalk_matrix,
+            context.metrics.get("film_base"),  # the roll's picked base: the stage reads the densities above it
+            settings.process.crosstalk_process,
+            *(getattr(settings.process, f) for f in FADE_RENDER_FIELDS),
+            settings.process.lock_bounds,
+            settings.process.use_cast_average,
+            settings.process.locked_neutral_axis,
+            distortion_k1,
+            # The transparency branch meters its neutral axis only when Cast Removal is on.
+            slide_exposure(settings.process, settings.exposure).cast_removal_strength > 0.0,
+            # Auto Density metering reads retuned targets from EXPOSURE_CONSTANTS, which no config
+            # hash sees, so the revision keys them in. Re-running base sets pipeline_changed, so the
+            # exposure stage follows.
+            exposure_models.TARGETS_REVISION,
+        )
+        current_img, pipeline_changed = self._run_stage(current_img, base_key, "base", run_base, context, pipeline_changed)
+        timing.lap("geometry/normalize")
+        # Outside the cached stage: a drag renders without readback, so a cache entry it made holds no base.
+        if context.cache_stages and context.readback_metrics:
+            context.metrics["film_base_density"] = (
+                base_scan_density(
+                    self._source_base_log(img, context), effective_crosstalk_matrix(settings.process, settings.process.process_mode)
+                )
+                if render_path(settings.process) is RenderPath.PRINT
+                else None
+            )
+
+        # Built from the source and keyed on base, so the GPU calls the same helper and the slider re-runs only exposure.
+        # Pre-trim bounds, as on the GPU: White/Black Point trims are a look, not the source.
+        mask_bounds = context.metrics.get("pre_trim_bounds", context.metrics.get("final_bounds"))
+        # Print curve only, as Diffusion: the transfer curve and the Flat master take no plane.
+        if (
+            settings.exposure.contrast_mask_strength > 0.0
+            and mask_bounds is not None
+            and render_path(settings.process) is RenderPath.PRINT
+            and settings.exposure.render_intent != RenderIntent.FLAT
+        ):
+            mask_roi = context.active_roi
+            bw_weights = plane_weights(settings.process, settings.exposure)
+            mask_key = (source_hash, calculate_config_hash(base_key), mask_roi, current_img.shape[:2], bw_weights)
+            if self._mask_plane is None or self._mask_plane[0] != mask_key:
+                plane, centre = contrast_mask_plane(
+                    img,
+                    mask_bounds,
+                    effective_crosstalk_matrix(settings.process, settings.process.process_mode),
+                    roi_norm=normalized_roi(mask_roi, current_img.shape[:2]),
+                    bw_weights=bw_weights,
+                    **geometry_kwargs(settings.geometry, distortion_k1),
+                )
+                # Expanded here, not in the exposure stage: the slider re-runs that stage,
+                # and only the coefficients move with it.
+                expanded = expand_mask_plane(plane, current_img.shape[:2], mask_roi)
+                self._mask_plane = None if expanded is None else (mask_key, expanded, centre)
+            if self._mask_plane is not None:
+                context.metrics["contrast_mask_plane"] = self._mask_plane[1]
+                context.metrics["contrast_mask_centre"] = self._mask_plane[2]
+                context.metrics["contrast_mask_roi"] = None
+
+        timing.lap("contrast mask")
+
+        # Same recipe as the mask plane, in the print's own normalization, so the kernel mixes it with the pixel as light.
+        # Print curve only: the transfer curve and the Flat master take no plane.
+        diff_bounds = context.metrics.get("final_bounds")
+        if (
+            settings.exposure.diffusion > 0.0
+            and diff_bounds is not None
+            and render_path(settings.process) is RenderPath.PRINT
+            and settings.exposure.render_intent != RenderIntent.FLAT
+        ):
+            diff_roi = context.active_roi
+            diff_weights = plane_weights(settings.process, settings.exposure)
+            diff_key = (
+                source_hash,
+                calculate_config_hash(base_key),
+                diff_roi,
+                current_img.shape[:2],
+                diff_weights,
+            )
+            # A None plane (an unmetered frame) is cached under its key like any other.
+            cached = self._diffusion_plane
+            if cached is None or cached[0] != diff_key:
+                grid = diffusion_grid(
+                    img,
+                    effective_crosstalk_matrix(settings.process, settings.process.process_mode),
+                    roi_norm=normalized_roi(diff_roi, current_img.shape[:2]),
+                    **geometry_kwargs(settings.geometry, distortion_k1),
+                )
+                plane = diffusion_plane(grid, diff_bounds, diff_weights)
+                cached = (diff_key, plane)
+                self._diffusion_plane = cached
+            if cached[1] is not None:
+                context.metrics["diffusion_plane"] = cached[1]
+                context.metrics["diffusion_roi"] = diff_roi
+        timing.lap("diffusion")
+
+        def run_exposure(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
+            # The base stage reports a white it measured for itself (`resolve_fade_white`).
+            measured = replace(settings, process=with_fade_white(settings.process, ctx.metrics.get("fade_white")))
+            img_out = exposure_processor(
+                measured, render_white_space(settings.process, ctx.process_mode, ctx.cam_xyz, ctx.camera_wb)
+            ).process(img_in, ctx)
+            # Rides this stage: it needs the print, and its own stage would re-run everything behind
+            # it on a drag. Stays inside the flat intent below, being a capture fix, not a look.
+            return apply_hue_trim(img_out, settings.process.hue_trim)
+
+        # Dodge/burn masks are print-exposure inputs, so they key this stage.
+        current_img, pipeline_changed = self._run_stage(
+            current_img,
+            (
+                settings.exposure,
+                settings.local,
+                settings.process.hue_trim,
+                settings.process.slide_bw,
+                collapse_weights(settings.process, settings.exposure),
+            ),
+            "exposure",
+            run_exposure,
+            context,
+            pipeline_changed,
+        )
+        timing.lap("exposure")
+
+        # Flat (digital-intermediate) master: keep only geometry and the mask-neutralized
+        # inversion, then crop. The creative stages (lab, local, toning, finish) are bypassed, so
+        # the export holds maximal editing latitude.
+        flat_intent = settings.exposure.render_intent == RenderIntent.FLAT
+
+        if not flat_intent:
+
+            def run_clahe(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
+                return apply_clahe(img_in, settings.lab.clahe_strength)
+
+            # Keyed on the bare float: the full settings.lab would wrongly invalidate this stage, and
+            # lab behind it, on saturation and sharpen edits.
+            current_img, pipeline_changed = self._run_stage(
+                current_img,
+                settings.lab.clahe_strength,
+                "clahe",
+                run_clahe,
+                context,
+                pipeline_changed,
+            )
+            timing.lap("CLAHE")
+
+            def run_lab(img_in: ImageBuffer, ctx: PipelineContext) -> ImageBuffer:
+                return PhotoLabProcessor(settings.lab, is_mono(settings.process)).process(img_in, ctx)
+
+            current_img, pipeline_changed = self._run_stage(current_img, settings.lab, "lab", run_lab, context, pipeline_changed)
+            timing.lap("lab")
+
+            current_img = print_stages(settings, current_img, context)
+            timing.lap("alt process/toning")
+
+        if not context.crop_preview_full:
+            current_img = CropProcessor(settings.geometry).process(current_img, context)
+        timing.lap("crop")
+
+        if not flat_intent:
+            from negpy.services.export.print import PrintService
+
+            paper = PrintService.effective_paper_linear(settings.finish, settings.toning)
+            carrier_live = settings.finish.carrier_width > 0.0 and not context.crop_preview_full
+            tone = rebate_tone(settings, context.metrics) if carrier_live else None
+            current_img = FinishProcessor(settings.finish, settings.export.export_print_size, paper, tone).process(current_img, context)
+            # Output transform: scene-linear -> display-encoded (flat master skips this).
+            current_img = ensure_image(working_oetf_encode(current_img))
+        timing.lap("finish/output encode")
+
+        # No paper layout runs here, so the whole buffer is the picture. Reported rather
+        # than left out: the controller merges each render's metrics into last_metrics, so
+        # a key only one engine writes keeps the other engine's last value.
+        context.metrics["content_rect"] = None
+
+        if context.wants_uv_grid:
+            try:
+                uv_grid = CoordinateMapping.create_uv_grid(
+                    rh_orig=h_orig,
+                    rw_orig=w_cols,
+                    rotation=settings.geometry.rotation,
+                    fine_rot=settings.geometry.fine_rotation,
+                    flip_h=settings.geometry.flip_horizontal,
+                    flip_v=settings.geometry.flip_vertical,
+                    autocrop=True,
+                    autocrop_params=({"roi": context.active_roi} if context.active_roi and not context.crop_preview_full else None),
+                    distortion_k1=distortion_k1,
+                    converge_v=settings.geometry.converge_v,
+                    converge_h=settings.geometry.converge_h,
+                )
+                context.metrics["uv_grid"] = uv_grid
+            except Exception as e:
+                logger.error(f"Failed to generate UV grid: {e}")
+        timing.lap("UV grid")
+
+        return current_img

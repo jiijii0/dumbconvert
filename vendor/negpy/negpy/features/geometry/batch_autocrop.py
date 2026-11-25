@@ -1,0 +1,817 @@
+"""Roll-aware crop calibration built on the single-frame film detector.
+
+The module is deliberately free of Qt, storage, and file-loading concerns.  It
+accepts transformed preview buffers, collects deterministic crop evidence, builds
+a robust roll template, and resolves only frames that retain film-edge evidence.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from typing import Sequence
+
+import negpy_core
+import numpy as np
+
+from negpy.domain.types import ROI, ImageBuffer
+from negpy.features.geometry.logic import (
+    BORDER_SIDES,
+    AutocropDetection,
+    _closest_standard_ratio,
+    _detection_luma,
+    _get_threshold_autocrop_coords,
+    _trim_opaque_border,
+    apply_fine_rotation,
+    get_autocrop_coords,
+    detect_film_bounds_with_confidence,
+    enforce_roi_aspect_ratio,
+    measure_film_border,
+    measure_film_edges,
+)
+from negpy.features.geometry.models import FINE_ROTATION_LIMIT
+from negpy.features.geometry.skew import trusted_frame_skew
+from negpy.kernel.system.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+_TRUSTED_CONFIDENCE = 0.58
+_MAX_AUTOMATIC_DESKEW = 8.0
+_DEFAULT_SAFETY_BORDER = 0.01
+# The rebate width is a roll property, so require enough agreeing frames that a few
+# bright frame edges cannot move the median.
+_MIN_BORDER_SAMPLES = 5
+# A fit disagreeing with the consensus by more than this is reading something other than
+# the film edge, so it is dropped.
+_MAX_EDGE_FIT_DELTA = 0.5
+_MIN_FITTED_ANGLES = 3
+# How far a confirmed fit may sit from the roll before the roll wins anyway. Wide, because
+# tilt is not a roll property: frames sit in the holder however they were put there, and the
+# measured spread runs past 3 degrees on a roll whose angle MAD is under 0.2. Not unbounded,
+# because a fit can still lock onto the wrong edge, and one that disagrees with every other
+# frame by more than this probably has.
+_CONFIRMED_ANGLE_TOL = 2.5
+# Confidence given to a frame whose rect is the threshold box rather than a detected film
+# box. Low: the box is the frame, and every real measurement on it came from the border walk.
+_FALLBACK_CONFIDENCE = 0.30
+# How much of the frame the threshold box must cover before a roll may fall back to it. The
+# fallback rests on that box being no crop by itself; a box well inside the frame is a crop,
+# and taking it as the film box crops to whatever the threshold happened to enclose.
+_MIN_FALLBACK_COVERAGE = 0.9
+# Confidence for a frame the roll never saw, resolved from its own crop alone. It carries a
+# single frame's evidence, so it cannot claim what a pooled frame does.
+_OWN_CROP_CONFIDENCE = 0.5
+# Trusted frames a roll template needs. One wrong box would otherwise place every frame that
+# has no box of its own. A group this small or smaller has no second frame to ask.
+_MIN_TRUSTED_FRAMES = 2
+
+
+@dataclass(frozen=True)
+class CropEvidence:
+    """Single-frame evidence in the final, deskewed display coordinate space."""
+
+    key: str
+    canvas_shape: tuple[int, int]
+    roi: ROI | None
+    correction_angle: float
+    confidence: float
+    target_ratio: str = "3:2"
+    rebate_trim: float = 1.0
+    # Set when a line fit confirmed correction_angle. Independent of `confidence`, which scores
+    # the box rather than its tilt.
+    angle_confident: bool = False
+    supported_sides: frozenset[str] = frozenset()
+    supported_corners: frozenset[str] = frozenset()
+    evidence_sources: tuple[str, ...] = ()
+    geometry_score: float = 0.0
+    vertical_edge_contrast: float = 0.0
+    vertical_edge_profile: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float32),
+        compare=False,
+        repr=False,
+    )
+    # Per-side thickness in BORDER_SIDES order, as a fraction of the film box side. NaN
+    # marks a side with no clean transition, () a frame that was never measured.
+    border: tuple[float, ...] = ()
+    # The same sides read by the ring alone, which trims only where the edge is brighter
+    # than the picture. The walk behind `border` has no such test, so a roll too short to
+    # pool a median takes this instead -- see _resolve_border.
+    bright_border: tuple[float, ...] = ()
+    # The threshold-walk box, set only when the film detector found no box. It is what
+    # single-frame Auto Crop falls back to, and only a roll where *no* frame found a box
+    # ever uses it -- see _threshold_fallback_frames.
+    fallback_roi: ROI | None = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class RollCropTemplate:
+    """Robust normalized geometry shared by trustworthy frames in a roll."""
+
+    width: float
+    fallback_width: float
+    height: float
+    center_x: float
+    top: float
+    correction_angle: float
+    width_mad: float
+    center_mad: float
+    top_mad: float
+    angle_mad: float
+    confidence: float
+    sample_count: int
+    # Roll median per side (BORDER_SIDES order); () when too few frames measured one.
+    border: tuple[float, ...] = ()
+    border_sample_count: int = 0
+    # Built from threshold boxes because no frame in the roll found a film box. The rect it
+    # carries is close to the whole frame, so only the border inset makes a crop of it.
+    from_fallback: bool = False
+
+
+@dataclass(frozen=True)
+class ResolvedCrop:
+    """Explicit crop payload ready for controller-side conflict checks."""
+
+    key: str
+    crop_rect: tuple[float, float, float, float]
+    correction_angle: float
+    confidence: float
+    calibrated: bool
+
+
+def _vertical_edge_profile(img: ImageBuffer) -> tuple[np.ndarray, float]:
+    """Return a contrast-normalized vertical-edge profile for template fallback; negpy_core
+    holds the rules."""
+    profile, contrast = negpy_core.batch_edge_profile(np.ascontiguousarray(img, dtype=np.float32))
+    return profile, contrast
+
+
+def _top_edge_slope(lum: np.ndarray, roi: ROI) -> float | None:
+    """Residual tilt of the film box's top edge, in degrees, or None when unreadable; negpy_core
+    holds the fit. Sign matches the film detector's quad angle: the measured image-coordinate
+    residual is already the additive fix."""
+    return negpy_core.top_edge_slope(np.ascontiguousarray(lum, dtype=np.float32), tuple(int(v) for v in roi))
+
+
+def _side_border(lum: np.ndarray, roi: ROI) -> dict[str, float]:
+    """Per-side border thickness, from the edge walk with the ring measurement behind it.
+
+    The walk reads the holder mask and the film-base sliver a camera scan compresses into
+    a few pixels; the ring reads a wide bright rebate, which the walk scores as picture
+    whenever it sits below bed level. A side the walk finds nothing on falls back, so a
+    NaN abstention still reaches the roll median.
+    """
+    walked = measure_film_edges(lum, roi)
+    measured = measure_film_border(lum, roi)
+    return {name: walked[name] if walked[name] > 0.0 else measured[name] for name in BORDER_SIDES}
+
+
+def _bright_side_border(lum: np.ndarray, roi: ROI) -> tuple[float, ...]:
+    """Ring-only border thickness: the sides that are measurably brighter than the picture."""
+    measured = measure_film_border(lum, roi)
+    return tuple(measured[name] for name in BORDER_SIDES)
+
+
+def _border_without_a_film_box(image: ImageBuffer) -> tuple[ROI, tuple[float, ...], tuple[float, ...]]:
+    """Threshold box and border widths for a frame whose film box was never found.
+
+    The rect for such a frame normally comes from the roll template, but the *border* does
+    not have to: reading the edges needs no box, only the frame. Holders the film detector
+    cannot read at all would otherwise contribute no samples, the roll would never reach its
+    minimum, and no frame in it would be inset — the whole roll keeps its border.
+
+    The box comes back too because a roll on which *every* frame lands here has no template
+    to take a rect from either.
+    """
+    lum = _detection_luma(image)
+    box = _trim_opaque_border(lum, _get_threshold_autocrop_coords(image, None))
+    return box, tuple(_side_border(lum, box)[name] for name in BORDER_SIDES), _bright_side_border(lum, box)
+
+
+def _edge_fit(image: ImageBuffer) -> float | None:
+    """The rotation the four-edge fit trusts, within the automatic deskew limit, else None."""
+    try:
+        skew = trusted_frame_skew(image, fit_keystone=False)
+    except Exception:
+        # A fit that raises on every frame must not degrade the whole roll in silence.
+        logger.exception("four-edge fit failed; frame falls back to the contour angle")
+        return None
+    if skew is None:
+        return None
+    if not np.isfinite(skew.fine_rotation) or abs(skew.fine_rotation) > _MAX_AUTOMATIC_DESKEW:
+        return None
+    return float(skew.fine_rotation)
+
+
+def _no_box_evidence(
+    key: str,
+    image: ImageBuffer,
+    detection: AutocropDetection,
+    correction: float,
+    angle_confident: bool,
+    target_ratio: str,
+    rebate_trim: float,
+) -> CropEvidence:
+    """A frame with no film box at any rotation; its border walk feeds the roll's fallback template."""
+    h, w = image.shape[:2]
+    fallback_roi, fallback_border, fallback_bright = _border_without_a_film_box(image)
+    return CropEvidence(
+        key,
+        (h, w),
+        None,
+        correction,
+        0.0,
+        target_ratio=target_ratio,
+        rebate_trim=rebate_trim,
+        angle_confident=angle_confident,
+        vertical_edge_contrast=detection.vertical_edge_contrast,
+        vertical_edge_profile=np.asarray(detection.vertical_edge_profile, dtype=np.float32),
+        border=fallback_border,
+        bright_border=fallback_bright,
+        fallback_roi=fallback_roi,
+        reason="no_consensus",
+    )
+
+
+def detect_crop_candidate(
+    key: str,
+    image: ImageBuffer,
+    *,
+    target_ratio: str = "3:2",
+    rebate_trim: float = 1.0,
+) -> CropEvidence:
+    """Collect crop, deskew, and edge evidence for one transformed preview.
+
+    The caller must apply flat-field correction, coarse rotation, flips, existing
+    fine rotation, and distortion first.  A portrait canvas takes no part in the roll,
+    which is landscape, and carries its own single-frame crop instead.
+    """
+    h, w = image.shape[:2]
+    profile, profile_contrast = _vertical_edge_profile(image)
+    if w <= h:
+        skew = _edge_fit(image)
+        # The roll template cannot place this frame, but the single-frame detector reads it
+        # like any other. Abstaining would leave batch worse than Auto on the same frame.
+        own_angle = skew if skew is not None else 0.0
+        own_image = apply_fine_rotation(image, own_angle) if abs(own_angle) > 1e-4 else image
+        try:
+            own_roi = get_autocrop_coords(own_image, target_ratio_str=target_ratio, rebate_trim=rebate_trim)
+        except Exception:
+            own_roi = None
+        return CropEvidence(
+            key,
+            (h, w),
+            None,
+            own_angle,
+            0.0,
+            target_ratio=target_ratio,
+            rebate_trim=rebate_trim,
+            angle_confident=skew is not None,
+            vertical_edge_contrast=profile_contrast,
+            vertical_edge_profile=profile,
+            fallback_roi=own_roi,
+            reason="unsupported_orientation",
+        )
+
+    initial = detect_film_bounds_with_confidence(image)
+    correction = float(initial.correction_angle) if initial.roi is not None else 0.0
+    if not np.isfinite(correction) or abs(correction) > _MAX_AUTOMATIC_DESKEW:
+        correction = 0.0
+
+    # Before rotating, not after: the re-detection below then measures the ROI at the final
+    # angle, so no rect has to be remapped.
+    #
+    # The top-edge fit returns the whole angle; agreeing with the contour's, it replaces and confirms it.
+    # Otherwise the costly four-edge fit decides.
+    fitted = _top_edge_slope(_detection_luma(image), initial.roi) if initial.roi is not None else None
+    angle_confident = fitted is not None and abs(fitted - correction) <= _MAX_EDGE_FIT_DELTA
+    if angle_confident:
+        correction = float(np.clip(fitted, -_MAX_AUTOMATIC_DESKEW, _MAX_AUTOMATIC_DESKEW))
+    else:
+        skew = _edge_fit(image)
+        if skew is not None:
+            correction = skew
+            angle_confident = True
+        elif initial.roi is None:
+            return _no_box_evidence(key, image, initial, 0.0, False, target_ratio, rebate_trim)
+
+    corrected = apply_fine_rotation(image, correction) if abs(correction) > 1e-4 else image
+    # The detector is deterministic, so an unrotated frame reuses its detection.
+    final = initial if corrected is image else detect_film_bounds_with_confidence(corrected)
+    if final.roi is None:
+        if initial.roi is None:
+            # Keeps the fallback payload: an opaque-holder roll's template rests on it.
+            return _no_box_evidence(key, corrected, final, correction, angle_confident, target_ratio, rebate_trim)
+        return CropEvidence(
+            key,
+            corrected.shape[:2],
+            None,
+            correction,
+            0.0,
+            target_ratio=target_ratio,
+            rebate_trim=rebate_trim,
+            angle_confident=angle_confident,
+            vertical_edge_contrast=final.vertical_edge_contrast,
+            vertical_edge_profile=np.asarray(final.vertical_edge_profile, dtype=np.float32),
+            reason="deskew_no_consensus",
+        )
+
+    # The film box, not the exposed image area: only the measurement happens here, and
+    # resolve_roll_crops decides using the whole roll.
+    lum = _detection_luma(corrected)
+    roi = _trim_opaque_border(lum, final.roi)
+    border = tuple(_side_border(lum, roi)[name] for name in BORDER_SIDES)
+    bright_border = _bright_side_border(lum, roi)
+    y1, y2, x1, x2 = roi
+    if y2 <= y1 or x2 <= x1:
+        return CropEvidence(
+            key,
+            corrected.shape[:2],
+            None,
+            correction,
+            0.0,
+            target_ratio=target_ratio,
+            rebate_trim=rebate_trim,
+            angle_confident=angle_confident,
+            vertical_edge_contrast=final.vertical_edge_contrast,
+            vertical_edge_profile=np.asarray(final.vertical_edge_profile, dtype=np.float32),
+            reason="invalid_geometry",
+        )
+
+    confidence = float(np.clip(final.confidence, 0.0, 1.0))
+    return CropEvidence(
+        key=key,
+        canvas_shape=corrected.shape[:2],
+        roi=roi,
+        correction_angle=correction,
+        confidence=confidence,
+        target_ratio=target_ratio,
+        rebate_trim=rebate_trim,
+        angle_confident=angle_confident,
+        supported_sides=final.supported_sides,
+        supported_corners=final.supported_corners,
+        evidence_sources=final.evidence_sources,
+        geometry_score=float(np.clip(final.geometry_score, 0.0, 1.0)),
+        vertical_edge_contrast=final.vertical_edge_contrast,
+        vertical_edge_profile=np.asarray(final.vertical_edge_profile, dtype=np.float32),
+        border=border,
+        bright_border=bright_border,
+    )
+
+
+def _normalized_roi(roi: ROI, shape: tuple[int, int]) -> tuple[float, float, float, float]:
+    h, w = shape
+    y1, y2, x1, x2 = roi
+    return x1 / w, y1 / h, x2 / w, y2 / h
+
+
+def _pixel_roi(rect: tuple[float, float, float, float], shape: tuple[int, int]) -> ROI:
+    h, w = shape
+    x1, y1, x2, y2 = rect
+    return (
+        max(0, min(h, int(round(y1 * h)))),
+        max(0, min(h, int(round(y2 * h)))),
+        max(0, min(w, int(round(x1 * w)))),
+        max(0, min(w, int(round(x2 * w)))),
+    )
+
+
+def _mad(values: np.ndarray, center: float | None = None) -> float:
+    if values.size == 0:
+        return 0.0
+    pivot = float(np.median(values)) if center is None else center
+    return float(np.median(np.abs(values - pivot)))
+
+
+def _roll_border(evidence: Sequence[CropEvidence]) -> tuple[tuple[float, ...], int]:
+    """Median border thickness per side across every frame that measured one.
+
+    Pooled over all detections, not the trusted subset: thickness is a property of the
+    film gate, so more samples beat stricter ones.
+
+    The sample gate is per side. A roll where one side is measured by too few frames --
+    an edge whose picture runs full-bleed on most frames, or a holder the film detector
+    reads on only a handful -- still has a usable median for the other three, and
+    discarding all four leaves the whole roll untrimmed. Short sides report NaN.
+    """
+    measured = [item.border for item in evidence if len(item.border) == len(BORDER_SIDES)]
+    if not measured:
+        return (), 0
+    columns = np.asarray(measured, dtype=np.float64)
+    medians: list[float] = []
+    counts: list[int] = []
+    for index in range(len(BORDER_SIDES)):
+        values = columns[:, index]
+        values = values[np.isfinite(values)]
+        counts.append(values.size)
+        medians.append(float(np.median(values)) if values.size >= _MIN_BORDER_SAMPLES else float("nan"))
+    if not any(np.isfinite(value) for value in medians):
+        return (), max(counts)
+    return tuple(medians), max(counts)
+
+
+def _threshold_fallback_frames(evidence: Sequence[CropEvidence]) -> list[CropEvidence]:
+    """Frames carrying a threshold box, presented as detections, for a roll where the film detector found no box
+    (film that overfills the sensor leaves no bed). Single-frame Auto Crop falls back to the same box; the border
+    walk that already ran trims it."""
+    boxes = [item for item in evidence if item.roi is None and item.fallback_roi is not None]
+    if not boxes:
+        return []
+    # Roll-level, not per frame: the premise is about the roll's whole geometry, and a
+    # per-frame test would take half a roll and leave the rest with no crop at all.
+    coverage = float(np.median([_roi_coverage(item.fallback_roi, item.canvas_shape) for item in boxes]))
+    if coverage < _MIN_FALLBACK_COVERAGE:
+        return []
+    return [
+        replace(item, roi=item.fallback_roi, confidence=_FALLBACK_CONFIDENCE, evidence_sources=("threshold-fallback",)) for item in boxes
+    ]
+
+
+def _roi_coverage(roi: ROI, shape: tuple[int, int]) -> float:
+    """Share of the canvas the ROI covers."""
+    height, width = shape
+    y1, y2, x1, x2 = roi
+    if height <= 0 or width <= 0:
+        return 0.0
+    return max(0.0, (y2 - y1)) * max(0.0, (x2 - x1)) / float(height * width)
+
+
+def build_roll_template(evidence: Sequence[CropEvidence]) -> RollCropTemplate | None:
+    """Build a median/MAD roll template from multi-side, trustworthy detections."""
+    trusted = [
+        item
+        for item in evidence
+        if item.roi is not None
+        and item.confidence >= _TRUSTED_CONFIDENCE
+        and item.geometry_score >= 0.35
+        and (len(item.supported_sides) >= 2 or len(item.supported_corners) >= 1)
+    ]
+    if len(trusted) < _MIN_TRUSTED_FRAMES < len(evidence):
+        trusted = []
+    border, border_samples = _roll_border(evidence)
+    from_fallback = False
+    if not trusted:
+        trusted = _threshold_fallback_frames(evidence)
+        from_fallback = True
+    if not trusted:
+        return None
+
+    rects = np.asarray([_normalized_roi(item.roi, item.canvas_shape) for item in trusted], dtype=np.float64)
+    widths = rects[:, 2] - rects[:, 0]
+    heights = rects[:, 3] - rects[:, 1]
+    centers = (rects[:, 0] + rects[:, 2]) * 0.5
+    tops = rects[:, 1]
+    angles = np.asarray([item.correction_angle for item in trusted], dtype=np.float64)
+
+    width_med = float(np.median(widths))
+    angle_med = float(np.median(angles))
+    width_tol = max(0.025, 3.5 * _mad(widths, width_med))
+    angle_tol = max(0.45, 3.5 * _mad(angles, angle_med))
+    keep = (np.abs(widths - width_med) <= width_tol) & (np.abs(angles - angle_med) <= angle_tol)
+    if not np.any(keep):
+        keep = np.ones(widths.shape, dtype=bool)
+
+    widths = widths[keep]
+    heights = heights[keep]
+    centers = centers[keep]
+    tops = tops[keep]
+    angles = angles[keep]
+    kept_items = [item for item, accepted in zip(trusted, keep, strict=True) if accepted]
+
+    fitted = np.asarray([item.correction_angle for item in kept_items if item.angle_confident], dtype=np.float64)
+    if fitted.size >= _MIN_FITTED_ANGLES:
+        angles = fitted
+
+    return RollCropTemplate(
+        width=float(np.median(widths)),
+        fallback_width=float(np.percentile(widths, 75)),
+        height=float(np.median(heights)),
+        center_x=float(np.median(centers)),
+        top=float(np.median(tops)),
+        correction_angle=float(np.median(angles)),
+        width_mad=_mad(widths),
+        center_mad=_mad(centers),
+        top_mad=_mad(tops),
+        angle_mad=_mad(angles),
+        confidence=float(np.median([item.confidence for item in kept_items])),
+        sample_count=len(kept_items),
+        border=border,
+        border_sample_count=border_samples,
+        from_fallback=from_fallback,
+    )
+
+
+def _clamp_rect(rect: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = rect
+    x1, x2 = sorted((float(np.clip(x1, 0.0, 1.0)), float(np.clip(x2, 0.0, 1.0))))
+    y1, y2 = sorted((float(np.clip(y1, 0.0, 1.0)), float(np.clip(y2, 0.0, 1.0))))
+    return x1, y1, x2, y2
+
+
+def _map_rect_between_rotations(
+    rect: tuple[float, float, float, float],
+    shape: tuple[int, int],
+    source_angle: float,
+    target_angle: float,
+) -> tuple[float, float, float, float]:
+    """Map a normalized rectangle into a canvas with a different fine rotation.
+
+    ``apply_fine_rotation`` keeps the canvas size fixed and rotates around its
+    center. Mapping all four corners and taking their enclosing box preserves the
+    original crop without clipping when a weak angle is replaced by roll consensus.
+    """
+    delta = float(target_angle - source_angle)
+    if abs(delta) <= 1e-7:
+        return rect
+    h, w = shape
+    x1, y1, x2, y2 = rect
+    points = np.asarray(
+        [
+            (x1 * w, y1 * h),
+            (x2 * w, y1 * h),
+            (x2 * w, y2 * h),
+            (x1 * w, y2 * h),
+        ],
+        dtype=np.float64,
+    )
+    matrix = negpy_core.rotation_matrix((w / 2.0, h / 2.0), delta, 1.0)
+    mapped = points @ matrix[:, :2].T + matrix[:, 2]
+    # Quantize outward before normalizing. Later conversion back to a half-open
+    # pixel ROI must not round an extremum inward, especially when one edge touches
+    # the canvas and the uniform safety border is consequently limited to zero.
+    left = max(0, min(w, int(np.floor(np.min(mapped[:, 0])))))
+    top = max(0, min(h, int(np.floor(np.min(mapped[:, 1])))))
+    right = max(0, min(w, int(np.ceil(np.max(mapped[:, 0])))))
+    bottom = max(0, min(h, int(np.ceil(np.max(mapped[:, 1])))))
+    return _clamp_rect(
+        (
+            left / w,
+            top / h,
+            right / w,
+            bottom / h,
+        )
+    )
+
+
+def _calibrate_detected_rect(
+    item: CropEvidence,
+    roi: ROI,
+    template: RollCropTemplate,
+) -> tuple[tuple[float, float, float, float], bool]:
+    x1, y1, x2, y2 = _normalized_roi(roi, item.canvas_shape)
+    width, height = x2 - x1, y2 - y1
+    center = (x1 + x2) * 0.5
+    calibrated = False
+
+    width_tol = max(0.035, 4.0 * template.width_mad)
+    center_tol = max(0.035, 4.0 * template.center_mad)
+    top_tol = max(0.03, 4.0 * template.top_mad)
+
+    target_width = width
+    if 0.0 < template.width - width <= max(0.10, width_tol) or (
+        item.confidence < _TRUSTED_CONFIDENCE and abs(width - template.width) > width_tol
+    ):
+        target_width = template.width
+        calibrated = True
+
+    if target_width != width:
+        if "left" in item.supported_sides and "right" not in item.supported_sides:
+            x2 = x1 + target_width
+        elif "right" in item.supported_sides and "left" not in item.supported_sides:
+            x1 = x2 - target_width
+        else:
+            x1, x2 = center - target_width * 0.5, center + target_width * 0.5
+
+    if item.confidence < _TRUSTED_CONFIDENCE:
+        if abs(center - template.center_x) > center_tol:
+            x1, x2 = template.center_x - target_width * 0.5, template.center_x + target_width * 0.5
+            calibrated = True
+        if abs(y1 - template.top) > top_tol or abs(height - template.height) > max(0.04, 4.0 * template.top_mad):
+            y1, y2 = template.top, template.top + template.height
+            calibrated = True
+
+    return _clamp_rect((x1, y1, x2, y2)), calibrated
+
+
+def _rect_from_edge_profile(item: CropEvidence, template: RollCropTemplate) -> tuple[float, float, float, float] | None:
+    """A film box from the frame's vertical-edge profile where the roll puts the edges; negpy_core
+    holds the rules."""
+    fields = (
+        template.center_x,
+        template.width,
+        template.fallback_width,
+        template.top,
+        template.height,
+        template.center_mad,
+        template.width_mad,
+    )
+    profile = np.ascontiguousarray(item.vertical_edge_profile, dtype=np.float32).ravel()
+    return negpy_core.rect_from_edge_profile(profile, float(item.vertical_edge_contrast), fields)
+
+
+def _resolve_border(
+    frame: tuple[float, ...],
+    roll: tuple[float, ...],
+    bright: tuple[float, ...] = (),
+) -> tuple[float, ...]:
+    """Prefer the frame's own border, falling back to the roll median per side.
+
+    How much bed the detector leaves inside the film box varies frame to frame, so
+    pooling that measurement across the roll trims the wrong amount. The median is only
+    the safety net for sides that abstained (NaN).
+
+    A roll too short to pool any median at all falls back to `bright` instead of `frame`.
+    Pooling is what tells a rebate from a bright scene edge, and with too few samples to
+    pool, the brightness test is the only evidence left that a side has a border to trim.
+    """
+    if len(roll) != len(BORDER_SIDES):
+        return _bright_only_border(bright)
+    if len(frame) != len(BORDER_SIDES):
+        frame = (float("nan"),) * len(BORDER_SIDES)
+    # A side neither the frame nor the roll could measure trims nothing, rather than
+    # carrying NaN into the inset arithmetic.
+    return tuple(
+        own if np.isfinite(own) else (fallback if np.isfinite(fallback) else 0.0) for own, fallback in zip(frame, roll, strict=True)
+    )
+
+
+def _bright_only_border(bright: tuple[float, ...]) -> tuple[float, ...]:
+    """The ring measurement as an inset, and only where an opposite pair both read one.
+
+    A lone bright side is a uniform scene region far more often than a rebate, and
+    trimming to it carves the picture down to a dark subject.
+    """
+    if len(bright) != len(BORDER_SIDES):
+        return ()
+    amounts = {name: (value if np.isfinite(value) else 0.0) for name, value in zip(BORDER_SIDES, bright, strict=True)}
+    paired = {"top", "bottom"} if amounts["top"] > 0.0 and amounts["bottom"] > 0.0 else set()
+    if amounts["left"] > 0.0 and amounts["right"] > 0.0:
+        paired |= {"left", "right"}
+    if not paired:
+        return ()
+    return tuple(amounts[name] if name in paired else 0.0 for name in BORDER_SIDES)
+
+
+def _inset_rect_by_border(
+    rect: tuple[float, float, float, float],
+    border: tuple[float, ...],
+) -> tuple[float, float, float, float]:
+    """Trim the rebate off a film-box rect. Sides are insets of that rect."""
+    if len(border) != len(BORDER_SIDES):
+        return rect
+    x1, y1, x2, y2 = rect
+    width, height = x2 - x1, y2 - y1
+    if width <= 0.0 or height <= 0.0:
+        return rect
+    amounts = dict(zip(BORDER_SIDES, border, strict=True))
+    y1 += amounts["top"] * height
+    y2 -= amounts["bottom"] * height
+    x1 += amounts["left"] * width
+    x2 -= amounts["right"] * width
+    if y2 - y1 <= 0.0 or x2 - x1 <= 0.0:
+        return rect
+    return _clamp_rect((x1, y1, x2, y2))
+
+
+def _apply_target_ratio(roi: ROI, shape: tuple[int, int], target_ratio: str) -> ROI:
+    """Re-impose the target ratio, which the border inset breaks by design."""
+    h, w = shape
+    ratio = target_ratio
+    if ratio == "Free":
+        ratio = _closest_standard_ratio(roi, (h, w), fallback="3:2").value
+    return enforce_roi_aspect_ratio(roi, h, w, ratio)
+
+
+def add_uniform_safety_border(
+    roi: ROI,
+    shape: tuple[int, int],
+    ratio: float = _DEFAULT_SAFETY_BORDER,
+) -> ROI:
+    """Expand by one common pixel amount, reduced when any edge lacks room."""
+    h, w = shape
+    y1, y2, x1, x2 = roi
+    requested = max(0, int(round(min(h, w) * ratio)))
+    available = max(0, min(y1, x1, h - y2, w - x2))
+    pad = min(requested, available)
+    return y1 - pad, y2 + pad, x1 - pad, x2 + pad
+
+
+def _own_crop(item: CropEvidence) -> list[ResolvedCrop]:
+    """The frame's own single-frame crop, for a frame the roll cannot place."""
+    if item.fallback_roi is None:
+        return []
+    h, w = item.canvas_shape
+    y1, y2, x1, x2 = item.fallback_roi
+    if y2 <= y1 or x2 <= x1 or h <= 0 or w <= 0:
+        return []
+    rect = tuple(float(np.clip(v, 0.0, 1.0)) for v in (x1 / w, y1 / h, x2 / w, y2 / h))
+    return [
+        ResolvedCrop(
+            key=item.key,
+            crop_rect=rect,
+            correction_angle=item.correction_angle,
+            confidence=_OWN_CROP_CONFIDENCE,
+            calibrated=False,
+        )
+    ]
+
+
+def resolve_roll_crops(
+    evidence: Sequence[CropEvidence],
+    *,
+    safety_border: float = _DEFAULT_SAFETY_BORDER,
+) -> list[ResolvedCrop]:
+    """Resolve trustworthy and template-supported frames; ambiguous frames abstain."""
+    # A portrait frame's rect and fitted angle describe a different canvas.
+    pooled = [item for item in evidence if item.reason != "unsupported_orientation"]
+    templates = {
+        ratio: build_roll_template([item for item in pooled if item.target_ratio == ratio])
+        for ratio in dict.fromkeys(item.target_ratio for item in evidence)
+    }
+
+    # A portrait frame resolves before the roll is consulted, and whether or not the roll
+    # produced a template: it took no part in either, so neither can place it.
+    results = [crop for item in evidence if item.reason == "unsupported_orientation" for crop in _own_crop(item)]
+    if not any(template is not None for template in templates.values()):
+        return results
+
+    for item in evidence:
+        if item.reason == "unsupported_orientation":
+            continue
+        template = templates.get(item.target_ratio)
+        if template is None:
+            continue
+
+        calibrated = False
+        # Only a fallback template reaches for the threshold box. Where the roll found real
+        # boxes, a weak frame still goes to the edge profile: that reads the roll's geometry,
+        # where the threshold box is near enough the whole frame to be no crop at all.
+        roi = item.roi
+        if roi is None and template.from_fallback:
+            roi = item.fallback_roi
+
+        if roi is not None:
+            rect, calibrated = _calibrate_detected_rect(item, roi, template)
+            if item.roi is None:
+                calibrated = True
+                confidence = min(0.55, template.confidence * 0.72)
+            else:
+                confidence = item.confidence
+        else:
+            rect = _rect_from_edge_profile(item, template)
+            if rect is None:
+                continue
+            calibrated = True
+            confidence = min(0.55, template.confidence * 0.72)
+
+        angle = item.correction_angle
+        angle_tol = max(0.55, 4.0 * template.angle_mad)
+        # A confirmed fit outranks the roll outright. Tilt is not a roll constant: frames sit
+        # in the holder however they were put there, and the measured spread runs past 3 degrees
+        # on a roll whose median MAD is under 0.2. An angle the fit measured on the film's own
+        # top edge is better evidence than the consensus, and yielding to the roll rotates the
+        # frame off its own edges. Everything else still yields: a box that scored poorly, or
+        # one whose angle no fit could confirm.
+        angle_trusted = item.confidence >= _TRUSTED_CONFIDENCE
+        divergence = abs(angle - template.correction_angle)
+        # The wider of a fixed allowance and what this roll's own spread justifies. A frame that
+        # measured its own tilt, through a fit on its top edge or a box scored well enough to
+        # trust, keeps it within that, because a roll can be genuinely bimodal. Where film was
+        # re-seated partway through a roll, a handful of frames sat degrees off the median and
+        # were each rotated off their own edges to meet a consensus that did not describe them.
+        own_measurement = item.angle_confident or angle_trusted
+        if item.roi is None or not (own_measurement and divergence <= max(_CONFIRMED_ANGLE_TOL, angle_tol)):
+            target_angle = template.correction_angle
+            rect = _map_rect_between_rotations(rect, item.canvas_shape, angle, target_angle)
+            angle = target_angle
+            calibrated = True
+        angle = float(np.clip(angle, -FINE_ROTATION_LIMIT, FINE_ROTATION_LIMIT))
+
+        border = _resolve_border(item.border, template.border, item.bright_border)
+        if item.rebate_trim != 1.0:
+            border = tuple(value * item.rebate_trim for value in border)
+        inset = _inset_rect_by_border(rect, border)
+        trimmed = inset != rect
+        roi = _pixel_roi(inset, item.canvas_shape)
+        if trimmed:
+            # Only the inset breaks the ratio, so only the inset re-imposes it. An untrimmed
+            # rect passes through exactly, keeping half-open pixel bounds.
+            roi = _apply_target_ratio(roi, item.canvas_shape, item.target_ratio)
+        # A measured inset already lands on the rebate edge, so padding it back out by an
+        # unrelated fraction would restore the rebate.
+        pad_ratio = 0.0 if trimmed else safety_border
+        y1, y2, x1, x2 = add_uniform_safety_border(roi, item.canvas_shape, pad_ratio)
+        h, w = item.canvas_shape
+        if y2 <= y1 or x2 <= x1:
+            continue
+        manual_rect = (x1 / w, y1 / h, x2 / w, y2 / h)
+        results.append(
+            ResolvedCrop(
+                key=item.key,
+                crop_rect=tuple(float(np.clip(v, 0.0, 1.0)) for v in manual_rect),
+                correction_angle=angle,
+                confidence=float(np.clip(confidence, 0.0, 1.0)),
+                calibrated=calibrated,
+            )
+        )
+    return results

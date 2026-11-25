@@ -1,0 +1,228 @@
+"""Neutral-axis estimator: hue-uniform chroma ranking, strong-cast recovery via
+the correction pass, and the composite confidence model.
+
+Fixtures are built in normalized-val space against fixed bounds (floor -3, ceil 0,
+so val = (log + 3) / 3) with tone regions sized to land inside the estimator's
+highlight/mid/shadow luma bands. 256px images keep the block-median prefilter a
+no-op, so band populations are exact.
+"""
+
+import numpy as np
+
+from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+from negpy.features.exposure.normalization import LogNegativeBounds, measure_neutral_axis_from_log
+
+_H, _W = 258, 256
+_BOUNDS = LogNegativeBounds((-3.0, -3.0, -3.0), (0.0, 0.0, 0.0))
+
+
+def _val_img(highlight=0.17, mid=0.47, shadow=0.79) -> np.ndarray:
+    v = np.empty((_H, _W, 3), np.float32)
+    third = _H // 3
+    v[:third] = highlight
+    v[third : 2 * third] = mid
+    v[2 * third :] = shadow
+    return v
+
+
+def _to_log(val_img: np.ndarray) -> np.ndarray:
+    return (-3.0 + 3.0 * val_img).astype(np.float32)
+
+
+def _val_of(ref: float) -> float:
+    return (ref + 3.0) / 3.0
+
+
+def _dev(refs: tuple[float, float, float], ch: int) -> float:
+    return _val_of(refs[ch]) - _val_of(refs[1])
+
+
+def test_rms_ranking_prefers_true_neutrals():
+    # Mid band split: opposed R/B deviation ±d (true distance from the gray axis
+    # sqrt(2)·d) vs a single-channel deviation 1.9d (true distance ~1.55d, i.e.
+    # farther). max-min ranks them the other way round (2d vs 1.9d).
+    d = 0.04
+    v = _val_img()
+    third = _H // 3
+    mid_rows = slice(third, 2 * third)
+    v[mid_rows, 0::2, 0] = 0.47 + d
+    v[mid_rows, 0::2, 2] = 0.47 - d
+    v[mid_rows, 1::2, 0] = 0.47 + 1.9 * d
+
+    res = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert res is not None
+    mid_refs = res[0]
+    assert abs(_dev(mid_refs, 0) - d) < 2e-3, "mid refs must come from the opposed (nearer-neutral) set"
+    assert abs(_dev(mid_refs, 2) + d) < 2e-3
+
+
+def test_strong_cast_recovered_by_correction_pass():
+    # A uniform +0.45 red cast puts every neutral's chroma above the strict cap —
+    # the single-pass estimator rejected the bands and fell back to the shadow tie.
+    # The correction pass re-ranks with the provisional cast removed, so the
+    # neutrals pass the (corrected) cap and the full axis is recovered.
+    cast = 0.45
+    cap = float(EXPOSURE_CONSTANTS["neutral_axis_chroma_cap"])
+    assert np.sqrt(2.0 * cast * cast / 3.0) > cap  # fixture genuinely beyond the strict cap
+    v = _val_img(highlight=0.15, mid=0.45, shadow=0.75)
+    v[:, :, 0] += cast
+
+    res = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert res is not None, "correctable cast must not collapse to the shadow-tie fallback"
+    mid_refs, shadow_refs, _, confidence = res
+    assert abs(_dev(mid_refs, 0) - cast) < 2e-3
+    assert abs(_dev(shadow_refs, 0) - cast) < 2e-3
+    assert confidence > 0.8  # clean, large, consistent grey sets
+
+
+def test_saturated_content_still_rejected():
+    # A mid band made ONLY of strongly colored content (beyond the first-pass cap)
+    # must not fabricate an axis by "correcting" the content to grey. Blue-tinted
+    # so the low luma weight keeps the content inside the mid band.
+    v = _val_img()
+    third = _H // 3
+    v[third : 2 * third, :, 2] = 0.47 + 0.75
+    assert measure_neutral_axis_from_log(_to_log(v), _BOUNDS) is None
+
+
+def test_confidence_drops_with_small_neutral_set():
+    big = measure_neutral_axis_from_log(_to_log(_val_img()), _BOUNDS)
+    # Shrink the mid-band population to a small patch; fill the rest of that
+    # region with highlight-band tones so only the patch feeds the mid refs.
+    v = _val_img()
+    third = _H // 3
+    v[third : 2 * third] = 0.17
+    v[third : third + 2, :] = 0.47  # 512 px -> ~154 selected
+    small = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert big is not None and small is not None
+    assert small[3] < big[3] * 0.75
+
+
+def test_confidence_drops_on_contradictory_bands():
+    consistent = _val_img()
+    consistent[:, :, 0] += 0.12
+    contradictory = _val_img()
+    third = _H // 3
+    contradictory[third : 2 * third, :, 0] += 0.12
+    contradictory[2 * third :, :, 0] -= 0.12
+    res_c = measure_neutral_axis_from_log(_to_log(consistent), _BOUNDS)
+    res_x = measure_neutral_axis_from_log(_to_log(contradictory), _BOUNDS)
+    assert res_c is not None and res_x is not None
+    assert res_x[3] < res_c[3] * 0.5
+
+
+def test_pure_neutral_full_confidence_and_exact_refs():
+    res = measure_neutral_axis_from_log(_to_log(_val_img()), _BOUNDS)
+    assert res is not None
+    mid_refs, shadow_refs, highlight_refs, confidence = res
+    for refs, v in ((mid_refs, 0.47), (shadow_refs, 0.79), (highlight_refs, 0.17)):
+        assert refs is not None
+        for ch in range(3):
+            assert abs(_val_of(refs[ch]) - v) < 1e-3
+    assert confidence > 0.9
+
+
+_FOLIAGE = (0.06, 0.0, 0.10)  # desaturated yellow-green: R and B denser than G, B most
+
+
+def _with_foliage(gray_cols: int) -> np.ndarray:
+    """Every band mostly foliage, with `gray_cols` columns of true gray."""
+    v = _val_img()
+    for ch, d in enumerate(_FOLIAGE):
+        v[:, gray_cols:, ch] += d
+    return v
+
+
+def test_foliage_is_not_taken_as_gray():
+    # Grays are a tenth of each band, so the lowest-chroma 30% is mostly foliage: without
+    # the foliage sector the axis lands on the leaves and the print goes magenta.
+    res = measure_neutral_axis_from_log(_to_log(_with_foliage(gray_cols=26)), _BOUNDS)
+    assert res is not None
+    for refs in res[:3]:
+        assert refs is not None
+        assert abs(_dev(refs, 0)) < 2e-3
+        assert abs(_dev(refs, 2)) < 2e-3
+
+
+def test_foliage_only_frame_has_no_axis():
+    assert measure_neutral_axis_from_log(_to_log(_with_foliage(gray_cols=0)), _BOUNDS) is None
+
+
+def test_pale_green_cast_is_still_removed():
+    # Below the foliage chroma floor a green cast is a cast, not content.
+    cast = 0.02
+    assert cast < float(EXPOSURE_CONSTANTS["neutral_axis_foliage_chroma"])
+    v = _val_img()
+    v[:, :, 0] += cast
+    v[:, :, 2] += cast
+    res = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert res is not None
+    assert abs(_dev(res[0], 0) - cast) < 2e-3
+    assert abs(_dev(res[0], 2) - cast) < 2e-3
+
+
+_SKY = (0.10, 0.0, -0.10)  # pale azure: R denser and B thinner than G (hue -90 deg)
+
+
+def _with_sky(gray_cols: int) -> np.ndarray:
+    """Every band mostly sky, with `gray_cols` columns of true gray."""
+    v = _val_img()
+    for ch, d in enumerate(_SKY):
+        v[:, gray_cols:, ch] += d
+    return v
+
+
+def test_sky_is_not_taken_as_gray():
+    # The palest sky is the lowest-chroma 30% of a band with few grays: without the sky
+    # sector the axis lands on it and the print goes yellow.
+    res = measure_neutral_axis_from_log(_to_log(_with_sky(gray_cols=26)), _BOUNDS)
+    assert res is not None
+    for refs in res[:3]:
+        assert refs is not None
+        assert abs(_dev(refs, 0)) < 2e-3
+        assert abs(_dev(refs, 2)) < 2e-3
+
+
+def test_sky_only_frame_has_no_axis():
+    assert measure_neutral_axis_from_log(_to_log(_with_sky(gray_cols=0)), _BOUNDS) is None
+
+
+def test_pale_blue_cast_is_still_removed():
+    # Below the sky chroma floor a blue cast is a cast, not content.
+    cast = 0.04
+    assert cast < float(EXPOSURE_CONSTANTS["neutral_axis_sky_chroma"])
+    v = _val_img()
+    v[:, :, 0] += cast
+    v[:, :, 2] -= cast
+    res = measure_neutral_axis_from_log(_to_log(v), _BOUNDS)
+    assert res is not None
+    assert abs(_dev(res[0], 0) - cast) < 2e-3
+    assert abs(_dev(res[0], 2) + cast) < 2e-3
+
+
+def _mixed_mid(spread: float) -> np.ndarray:
+    """Mid band whose near-neutral set holds a gray cluster between two colored ones,
+    offset from green by +spread and -spread in red."""
+    v = _val_img()
+    mid_rows = slice(_H // 3, 2 * (_H // 3))
+    v[mid_rows, 31:69] = (0.50 + spread, 0.50, 0.50)
+    v[mid_rows, 69:107] = (0.56 - spread, 0.56, 0.56)
+    v[mid_rows, 107:] = (0.90, 0.40, 0.40)
+    return v
+
+
+def test_mid_ref_is_a_real_offset_in_a_mixed_set():
+    # Red's median falls in one colored cluster and green's in the other, so their
+    # difference is the offset of no pixel in the set.
+    res = measure_neutral_axis_from_log(_to_log(_mixed_mid(0.08)), _BOUNDS)
+    assert res is not None
+    assert abs(_dev(res[0], 0)) < 2e-3
+    assert abs(_dev(res[0], 2)) < 2e-3
+
+
+def test_confidence_drops_with_a_wide_neutral_set():
+    narrow = measure_neutral_axis_from_log(_to_log(_mixed_mid(0.02)), _BOUNDS)
+    wide = measure_neutral_axis_from_log(_to_log(_mixed_mid(0.20)), _BOUNDS)
+    assert narrow is not None and wide is not None
+    assert narrow[3] > 0.6
+    assert wide[3] < 0.2

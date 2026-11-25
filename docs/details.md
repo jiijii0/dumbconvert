@@ -12,10 +12,14 @@ When you add scans you choose how they are analysed:
   a red wall or a sunset left out), and the roll gets **one colour baseline** and one
   grey axis for cast removal (a frame with no grey in it is balanced like its neighbours).
   Each frame keeps its own brightness range, and an unusual frame keeps its own measurement. This is what lab scanners do: the Frontier reads the
-  whole order before correcting colour. Set the **film stock** (type to search NegPy's
-  catalogue of 135 negative stocks) and the **camera** you shot with:
+  whole order before correcting colour. Choose the **film stock** first (type to search NegPy's
+  catalogue of negative stocks, or pick "Other colour negative" / "Other B&W negative"): the roll
+  is analysed only once it has one, and until then the window steps back around the field.
   - B&W stocks convert in B&W automatically;
-  - colour stocks use their own dye-unmix (crosstalk) matrix when NegPy ships one;
+  - colour stocks use their own dye-unmix (crosstalk) matrix when NegPy ships one, and their own
+    Lab print colours (see below); respools of Kodak Vision3 (CineStill, Flic Film, Silbersalz35)
+    use Vision3's;
+  - changing the stock while the roll is being analysed starts a new analysis at once;
   - film, camera, roll name and frame number are written into the exported file (EXIF/XMP).
     The scan's own EXIF is not copied, because it names the scanning camera.
 - **Single frames** (drop on the right half): each picture is analysed on its own.
@@ -59,7 +63,7 @@ press ↑ or ↓ with the right hand, which is on the arrows anyway to move thro
 cyan is more red, which is why the on-screen C column has a cyan + and a red −. Unassigned actions you can
 put on a key: one-step + / − keys for every correction, copy, paste, undo, redo, export.
 
-Always the same: Cmd+Z / Cmd+Shift+Z undo/redo, Cmd+C / Cmd+V copy/paste settings, Cmd+A select every frame
+Always the same (Ctrl instead of Cmd on Windows and Linux): Cmd+Z / Cmd+Shift+Z undo/redo, Cmd+C / Cmd+V copy/paste settings, Cmd+A select every frame
 (then any correction changes them all), Cmd+E export, Esc to leave a text field. Letters typed in text fields
 never change the picture.
 
@@ -112,7 +116,7 @@ metadata written into exported files: **date**, **location**, **camera**, **lens
 
 ## Export formats
 
-**Export…** opens one dialog with every option: what to export (everything, this group, or the selected frames), format, size (full, long edge in pixels, or print size in cm at a dpi), colour space (sRGB, Display P3, Adobe RGB), a file-name pattern (`{name}`, `{roll}`, `{film}`, `{frame}`, `{camera}`), keep both or overwrite, one subfolder per roll, and Show in Finder. Every format gets the crop, rotation
+**Export…** opens one dialog with every option: what to export (everything, this group, or the selected frames), format, size (full, long edge in pixels, or print size in cm at a dpi), colour space (sRGB, Display P3, Adobe RGB), a file-name pattern (`{name}`, `{roll}`, `{film}`, `{frame}`, `{camera}`), keep both or overwrite, one subfolder per roll, and Show in Finder (Explorer on Windows, the file manager on Linux). Every format gets the crop, rotation
 and all adjustments, plus the roll's camera and film in its metadata.
 
 | Format | Best for |
@@ -143,7 +147,7 @@ does not fit continues on a second sheet. The sheet is drawn by NegPy's contact-
 | `simpleneg/engine.py` | Maps DumbConvert's sliders onto NegPy's `WorkspaceConfig` and calls its renderer. **Start here.** |
 | `simpleneg/app.py` | The window: film strip, preview, sliders, export. |
 | `simpleneg/keys.py` | Key bindings: the list of actions, the defaults, the keyboard drawing, saving. |
-| `vendor/negpy/` | NegPy's full source. Its `docs/PIPELINE.md` explains the colour science. |
+| `vendor/negpy/` | NegPy's conversion engine (a trimmed copy, changed for this app). Its `docs/PIPELINE.md` explains the colour science. |
 
 ## How the controls map to NegPy
 
@@ -158,29 +162,31 @@ does not fit continues on a second sheet. The sheet is drawn by NegPy's contact-
 | Auto WB | DumbConvert's own: makes the least colourful pixels neutral by setting C/M/Y |
 | Refine ▸ Re-measure Inside Crop | Measures the film again inside the crop (`analysis_rect`), then Auto WB |
 | Settings (gear tab) ▸ Flat field | Flat field gain map from a photo of the bare light panel (NegPy's `compute_gain`), all images: fixes uneven light and vignetting |
-| Refine ▸ Split contrast: Highlights / Shadows (soft ↔ hard) | Split grade (`highlight_grade` / `shadow_grade`): contrast of one end of the curve, like split-grade darkroom printing |
-| Refine ▸ Shadow cast / Highlight cast | Zone filtration (`shadow_*` / `highlight_*` CMY): warmth = yellow (+ a little red), tint = magenta |
-| (automatic) Dye separation | `dye_separation` fixed at 1.2: restores the colour white-light scanning loses |
-| Refine ▸ Glow | `glow_amount` (Lab stage): a soft glow around bright areas, like a minilab scan's soft focus |
+| Refine ▸ Light: Exposure, Highlights, Shadows, Whites, Blacks | Lightroom-like tone controls on the finished positive (`exposure_ev`, `tone_*`, Lab stage) |
+| Refine ▸ Color: Temp / Tint | White balance on the positive, like a raw converter's (`wb_temp` / `wb_tint`); the dropper sets them from a spot that should be grey |
+| Refine ▸ Color: Mixer | Hue, saturation and luminance per colour band, in Oklab (`hsl_*`); the dropper picks the band from the photo |
+| Refine ▸ Finish: Print look | Lab print (the default, see below), None (a straight conversion) or one of NegPy's papers and minilab renderings (`paper_profile`) |
+| (automatic) Dye separation | `dye_separation` 1.1 under white light, 1.0 under RGB light |
+| Refine ▸ Finish: Glow | `glow_amount` (Lab stage): a soft glow around bright areas, like a minilab scan's soft focus |
 | Refine ▸ Sharpen | `sharpen` (Lab stage), NegPy's default 0.25 |
 | Refine ▸ Colour noise | `chroma_denoise` 0–3, default 1.0 (NegPy's 2.5 removes barely more speckle and costs some colour) |
 | Heal Dust (H) | `manual_heal_strokes`: each click is a search area; NegPy repairs only what stands out from the film around it. Clicks are mapped to the raw scan with NegPy's UV grid, so crop and rotation can change later. Scroll for brush size; every spot is one undo step |
-| Clean Area (A) | NegPy's automatic dust and scratch removal (`dust_remove`), kept to the shapes you draw: everything outside them is given to NegPy as `dust_exclusion_strokes`. Right-click a shape to remove it; each shape is one undo step. |
+| Clean Area (A) | The shape you draw is filled with heal bands (`manual_heal_strokes`), so inside it NegPy repairs whatever stands out from the film around it and leaves clean film alone. Right-click a shape to remove it; each shape is one undo step. |
 | Pick Grey (W) | DumbConvert's own: sets C/M/Y so the clicked spot comes out grey |
-| (automatic) Film crosstalk | From the roll's film stock (`crosstalk_matrix`), full strength for white-light scanning |
+| (automatic) Film crosstalk | From the roll's film stock (`crosstalk_matrix`), the film's own dye matrix under either light |
+| Settings ▸ Scanning light | White (a broadband panel: camera white balance in the decode, dye separation 1.1) or RGB (separate LEDs: a linear decode, no extra separation) |
+| Settings ▸ Accent | The colour of what is chosen: purple, blue, gold or teal |
 
-## Nothing to save
+## Saving a session
 
-DumbConvert is for quick jobs: open, convert, export, close. There are no projects or sidecar
-files. Two things protect your work anyway:
-
-- **Quitting asks first** if frames you adjusted have not been exported, or an export is running.
-- **A crash loses nothing**: the work in progress is written to a small recovery file every few
-  seconds (`~/Library/Application Support/DumbConvert/recovery.json`) and removed on a normal
-  quit. If it is still there at the next start, the app offers to restore it.
+There are no projects or sidecar files. The save icon in the tab bar (Cmd+S, Ctrl+S on Windows
+and Linux) keeps the open rolls and their adjustments inside the app; a dot beside it shows unsaved
+changes. Quitting with unsaved changes asks whether to save, and the next start offers the saved
+session back. A crash loses nothing either: the work in progress is written to a small recovery
+file every few seconds, in the app's data folder, and offered back at the next start.
 
 The place search in the Exif tab sends the words you type to Photon (photon.komoot.io), a free
-search over OpenStreetMap. No key or account is used, and nothing else leaves your Mac.
+search over OpenStreetMap. No key or account is used, and nothing else leaves your computer.
 
 ## Why these defaults
 
@@ -188,14 +194,14 @@ DumbConvert starts from a more film-like setup than NegPy's neutral defaults:
 
 | Setting | NegPy default | DumbConvert | Why |
 |---|---|---|---|
-| Look | Digital (Adobe RGB) | Digital (Adobe RGB), not changeable | A straight conversion, no print-paper look: the print look is for printing. On white-light scans it was also the most colourful and the most neutral of NegPy's renderings. |
-| Crosstalk | off | half the film's dye matrix (Generic C41 or the roll's stock) + half a measured white-light matrix, 1.0 | DumbConvert assumes a bright **white** light. White light + a camera mixes the dye layers (Bayer filters overlap around 580–600 nm), which costs colour, mostly in green and blue. NegPy's matrices describe the film's dyes only; `WHITE_LIGHT_MATRIX` in `engine.py` adds what the light and the camera do, fitted in density space on CineStill's sample scans (the same frames under a narrow-band light and a high-CRI white light). |
-| Dye Separation | 1.0 | 1.1 | The white-light matrix restores the colour where it was lost, so only a small overall lift is left. Half the measured matrix + 1.1 was closer to the narrow-band scans than Generic C41 + 1.2 on all six test pairs, also when a pair was left out of the fit; the full measured matrix overshot on one. |
+| Look | Digital (a straight conversion) | Lab print | A straight scan conversion leaves out what printing on photo paper does to a negative's colour. Lab print adds it back, per film stock, from the makers' data sheets: a spectral simulation of each film exposed, scanned under a white LED by real camera sensors, and printed on the paper its maker pairs it with (`PRINT_CHARACTER` in `engine.py`, method in `tools/print_character/`). Kodak stocks turn yellows toward amber and blues toward teal with quieter greens; Fujifilm keeps lemon yellows and cooler greens. 70 % of the measured hue turns, with the overall colourfulness left as it is. |
+| Crosstalk | off | the film's dye matrix (Generic C41 or the roll's stock), 1.0 | Under white light a camera mixes the dye layers a little; the film's own matrix unmixes the film. |
+| Dye Separation | 1.0 | 1.1 (white light) | A small overall lift for what a broadband light and a Bayer sensor lose. |
 | Cast Removal | 0.5 | 0.2 | Less neutralizing keeps the film's own colour character. |
 | Skin Protection | 0.5 | 0.25 | Less damping of warm tones. |
 
 To expose another NegPy control, find its field in `vendor/negpy/negpy/features/*/models.py`
-(the meaning is in `vendor/negpy/docs/USER_GUIDE.md`), add it to `Settings` in `engine.py`,
+(the comments there say what it does), add it to `Settings` in `engine.py`,
 map it in `to_config()`, and add a `line(...)` row in `app.py`'s `_build_more` (the Refine section).
 
 ## Updating NegPy

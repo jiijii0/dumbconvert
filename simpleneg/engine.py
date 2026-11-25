@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 from negpy.domain.models import ExportConfig, ExportFormat, WorkspaceConfig
 from negpy.features.process.models import DEFAULT_CROSSTALK_MATRIX
+from negpy.features.process.models import scan_setup_values
 from negpy.services.assets.crosstalk import CrosstalkProfiles
 from negpy.infrastructure.loaders.constants import SUPPORTED_RAW_EXTENSIONS
 from negpy.services.rendering.image_processor import ImageProcessor
@@ -40,25 +41,88 @@ CMY_SCALE = 2.0
 CMY_BALANCE = (1.0, 0.87, 1.40)
 
 
-# What a white light and a camera's colour filters do to a colour negative, measured: the same
-# frames scanned under a narrow-band RGB light and under a high-CRI white light (CineStill's
-# sample pairs), fitted in density space. Red is read almost cleanly; green and blue are not.
-# NegPy's film matrices describe the film's dyes only, so SimpleNeg uses half of each: the
-# film's dyes and this rig correction. Half is deliberate: on the test pairs it came closer to
-# the narrow-band scan than the dye matrix alone on every frame (also on frames left out of
-# the fit), while the full measured matrix overshot on some.
-WHITE_LIGHT_MATRIX = (1.005, -0.010, 0.005,
-                      -0.290, 1.074, 0.215,
-                      -0.069, -0.452, 1.521)
-WHITE_LIGHT_SHARE = 0.5
+# Lab print: the colour a C-41 negative takes when it is printed on photo paper, which a straight
+# scan conversion leaves out. Measured with a spectral simulation from the manufacturers' data
+# sheets (spektrafilm's digitised Kodak / Fujifilm curves, CC BY-SA 4.0, github.com/andreavolpato/
+# spektrafilm): a ColorChecker exposed on each film, scanned under a high-CRI white LED by real
+# camera sensors and converted here, against the same negative printed on the paper its maker
+# pairs it with. Per colour-mixer band (red .. magenta): the hue turn in degrees and the chroma
+# factor taking this conversion to the print. Stocks without data get the Kodak average (the
+# stocks most people shoot). tools/print_character/README.md tells how the numbers were made.
+PRINT_CHARACTER = {
+    "Kodak Gold 200 (approx)": ((-6.3, -8.3, -12.0, -5.5, -2.9, -8.8, -3.0, -8.7),
+                                (1.01, 0.95, 0.82, 0.68, 1.06, 1.01, 0.85, 1.05)),
+    "Kodak Ultra Max 400 (approx)": ((-5.2, -9.0, -11.5, -4.8, -3.2, -10.1, -0.6, -6.5),
+                                     (1.05, 0.96, 0.83, 0.70, 1.06, 0.97, 0.83, 1.07)),
+    "Kodak Ektacolor Pro 160 / Portra 160 (approx)": ((-3.4, -9.3, -14.8, -8.9, -7.7, -16.8, -11.7, -6.9),
+                                                      (1.08, 0.99, 0.87, 0.71, 0.94, 0.87, 0.85, 1.00)),
+    "Kodak Ektacolor Pro 400 / Portra 400 (approx)": ((-4.1, -11.4, -16.7, -8.7, -6.8, -15.0, -7.4, -6.0),
+                                                      (0.97, 0.93, 0.81, 0.66, 0.99, 0.83, 0.74, 0.92)),
+    "Kodak Ektacolor Pro 800 / Portra 800 (approx)": ((-4.9, -10.0, -15.0, -7.2, -6.8, -13.0, -3.2, -5.9),
+                                                      (0.97, 0.91, 0.80, 0.64, 0.95, 0.84, 0.69, 0.98)),
+    "Kodak Ektar 100 (approx)": ((-3.6, -7.7, -15.7, -7.9, -7.6, -14.4, -2.0, -11.9),
+                                 (1.12, 1.03, 0.89, 0.70, 1.04, 1.08, 0.78, 1.13)),
+    "Fujicolor C200 (approx)": ((0.6, -7.7, 2.4, 5.8, -7.2, -13.2, 7.9, 18.7),
+                                (1.21, 0.96, 0.90, 0.84, 1.09, 0.79, 0.75, 1.08)),
+    "Fujicolor Superia X-TRA 400 (approx)": ((0.4, -7.2, 2.4, 5.7, -8.1, -8.5, 9.6, 19.4),
+                                             (1.31, 1.00, 0.97, 0.92, 1.15, 0.81, 0.80, 1.13)),
+    "Fujicolor Pro 400H (approx)": ((-1.3, -11.6, -5.9, -0.1, -8.9, -8.6, 5.1, 9.5),
+                                    (1.16, 0.93, 0.85, 0.74, 1.13, 0.83, 0.78, 1.07)),
+    # Cinema negative (and its respools: CineStill, Flic Film, Silbersalz35) through a C-41 lab onto
+    # RA-4 paper (Supra Endura): hues stay near neutral, colour is calmer than a still film's
+    "Kodak VISION3 50D 5203/7203 (approx)": ((-2.2, -2.3, -4.9, 1.7, -4.1, -1.6, 2.3, -0.5),
+                                             (0.87, 0.85, 0.83, 0.76, 0.92, 0.83, 0.76, 0.90)),
+    "Kodak VISION3 200T 5213/7213 (approx)": ((-3.3, -4.0, -4.4, 3.2, -5.1, -2.7, 4.1, 2.9),
+                                              (0.83, 0.81, 0.77, 0.73, 0.87, 0.76, 0.73, 0.84)),
+    "Kodak VISION3 250D 5207/7207 (approx)": ((-4.2, -5.1, -7.5, -0.3, -5.9, -2.8, 3.0, -1.1),
+                                              (0.89, 0.85, 0.79, 0.71, 0.89, 0.83, 0.69, 0.92)),
+    "Kodak VISION3 500T 5219/7219 (approx)": ((-3.1, -9.0, -12.4, -2.6, -6.0, -6.9, -0.4, 1.4),
+                                              (0.84, 0.84, 0.74, 0.63, 0.84, 0.77, 0.61, 0.80)),
+}
+PRINT_CHARACTER_DEFAULT = ((-4.6, -9.3, -14.3, -7.2, -5.8, -13.0, -4.7, -7.7),
+                           (1.03, 0.96, 0.84, 0.68, 1.01, 0.93, 0.79, 1.03))
+# The print is ~9 % less colourful than this conversion overall (Kodak average): that part is left
+# out, so the look turns hues rather than dulling; a stock keeps its own difference from the average.
+PRINT_CHROMA_REF = 0.91
+PRINT_STRENGTH = 0.7    # of the measured difference: the look, kept subtle (sliders adjust on top)
+LAB_PRINT = "lab"
 
 
-def white_light_matrix(dyes: tuple) -> tuple:
-    """The film's dye-unmix matrix combined with the white-light correction (rows sum to 1)."""
+def print_character(film: str) -> tuple[tuple, tuple]:
+    """The Lab print look of a film as colour-mixer values (hue, saturation per band)."""
+    hue, chroma = PRINT_CHARACTER.get(film, PRINT_CHARACTER_DEFAULT)
+    from negpy.features.lab.logic import HSL_HUE_DEGREES
+    return (tuple(PRINT_STRENGTH * h / HSL_HUE_DEGREES for h in hue),
+            tuple(PRINT_STRENGTH * (c / PRINT_CHROMA_REF - 1.0) for c in chroma))
+
+
+def _mixer(st: "Settings") -> tuple[tuple, tuple]:
+    """The colour mixer NegPy gets: the photo's own, on top of the Lab print look (colour film only)."""
+    hue, sat = tuple(st.hsl_hue), tuple(st.hsl_saturation)
+    if st.paper != LAB_PRINT or st.mode != "color" or st.grayscale:
+        return hue, sat
+    ph, ps = print_character(st.film)
+    return (tuple(float(np.clip(u + p, -1.0, 1.0)) for u, p in zip(hue, ph)),     # turns add up
+            tuple(float(np.clip((1 + u) * (1 + p) - 1, -1.0, 1.0)) for u, p in zip(sat, ps)))   # chroma scales multiply
+
+
+def print_looks(grayscale: bool) -> list[tuple[str, str]]:
+    """(key, name) of the print looks for colour or B&W film, "None" first: NegPy's paper profiles,
+    and for colour film the Lab print look right after None."""
+    from negpy.features.exposure.papers import profiles_for_mode
+    out = []
+    for key, p in profiles_for_mode(MODES["bw" if grayscale else "color"]):
+        name = "None" if key == "neutral" else p.label.replace("Digital (", "").rstrip(")") if p.label.startswith("Digital (") else p.label
+        out.append((key, name))
+    if not grayscale:
+        out.insert(1, (LAB_PRINT, "Lab print"))
+    return out
+
+
+def film_matrix(dyes: tuple) -> tuple:
+    """The film's dye-unmix matrix alone (rows sum to 1): what an RGB light scan needs."""
     d = np.array(dyes, dtype=np.float64).reshape(3, 3)
-    d = d / d.sum(axis=1, keepdims=True)
-    m = (1.0 - WHITE_LIGHT_SHARE) * d + WHITE_LIGHT_SHARE * np.array(WHITE_LIGHT_MATRIX).reshape(3, 3)
-    return tuple(float(v) for v in (m / m.sum(axis=1, keepdims=True)).ravel())
+    return tuple(float(v) for v in (d / d.sum(axis=1, keepdims=True)).ravel())
 
 
 def films() -> list[str]:
@@ -92,14 +156,12 @@ class Settings:
     # a straight conversion (no print-paper look), full dye unmixing, fewer "neutralizing"
     # helpers (README, "Why these defaults").
     dye_separation: float = 1.1   # colour strength between the dye layers: fixed, restores what white light loses
-    # Tones, like a darkroom's split-grade printing: -1 soft .. +1 hard (contrast of that end only)
+    # Highlights and Shadows, -1 .. 1, like Lightroom: darker ← → brighter in that part of the tones
     highlight_tone: float = 0.0
     shadow_tone: float = 0.0
-    # Colour casts that only sit in one end of the tonal range (fog in shadows, red highlights)
-    shadow_warmth: float = 0.0     # -1 cooler (blue) .. +1 warmer (amber)
-    shadow_tint: float = 0.0       # -1 greener .. +1 more magenta
-    highlight_warmth: float = 0.0
-    highlight_tint: float = 0.0
+    # White balance on the positive, like a raw converter's: -1 .. 1 (NegPy lab wb_temp / wb_tint)
+    temp: float = 0.0              # cooler (blue) ← → warmer (amber)
+    tint: float = 0.0              # greener ← → more magenta
     # Finish
     glow: float = 0.0              # 0 .. 1: soft glow around bright areas, like a minilab scan
     sharpen: float = 0.25          # 0 .. 1 (NegPy's default)
@@ -110,12 +172,24 @@ class Settings:
     # Areas to clean automatically: each a closed shape, ((x, y), ...) in the raw scan like heal_spots.
     # Inside them NegPy's dust and scratch detector runs; the rest of the picture is left alone.
     heal_areas: tuple = ()
+    exposure: float = 0.0          # -1 .. 1: the positive's exposure, ±EXPOSURE_STOPS at the ends (not D)
+    white_point: float = 0.0       # -1 .. 1: Whites, the light end, dimmer ← → brighter
+    black_point: float = 0.0       # -1 .. 1: Blacks, the dark end, deeper ← → lifted
+    # Colour mixer, per band (red, orange, yellow, green, aqua, blue, purple, magenta), each -1 .. 1
+    hsl_hue: tuple = (0.0,) * 8
+    hsl_saturation: tuple = (0.0,) * 8
+    hsl_luminance: tuple = (0.0,) * 8
     # Auto crop, once found: the rectangle (0..1, like `crop`) and NegPy's key for the framing it was
     # found on. Kept so every render (draft, full, export) uses the same crop instead of looking again.
     auto_rect: tuple | None = None
     auto_key: str = ""
     # Set automatically, not in the panel
     film: str = "Generic C41"    # crosstalk profile (dye unmix matrix); set from the roll's film stock
+    paper: str = "lab"           # print look: "lab" = Lab print (PRINT_CHARACTER), "neutral" = none, else a NegPy paper
+    # The roll's one white balance (R, G, B multipliers) its camera RAWs decode on: a camera in auto
+    # white balance balances each frame differently, and the same film base would read differently
+    raw_wb: tuple | None = None
+    light: str = "white"         # the scanning light, from Settings: "white" (broadband panel) or "rgb" (narrowband LEDs)
     crosstalk: float = 1.0       # 0 = off .. 1 = full matrix. White light mixes the layers: unmix fully
     cast_removal: float = 0.2    # NegPy default 0.5
     skin_protection: float = 0.25   # NegPy default 0.5
@@ -126,6 +200,7 @@ class Settings:
     roll_floors: tuple | None = None
     roll_ceils: tuple | None = None
     roll_axis: tuple | None = None   # the roll's grey axis: one colour cast correction for the whole roll
+    roll_slope: tuple | None = None  # the roll's dye contrast per channel (NegPy pool_dye_slopes; None = all alike)
 
     def copy(self) -> "Settings":
         return Settings(**asdict(self))
@@ -138,17 +213,19 @@ class Settings:
 # ---------------------------------------------------------------------------
 # 2. Settings -> NegPy config
 # ---------------------------------------------------------------------------
-TONE_GRADE = 35.0   # ISO-R points at the end of a Tone slider
-CAST_CC = 0.75      # zone filtration at the end of a cast slider (0.75 = 15 CC)
+EXPOSURE_STOPS = 2.0  # Exposure at the end of its slider, in stops (one slider step = 0.1 stop)
 
 
-def to_config(st: Settings, uncropped: bool = False, path: Path | None = None) -> WorkspaceConfig:
+def to_config(st: Settings, uncropped: bool = False, path: Path | None = None,
+              long_edge: int | None = None) -> WorkspaceConfig:
     """`uncropped=True` renders the whole frame (used while editing the crop).
-    `path` is the scan being rendered: Contrast needs to measure it (see _with_contrast)."""
+    `path` is the scan being rendered and `long_edge` its render size (None: the whole decode):
+    Contrast measures the scan as that render will (see _with_contrast)."""
     flat = {
         "process_mode": MODES[st.mode],
-        # NegPy's "Digital" output: an ideal print with no paper dyes, i.e. no print look
-        "paper_profile": "neutral",
+        # The print look: "neutral" is NegPy's "Digital", an ideal print with no paper dyes. A look of
+        # the other kind of film (colour paper on B&W) falls back to it inside NegPy.
+        "paper_profile": "neutral" if st.paper == LAB_PRINT else st.paper,
         # Print Density (exposure time under the enlarger). Auto stays on.
         "density": st.density,
         # ISO-R grade: lower number = more contrast, 115 is normal.
@@ -157,31 +234,41 @@ def to_config(st: Settings, uncropped: bool = False, path: Path | None = None) -
         "saturation": st.saturation,
         "cast_removal_strength": st.cast_removal,
         "skin_protection": st.skin_protection,
-        "dye_separation": st.dye_separation,
+        # White light mixes the dye layers; extra separation gives back what it loses. RGB light does not.
+        "dye_separation": st.dye_separation if st.light != "rgb" else 1.0,
+        # A camera under RGB light: no camera white balance in the decode (NegPy's scanning-setup rule)
+        "linear_raw": scan_setup_values("camera", "narrowband" if st.light == "rgb" else "white")[0],
         "wb_cyan": CMY_SCALE * CMY_BALANCE[0] * (st.cyan - 1.0),
         "wb_magenta": CMY_SCALE * CMY_BALANCE[1] * (st.magenta - 1.0),
         "wb_yellow": CMY_SCALE * CMY_BALANCE[2] * (st.yellow - 1.0),
         # Split grade, ISO-R points: negative = harder, like the main grade
-        "highlight_grade": -TONE_GRADE * st.highlight_tone,
-        "shadow_grade": -TONE_GRADE * st.shadow_tone,
         # Zone filtration (1.0 = 20 CC). Warmth = yellow plus a little red, tint = magenta
-        "shadow_yellow": CAST_CC * st.shadow_warmth,
-        "shadow_cyan": -0.35 * CAST_CC * st.shadow_warmth,
-        "shadow_magenta": CAST_CC * st.shadow_tint,
-        "highlight_yellow": CAST_CC * st.highlight_warmth,
-        "highlight_cyan": -0.35 * CAST_CC * st.highlight_warmth,
-        "highlight_magenta": CAST_CC * st.highlight_tint,
+        "wb_temp": st.temp,
+        "wb_tint": st.tint,
         "glow_amount": st.glow,
         "sharpen": st.sharpen,
         "chroma_denoise": 3.0 * st.color_noise,
-        # A spot is a search area: NegPy repairs only what stands out from the film around it
-        "manual_heal_strokes": [([[x, y]], float(size), 0.0, 0.0) for x, y, size in st.heal_spots],
-        # NegPy's automatic dust removal looks at the whole picture; everything outside the areas
-        # you drew is handed back to it as "leave this alone" (see _outside_strokes)
-        "dust_remove": bool(st.heal_areas),
-        "dust_exclusion_strokes": _outside_strokes(_as_tuples(st.heal_areas)) if st.heal_areas else [],
+        # Light: Highlights, Shadows, Whites, Blacks, Lightroom-like on the finished positive (lab.apply_tone)
+        "tone_highlights": st.highlight_tone,      # Lightroom-like, on the finished positive
+        "tone_shadows": st.shadow_tone,
+        "tone_whites": st.white_point,
+        "tone_blacks": st.black_point,
+        "exposure_ev": EXPOSURE_STOPS * st.exposure,
+        "hsl_hue": _mixer(st)[0],
+        "hsl_saturation": _mixer(st)[1],
+        "hsl_luminance": tuple(st.hsl_luminance),
+        # A spot is a search area: NegPy repairs only what stands out from the film around it.
+        # An area is filled with the same repair, band by band (_inside_strokes).
+        "manual_heal_strokes": [([[x, y]], float(size), 0.0, 0.0) for x, y, size in st.heal_spots]
+        + (_inside_strokes(_as_tuples(st.heal_areas)) if st.heal_areas else []),
         "analysis_buffer": st.border,
         "analysis_rect": st.analysis_rect,
+        # The film is read once, on the scan as loaded: crop, turn and straighten only frame it.
+        # Re-measure Inside Crop (analysis_rect) is the one way to meter the framed picture.
+        "meter_as_loaded": True,
+        # The black and white points skip the most extreme 0.05 % of the picture (on top of NegPy's
+        # own 0.01 %): a few dust specks then cannot set them, so healing them leaves the rest alone
+        "luma_range_clip": 0.05,
         "rotation": st.rotation % 4,
         "flip_horizontal": st.mirror,
         "fine_rotation": float(st.fine_rotation),
@@ -196,14 +283,19 @@ def to_config(st: Settings, uncropped: bool = False, path: Path | None = None) -
     if matrix and st.crosstalk > 0:
         # Unmix the dye layers in density space, before NegPy measures the film.
         flat["crosstalk_strength"] = st.crosstalk
-        flat["crosstalk_matrix"] = white_light_matrix(tuple(matrix))
+        # The film's own dye matrix under either light; white light differs only in the extra
+        # dye separation above and the camera white balance in the decode.
+        flat["crosstalk_matrix"] = film_matrix(tuple(matrix))
         flat["crosstalk_profile"] = st.film
         flat["crosstalk_process"] = "Color Negative"
+    if st.raw_wb:
+        flat["decode_wb"] = tuple(st.raw_wb)
     if st.roll_floors and st.roll_ceils:
         # Colour from the whole roll (film base + cast are the same on every frame),
         # brightness range per frame, like a lab scanner reading the whole order first.
         flat["locked_floors"] = tuple(st.roll_floors)
         flat["locked_ceils"] = tuple(st.roll_ceils)
+        flat["locked_slope"] = st.roll_slope     # how the roll's colour follows each frame's exposure
         flat["use_color_average"] = True
         flat["use_luma_average"] = False
         if st.roll_axis and st.mode == "color":
@@ -218,27 +310,23 @@ def to_config(st: Settings, uncropped: bool = False, path: Path | None = None) -
     if not uncropped:
         if st.crop:
             flat["crop_rect"] = st.crop
+        elif st.auto_crop and st.auto_rect:
+            # Auto crop is found once and then kept like a crop of your own: turning and mirroring
+            # move it with the picture, straightening leaves it; only Refresh looks again
+            flat["crop_rect"] = tuple(st.auto_rect)
         elif st.auto_crop:
-            flat["crop_from_auto"] = True
-            if st.auto_rect and st.auto_key:
-                # NegPy's frozen auto crop: used while the framing still matches its key
-                # (a turn, a flip or straightening changes the key, and NegPy looks again)
-                flat["crop_rect"] = tuple(st.auto_rect)
-                flat["crop_detect_key"] = st.auto_key
+            flat["crop_from_auto"] = True        # until the search (find_auto_crop) answers
     cfg = WorkspaceConfig.from_flat_dict(flat)
     if path is not None and abs(st.contrast - 1.0) > 1e-6:
-        cfg = _with_contrast(cfg, path, st)
+        cfg = _with_contrast(cfg, path, st, uncropped, long_edge)
     return cfg
-
 
 # ---------------------------------------------------------------------------
 # Cleaning areas
 # ---------------------------------------------------------------------------
-# NegPy can find dust and scratches by itself, but only on the whole picture, with a brush to
-# protect film it mistook for dust. An area to clean is that turned inside out: the detector
-# runs everywhere and everything outside your shapes is protected. The protection is painted
-# as thin horizontal bands, row by row, each ending where a shape begins.
-HEAL_AREA_ROWS = 240
+# An area to clean is filled with heal bands, row by row, the same repair a heal spot does: it
+# fixes only what stands out from the film around it, so clean film inside the shape stays as it is.
+HEAL_AREA_BAND = 24.0     # band diameter, px at NegPy's HEAL_SIZE_REF (1600 px long edge)
 
 
 def _as_tuples(v):
@@ -246,33 +334,27 @@ def _as_tuples(v):
 
 
 @functools.lru_cache(maxsize=64)
-def _outside_strokes(areas: tuple) -> list:
-    """Protection bands (NegPy's dust_exclusion_strokes) covering the scan outside `areas`."""
-    size = 3200.0 / HEAL_AREA_ROWS * 0.9          # band width: neighbouring rows overlap on any frame shape
-    cap = size / 3200.0 * 1.5                     # a band's round end reaches this far: stop short of the shape
+def _inside_strokes(areas: tuple) -> list:
+    """Heal bands (NegPy manual_heal_strokes) filling the inside of each shape (scan 0..1)."""
+    from negpy.features.retouch.models import HEAL_SIZE_REF
+    reach = HEAL_AREA_BAND / HEAL_SIZE_REF        # a band's diameter, as a share of the long edge
+    step = reach * 0.6                            # rows overlap on any frame shape
     strokes = []
-    for row in range(HEAL_AREA_ROWS):
-        y = (row + 0.5) / HEAL_AREA_ROWS
-        inside = []                               # the stretches of this row that lie in a shape
-        for poly in areas:
+    for poly in areas:
+        ys = [q[1] for q in poly]
+        y = min(ys) + step / 2
+        while y < max(ys):
             xs = []
             for (x0, y0), (x1, y1) in zip(poly, poly[1:] + poly[:1]):
                 if (y0 <= y) != (y1 <= y):
                     xs.append(x0 + (y - y0) * (x1 - x0) / (y1 - y0))
             xs.sort()
-            inside += list(zip(xs[0::2], xs[1::2]))
-        inside.sort()
-        x, gaps = 0.0, []
-        for a, b in inside:
-            if a > x:
-                gaps.append((x, a))
-            x = max(x, b)
-        gaps.append((x, 1.0))
-        for a, b in gaps:
-            a = a + cap if a > 0.0 else -cap      # the frame's own edge needs no margin
-            b = b - cap if b < 1.0 else 1.0 + cap
-            if b > a:
-                strokes.append(([[round(a, 5), round(y, 5)], [round(b, 5), round(y, 5)]], size))
+            for a, b in zip(xs[0::2], xs[1::2]):
+                a, b = a + reach / 2, b - reach / 2    # the round ends stay inside the shape
+                if b <= a:
+                    a = b = (a + b) / 2
+                strokes.append(([[round(a, 5), round(y, 5)], [round(b, 5), round(y, 5)]], HEAL_AREA_BAND, 0.0, 0.0))
+            y += step
     return strokes
 
 
@@ -285,29 +367,48 @@ def _outside_strokes(areas: tuple) -> list:
 # slope and its shadow/highlight holds), switch the automatic off, and print the same curve
 # with the slope multiplied. Every step is the same change on every frame, up and down.
 CONTRAST_GAIN = 0.6      # one fader step (0.05) changes the slope by about 3 %
+
+
+def _widen_grade_ladder():
+    """The slope is printed as an ISO R grade on the frame's own density range, and NegPy clamps
+    grades to R50..R180. On a thin or flat negative the automatic slope needs a grade outside that
+    ladder, so the clamp gave a different curve and every fader step the same one. The ladder is
+    widened past anything slope_min..slope_max can need; at the default grade nothing changes."""
+    from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+
+    EXPOSURE_CONSTANTS["iso_r_min"] = min(EXPOSURE_CONSTANTS["iso_r_min"], 5.0)
+    EXPOSURE_CONSTANTS["iso_r_max"] = max(EXPOSURE_CONSTANTS["iso_r_max"], 600.0)
+
+
+_widen_grade_ladder()
 # Settings that change the picture's look but not what the film measures (the meter ignores them)
 _LOOK_FIELDS = ("contrast", "density", "saturation", "cyan", "magenta", "yellow", "highlight_tone", "shadow_tone",
-                "shadow_warmth", "shadow_tint", "highlight_warmth", "highlight_tint", "glow", "sharpen",
-                "color_noise", "heal_spots", "heal_areas")
+                "temp", "tint", "glow", "sharpen", "paper",
+                "color_noise", "heal_spots", "heal_areas", "white_point", "black_point", "exposure",
+                "hsl_hue", "hsl_saturation", "hsl_luminance")
 _meters: dict[tuple, dict] = {}
 _meters_lock = threading.Lock()
 
 
-def _meter(path: Path, st: Settings) -> dict:
-    """What NegPy's light meter reads on this frame (cached: it only changes with the framing,
-    the film and the roll, not with the look)."""
+def _meter(path: Path, st: Settings, uncropped: bool = False, long_edge: int | None = None) -> dict:
+    """What NegPy's light meter reads on this frame, rendered at `long_edge` (cached: it only
+    changes with the framing, the film, the roll and the render size, not with the look).
+    The reading depends on the size and on how the scan was shrunk, so it is taken on the
+    same downsample the render uses; a reading from another size prints another curve."""
     neutral, defaults = st.copy(), Settings()
     for f in _LOOK_FIELDS:
         setattr(neutral, f, getattr(defaults, f))
-    key = (source_hash(path), flat_profile_id(neutral), repr(neutral))
+    key = (source_hash(path), flat_profile_id(neutral), repr(neutral), uncropped, long_edge)
     with _meters_lock:
         if key in _meters:
             return _meters[key]
-    cfg = to_config(neutral)
+    from negpy.services.rendering.image_processor import _downsample_to_long_edge
+
+    cfg = to_config(neutral, uncropped)
     ip = _processor()
-    src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
-    step = max(1, int(np.ceil(max(src.shape[:2]) / 1200)))   # measuring needs no full resolution
-    small = np.ascontiguousarray(src[::step, ::step])
+    # A sized render decodes fast (half-size raw); a full-size one (zoom, export) decodes fully
+    src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=long_edge is not None)
+    small = np.ascontiguousarray(_downsample_to_long_edge(src, long_edge or 0))
     _, metrics = ip.run_pipeline(small, cfg, source_hash(path) + "|meter", max(small.shape[:2]),
                                  prefer_gpu=False, readback_metrics=True)
     keep = {k: metrics.get(k) for k in ("norm_density_range", "textural_range", "shadow_point",
@@ -320,7 +421,8 @@ def _meter(path: Path, st: Settings) -> dict:
     return keep
 
 
-def _with_contrast(cfg: WorkspaceConfig, path: Path, st: Settings) -> WorkspaceConfig:
+def _with_contrast(cfg: WorkspaceConfig, path: Path, st: Settings, uncropped: bool = False,
+                   long_edge: int | None = None) -> WorkspaceConfig:
     from dataclasses import replace
 
     from negpy.features.exposure import auto_sliders
@@ -328,7 +430,7 @@ def _with_contrast(cfg: WorkspaceConfig, path: Path, st: Settings) -> WorkspaceC
     from negpy.features.exposure.models import EXPOSURE_CONSTANTS
     from negpy.features.exposure.papers import slope_gain
 
-    m = _meter(path, st)
+    m = _meter(path, st, uncropped, long_edge)
     ex, mode = cfg.exposure, cfg.process.process_mode
     slope = auto_sliders._auto_slope(ex, mode, m)
     if slope is None:                    # nothing measured: plain paper grades
@@ -373,7 +475,7 @@ def scan_note(path: Path) -> str:
 # Vignetting / flat field
 # ---------------------------------------------------------------------------
 # NegPy's flat field multiplies the *linear scan* by a gain map before anything
-# else runs (before film-base detection too, so the corners no longer fool it).
+# else runs (before film-base detection too, so the corners cannot fool it).
 # NegPy asks a "provider" for the gain map of a profile id; we register our own
 # provider for ids "file:<path>:<mtime>": a gain map measured from a flat-field photo.
 from negpy.features.flatfield import logic as flatfield
@@ -451,21 +553,117 @@ def _processor() -> ImageProcessor:
     return ip
 
 
+def _srgb_oklab_ab(rgb) -> tuple[float, float]:
+    c = np.asarray(rgb, dtype=np.float64) / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    lms = np.cbrt(np.array([[0.4122214708, 0.5363325363, 0.0514459929], [0.2119034982, 0.6806995451, 0.1073969566],
+                            [0.0883024619, 0.2817188376, 0.6299787005]]) @ lin)
+    return (1.9779984951 * lms[0] - 2.4285922050 * lms[1] + 0.4505937099 * lms[2],
+            0.0259040371 * lms[0] + 0.7827717662 * lms[1] - 0.8086757660 * lms[2])
+
+
+def mixer_band(rgb) -> int | None:
+    """The colour mixer band (0 red .. 7 magenta) a colour picked on the picture (sRGB 0..255) belongs
+    to: the one with the most weight at its hue, as NegPy's mixer weighs it. None for a grey."""
+    from negpy.features.lab.logic import _band_weights
+    a, b = _srgb_oklab_ab(rgb)
+    if np.hypot(a, b) < 0.02:
+        return None
+    k0, k1, s = _band_weights(np.array([np.degrees(np.arctan2(b, a))]))
+    return int(k1[0] if s[0] > 0.5 else k0[0])
+
+
+def neutral_temp_tint(rgb, temp: float, tint: float) -> tuple[float, float]:
+    """Temp and Tint that make a spot of the picture (sRGB 0..255, shown with `temp` and `tint`) grey,
+    like a raw converter's white-balance dropper. Clicking again on the same spot refines it."""
+    from negpy.features.lab.logic import WB_TEMP_STOPS, WB_TINT_STOPS
+    c = np.clip(np.asarray(rgb, dtype=np.float64) / 255.0, 1 / 255, 1.0)
+    r, g, b = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    temp += np.log2(b / r) / (2 * WB_TEMP_STOPS)
+    tint -= np.log2(np.sqrt(r * b) / g) / WB_TINT_STOPS
+    return float(np.clip(round(temp, 2), -1, 1)), float(np.clip(round(tint, 2), -1, 1))
+
+
 def source_hash(path: Path) -> str:
     """NegPy caches the decoded scan under this key; changes when the file does."""
     s = path.stat()
     return f"{path}:{s.st_mtime_ns}:{s.st_size}"
 
 
+# The viewer (preview and zoom) renders on the graphics card when there is one: the same conversion
+# as the CPU, several times faster on large renders. Thumbnails, measuring and export stay on the
+# CPU, the reference. A card that fails once is not asked again this session.
+USE_GPU = True
+_gpu_failed = False
+_gpu_processors: dict[int, ImageProcessor] = {}
+
+
+def _gpu_processor() -> ImageProcessor | None:
+    """This thread's GPU-backed processor, or None when the card is off, missing or failed."""
+    global _gpu_failed
+    if not USE_GPU or _gpu_failed:
+        return None
+    tid = threading.get_ident()
+    with _processors_lock:
+        ip = _gpu_processors.get(tid)
+        if ip is None:
+            try:
+                ip = ImageProcessor(use_gpu=True)
+            except Exception:
+                ip = None
+            if ip is None or ip.engine_gpu is None:
+                _gpu_failed = True
+                return None
+            _gpu_processors[tid] = ip
+    return ip
+
+
+def gpu_active() -> bool:
+    return USE_GPU and not _gpu_failed
+
+
+def _display_render(path: Path, cfg: WorkspaceConfig, long_edge: int, fast_decode: bool, keep_source: bool,
+                    keep_small: bool = False) -> np.ndarray:
+    """A viewer render: on the card when it works, else (and from then on) on the CPU."""
+    global _gpu_failed
+    ip = _gpu_processor()
+    if ip is not None:
+        try:
+            arr = ip.render_display_array(str(path), cfg, source_hash(path), long_edge, prefer_gpu=True,
+                                          fast_decode=fast_decode, keep_source=keep_source, keep_small=keep_small)
+        except Exception:
+            arr = None
+        if arr is not None:
+            return arr
+        _gpu_failed = True                       # the card could not do it: the CPU from now on
+        print("DumbConvert: the graphics card failed a render; using the CPU from now on", file=sys.stderr)
+    arr = _processor().render_display_array(str(path), cfg, source_hash(path), long_edge, prefer_gpu=False,
+                                            fast_decode=fast_decode, keep_source=keep_source, keep_small=keep_small)
+    if arr is None:
+        raise RuntimeError(f"NegPy could not render {path.name}")
+    return arr
+
+
+def prefetch_preview(path: Path, st: Settings, long_edge: int):
+    """Get a frame ready for the viewer: its scan decoded and shrunk to the viewer's size in NegPy's
+    shared cache (about 20 MB at 1600 px), so switching to it renders at once."""
+    _processor().prefetch_display_source(str(path), to_config(st, False), long_edge, fast_decode=True)
+
+
 def preview(path: Path, st: Settings, long_edge: int, uncropped: bool = False,
-            keep_source: bool = False) -> np.ndarray:
+            keep_source: bool = False, gpu: bool = False) -> np.ndarray:
     """Render `path` to an sRGB uint8 array, long edge about `long_edge` px.
 
     `keep_source=True` keeps the decoded scan in this thread's memory, so the next render
-    of the same file skips decoding (the live preview); others release it.
+    of the same file skips decoding (the live preview); others release it. `gpu`: the viewer's
+    render, on the graphics card when there is one (see USE_GPU).
     """
+    cfg = to_config(st, uncropped, path, long_edge)
+    if gpu:
+        # the viewer: its shrunk decode is kept (shared with prefetch_preview), the full one is not needed
+        return _display_render(path, cfg, long_edge, True, False, keep_small=True)
     arr = _processor().render_display_array(
-        str(path), to_config(st, uncropped, path), source_hash(path), long_edge,
+        str(path), cfg, source_hash(path), long_edge,
         prefer_gpu=False, fast_decode=True, keep_source=keep_source,
     )
     if arr is None:
@@ -474,16 +672,105 @@ def preview(path: Path, st: Settings, long_edge: int, uncropped: bool = False,
 
 
 
-def preview_full(path: Path, st: Settings) -> np.ndarray:
-    """The picture at full resolution (a full raw decode, no half-size shortcut): for zooming in.
-    Keeps the decode in this thread's memory for the next zoomed render; release_cache() frees it."""
+def original_preview(path: Path, st: Settings, long_edge: int) -> np.ndarray:
+    """The scan as it came from the camera, before any conversion: the negative itself, turned and
+    flipped like the frame (no crop, no flat field), its light panel brought up to near white."""
+    from negpy.kernel.image.logic import apply_geometry_orientation
+    from negpy.services.rendering.image_processor import _downsample_to_long_edge
+
+    ip = _processor()
+    src, _, _ = ip._load_source_f32(str(path), to_config(Settings()), fast_decode=True, unmix=False)
+    img = _downsample_to_long_edge(np.ascontiguousarray(src[..., :3], dtype=np.float32), long_edge)
+    img = apply_geometry_orientation(img, st.rotation % 4, st.mirror, False)
+    white = float(np.percentile(img, 99.5)) or 1.0
+    shown = np.clip(img / white, 0.0, 1.0) ** (1 / 2.2)          # display encoding of linear light
+    return np.ascontiguousarray((shown * 255 + 0.5).astype(np.uint8))
+
+
+def thumbnail(path: Path, st: Settings, long_edge: int) -> np.ndarray:
+    """A filmstrip thumbnail: like preview, but the shrunk decode is kept (NegPy keep_small), so
+    redrawing it after an edit costs only the conversion, not decoding the scan again."""
     arr = _processor().render_display_array(
-        str(path), to_config(st, path=path), source_hash(path), 1_000_000,
-        prefer_gpu=False, fast_decode=False, keep_source=True,
+        str(path), to_config(st, False, path, long_edge), source_hash(path), long_edge,
+        prefer_gpu=False, fast_decode=True, keep_small=True,
     )
     if arr is None:
         raise RuntimeError(f"NegPy could not render {path.name}")
     return arr
+
+
+def preview_full(path: Path, st: Settings) -> np.ndarray:
+    """The picture at full resolution (a full raw decode, no half-size shortcut): for zooming in.
+    Keeps the decode in this thread's memory for the next zoomed render; release_cache() frees it."""
+    return _display_render(path, to_config(st, path=path), 1_000_000, False, True)
+
+
+_exposures: dict = {}
+
+
+def scan_exposure(path: Path) -> tuple[str, str, str]:
+    """The scan's own exposure (the camera that photographed the negative): shutter, aperture, ISO,
+    each "" when the file does not say (a manual lens has no aperture). Read once per file."""
+    if path in _exposures:
+        return _exposures[path]
+    shutter = aperture = iso = ""
+    try:
+        from negpy.features.metadata.exif_read import rational_to_float, rational_to_int
+        from negpy.infrastructure.loaders.helpers import read_exif_from_file
+
+        tags = (read_exif_from_file(str(path)) or {}).get("Exif", {}) or {}
+        t = rational_to_float(tags.get(33434))                     # ExposureTime
+        if t:
+            shutter = f"1/{round(1 / t)}" if t < 0.5 else f"{t:g}s"
+        f = rational_to_float(tags.get(33437))                     # FNumber (0: a manual lens)
+        if f:
+            aperture = f"f/{f:g}"
+        n = tags.get(34855)                                        # ISOSpeedRatings
+        n = n if isinstance(n, int) else rational_to_int(n) if n is not None else None
+        if n:
+            iso = f"ISO {n}"
+    except Exception:
+        pass
+    _exposures[path] = (shutter, aperture, iso)
+    return _exposures[path]
+
+
+_details: dict = {}
+
+
+def scan_details(path: Path) -> dict:
+    """What the scan file says about itself, for the frame's info: the camera and lens that
+    photographed the negative, its size in pixels, the file's size and type. Read once per file."""
+    if path in _details:
+        return _details[path]
+    d = {"camera": "", "lens": "", "size": (0, 0), "bytes": 0, "type": path.suffix.lstrip(".").upper()}
+    try:
+        d["bytes"] = path.stat().st_size
+    except OSError:
+        pass
+    try:
+        from negpy.infrastructure.loaders.helpers import read_exif_from_file
+        exif = read_exif_from_file(str(path)) or {}
+        text = lambda v: (v.decode(errors="ignore") if isinstance(v, bytes) else str(v or "")).strip("\x00 ")  # noqa: E731
+        make, model = text(exif.get("0th", {}).get(271)), text(exif.get("0th", {}).get(272))
+        d["camera"] = model if make and model.lower().startswith(make.split()[0].lower()) else f"{make} {model}".strip()
+        lens = text(exif.get("Exif", {}).get(42036))                         # LensModel
+        d["lens"] = "" if lens.upper().replace("-", "").replace(" ", "") in ("", "NOLENS", "UNKNOWN") or set(lens) <= {"-", "0", " "} else lens
+    except Exception:
+        pass
+    try:
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff"}:
+            from PIL import Image
+            with Image.open(path) as im:
+                d["size"] = im.size
+        else:
+            import rawpy
+            with rawpy.imread(str(path)) as raw:
+                d["size"] = (raw.sizes.width, raw.sizes.height)
+    except Exception:
+        pass
+    _details[path] = d
+    return d
 
 
 def source_long_edge(path: Path) -> int:
@@ -503,6 +790,9 @@ def source_long_edge(path: Path) -> int:
 def release_cache():
     """Free this thread's decoded scan (a full-resolution one is large)."""
     _processor().release_source_cache()
+    ip = _gpu_processors.get(threading.get_ident())
+    if ip is not None:
+        ip.release_source_cache()
 
 
 # Export formats: key -> (menu label, file extension)
@@ -529,6 +819,7 @@ class ExportOptions:
     color_space: str = "sRGB"        # "sRGB" | "P3 D65" | "Adobe RGB"
     pattern: str = "{name}"          # file name pattern, see file_name()
     overwrite: bool = False          # False = keep both (add a number)
+    border_px: int = 0               # a white border this many pixels wide around the picture (not on DNG)
 
 
 COLOR_SPACES = {"sRGB": "sRGB (sharing, web)", "P3 D65": "Display P3 (Apple screens)",
@@ -588,13 +879,28 @@ def _export_config(fmt: ExportFormat, opts: ExportOptions, color_space: str | No
                         export_print_size=float(opts.print_cm), export_dpi=int(opts.dpi))
 
 
+def _with_border(cfg: WorkspaceConfig, export_cfg: ExportConfig, px: int) -> WorkspaceConfig:
+    """A plain white border of `px` pixels, through NegPy's print border. NegPy sizes it in cm at
+    the export's own DPI (full resolution: added around the picture; a set size: fitted inside it)."""
+    from dataclasses import replace
+
+    from negpy.services.export.print import PrintService
+
+    dpi = PrintService.effective_dpi(export_cfg)
+    cm = (px + 0.5) * 2.54 / max(dpi, 1)       # NegPy truncates cm -> px: the half pixel lands it on px
+    return replace(cfg, finish=replace(cfg.finish, border_size=cm, border_color="#ffffff",
+                                       border_bottom_weight=1.0, border_match_paper=False))
+
+
 def _negpy_export(path: Path, st: Settings, fmt: ExportFormat, opts: ExportOptions,
                   color_space: str | None = None) -> bytes:
     """Full-resolution render through NegPy, encoded by NegPy (crop/rotation/size applied)."""
     ip = _processor()
+    cfg, export_cfg = to_config(st, path=path), _export_config(fmt, opts, color_space)
+    if opts.border_px > 0:
+        cfg = _with_border(cfg, export_cfg, opts.border_px)
     try:
-        data, _ = ip.process_export(str(path), to_config(st, path=path), _export_config(fmt, opts, color_space),
-                                    source_hash(path), prefer_gpu=False)
+        data, _ = ip.process_export(str(path), cfg, export_cfg, source_hash(path), prefer_gpu=False)
     finally:
         ip.release_source_cache()        # a full-resolution decode: never keep it
     if not data:
@@ -949,7 +1255,6 @@ def auto_wb(path: Path, st: Settings, point: tuple[float, float] | None = None) 
 # ---------------------------------------------------------------------------
 import json
 
-from negpy.features.exposure.normalization import pool_frame_bounds
 
 # NegPy's film catalogue: next to the code when run from source, at the bundle root in the packaged app
 _GEAR_DIR = (Path(sys._MEIPASS) / "gear" if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
@@ -960,7 +1265,7 @@ def frame_bounds(path: Path, st: Settings) -> tuple[tuple, tuple, tuple | None]:
     """Measure one frame exactly as NegPy's renderer does: its per-channel film floors and
     ceils, and its grey axis (where its neutral tones sit; None when it has none)."""
     per_frame = st.copy()
-    per_frame.roll_floors = per_frame.roll_ceils = per_frame.roll_axis = None
+    per_frame.roll_floors = per_frame.roll_ceils = per_frame.roll_axis = per_frame.roll_slope = None
     cfg = to_config(per_frame, uncropped=False)
     ip = _processor()
     src, _, _ = ip._load_source_f32(str(path), cfg, fast_decode=True)
@@ -1024,57 +1329,125 @@ def view_from_raw(grid: np.ndarray, x: float, y: float) -> tuple[float, float]:
     return CoordinateMapping.map_raw_to_viewport(x, y, grid)
 
 
-def analyze_roll(frames: list[tuple[Path, Settings]]) -> tuple[tuple, tuple, list[bool], tuple | None]:
-    """One colour baseline for a whole roll: measure every frame, then pool.
+def roll_white_balance(paths: list[Path], progress=None) -> tuple | None:
+    """One white balance for a roll's camera RAWs: the median of their as-shot ones (R, 1, B over
+    green). None when the roll has no camera RAWs (a scanner's TIFFs carry their own balance).
+    `progress(done, total)` is called as it goes, with the files read so far."""
+    import rawpy
+    found = []
+    for i, p in enumerate(paths):
+        if progress:
+            progress(i, len(paths))
+        try:
+            with rawpy.imread(str(p)) as raw:
+                wb = [float(v) for v in raw.camera_whitebalance[:3]]
+        except Exception:
+            continue
+        if wb[1] > 0 and wb[0] > 0 and wb[2] > 0:
+            found.append((wb[0] / wb[1], 1.0, wb[2] / wb[1]))
+    if not found:
+        return None
+    m = np.median(np.array(found), axis=0)
+    return (round(float(m[0]), 4), 1.0, round(float(m[2]), 4))
 
-    Returns (floors, ceils, outliers, grey axis). Pooling (NegPy's pool_frame_bounds) takes the
-    median over frames and marks the frames whose colour is far from the rest (a sunset, a red
-    wall, a frame scanned differently) as outliers: they are left out of the baseline, and
-    they keep their own measurement instead of the roll's.
+
+def analyze_roll(frames: list[tuple[Path, Settings]], progress=None) -> tuple[tuple, tuple, tuple, list[bool], tuple | None]:
+    """One colour baseline for a whole roll: measure every frame, then pool (NegPy's pool_dye_slopes).
+
+    Returns (floors, ceils, dye slope, outliers, grey axis). Outliers (a sunset, a red wall, a
+    frame scanned differently) are left out of the baseline and keep their own measurement.
+    `progress(done, total)` is called as it goes, with the frames measured so far.
     """
-    from negpy.features.exposure.normalization import pool_neutral_axis
+    from negpy.features.exposure.normalization import pool_dye_slopes, pool_neutral_axis
     from negpy.features.process.models import neutral_axis_tuple
 
     floors, ceils, axes = [], [], []
-    for path, st in frames:
+    for i, (path, st) in enumerate(frames):
+        if progress:
+            progress(i, len(frames))
         f, c, a = frame_bounds(path, st)
         floors.append(f)
         ceils.append(c)
         axes.append(a if st.mode == "color" else None)
-    pooled, outliers = pool_frame_bounds(np.array(floors), np.array(ceils))
+    pooled, slope, outliers = pool_dye_slopes(np.array(floors), np.array(ceils))
     axis = pool_neutral_axis(axes, outliers)
-    return (tuple(pooled.floors), tuple(pooled.ceils), [bool(o) for o in outliers],
+    return (tuple(pooled.floors), tuple(pooled.ceils), slope, [bool(o) for o in outliers],
             neutral_axis_tuple(axis) if axis is not None else None)
 
 
+# For a roll whose film is not known: choosing the film is required before a roll is analysed,
+# so these let it go ahead (colour: Generic C41 and the average Lab print).
+OTHER_STOCKS = [
+    {"id": "other-color", "displayName": "Other colour negative", "manufacturer": "", "stockName": "",
+     "colorType": "ColorNegative", "notes": "A colour negative not in the list"},
+    {"id": "other-bw", "displayName": "Other B&W negative", "manufacturer": "", "stockName": "",
+     "colorType": "B&W Negative", "notes": "A black-and-white negative not in the list"},
+]
+
+
 def film_stocks() -> list[dict]:
-    """NegPy's film catalogue, negatives only (what SimpleNeg converts), sorted by name."""
+    """NegPy's film catalogue, negatives only (what SimpleNeg converts), sorted by name; the two
+    "Other …" entries come last."""
     data = json.loads((_GEAR_DIR / "film_stocks.json").read_text())
     stocks = [d for d in data if d.get("colorType") in ("ColorNegative", "B&W Negative")]
-    return sorted(stocks, key=lambda d: d["displayName"].casefold())
+    return sorted(stocks, key=lambda d: d["displayName"].casefold()) + OTHER_STOCKS
 
 
 def stock_by_id(stock_id: str) -> dict | None:
     return next((d for d in film_stocks() if d["id"] == stock_id), None)
 
 
+_MAKERS = {"kodak": "kodak", "fujifilm": "fuji", "fuji": "fuji", "fujicolor": "fuji"}
+# Respools of Kodak's cinema film: the same emulsion (Vision3) with the rem-jet backing taken off.
+# CineStill 800T is sold as a motion-picture stock rated at 800; it is widely documented as Vision3
+# 500T. A respool named with Vision3's own speed and light (Flic Film Cine Colour 250D, Silbersalz35
+# 500T) is matched by the CINE_RESPOOLERS rule below.
+STOCK_ALIASES = {"CineStill 800T": "Vision3 500T", "CineStill 50D": "Vision3 50D"}
+CINE_RESPOOLERS = ("cinestill", "flic film cine", "silbersalz35")
+
+
 def _words(text: str) -> set[str]:
     import re
-    return set(re.findall(r"[a-z0-9]+", text.lower().replace("(approx)", ""))) - {"kodak", "fujifilm", "fuji", "fujicolor"}
+    text = re.sub(r"\b[57]2\d\d\b", " ", text.lower().replace("(approx)", ""))    # Kodak's 5207/7207 codes
+    return {_MAKERS.get(w, w) for w in re.findall(r"[a-z0-9]+", text)}
+
+
+def _profile_names(name: str) -> list[tuple[set[str], str]]:
+    """What a film profile answers to, per name ("Ektacolor Pro 400 / Portra 400"): its words without
+    the maker, unless only a speed would be left ("Fujicolor 400" needs the "fuji"), and its name
+    words run together in order ("ultramax"), for stocks that write them as one."""
+    import re
+    out = []
+    for alt in re.sub(r"\b[57]2\d\d/[57]2\d\d\b", " ", name).split("/"):
+        w = _words(alt)
+        named = {x for x in w if x not in _MAKERS.values()}
+        w = named if any(not x.isdigit() for x in named) else w
+        order = [_MAKERS.get(x, x) for x in re.findall(r"[a-z0-9]+", alt.lower().replace("(approx)", ""))]
+        out.append((w, "".join(x for x in order if x in w and not x.isdigit())))
+    return [(w, j) for w, j in out if j]
 
 
 def crosstalk_for_stock(stock: dict) -> str:
     """The crosstalk profile NegPy ships for this stock, else Generic C41.
 
-    Matched by name: every word of the profile (minus the maker) must appear in
-    the stock's name, e.g. "Kodak Gold 200 (approx)" -> "Kodak Gold 200".
+    Matched by name: every word of one of the profile's names must be in the stock's name, with the
+    maker only when the name is just a speed: "Kodak Gold 200 (approx)" -> Kodak Gold 200, but
+    Fujicolor 400 is not every 400 film. "UltraMax" and "Ultra Max" read the same; respools of Vision3
+    (STOCK_ALIASES, CINE_RESPOOLERS) find its profile.
     """
-    stock_words = _words(f"{stock.get('displayName', '')} {stock.get('stockName', '')}")
+    display = stock.get("displayName", "")
+    text = f"{display} {stock.get('stockName', '')}"
+    text = STOCK_ALIASES.get(display, text)
+    if any(r in display.lower() for r in CINE_RESPOOLERS):
+        text += " vision3"
+    stock_words = _words(text) | {_MAKERS.get(display.split()[0].lower(), "")} if display else _words(text)
+    compact = "".join(text.lower().split())
     best, best_len = CrosstalkProfiles.DEFAULT_NAME, 0
     for name in films():
-        w = _words(name)
-        if w and w <= stock_words and len(w) > best_len:
-            best, best_len = name, len(w)
+        for w, joined in _profile_names(name):
+            hit = w <= stock_words or (joined in compact and {x for x in w if x.isdigit()} <= stock_words)
+            if hit and len(w) > best_len:
+                best, best_len = name, len(w)
     return best
 
 
@@ -1303,7 +1676,7 @@ def _sheet_tile(path: Path, st: Settings, long_edge: int):
     """(the frame as it would export, small; the settings NegPy rendered it with)"""
     from negpy.services.export.contact_sheet_roll import tile_params
 
-    cfg = to_config(st, path=path)
+    cfg = to_config(st, path=path, long_edge=long_edge)
     tile = _processor().render_display_array(str(path), tile_params(cfg), source_hash(path), long_edge,
                                              prefer_gpu=False, fast_decode=True)
     return tile, cfg
