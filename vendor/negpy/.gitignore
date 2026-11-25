@@ -29,7 +29,6 @@ venv/
 *.egg-info/
 
 __pycache__
-VERSION
 # metrics artifacts
 metrics.json
 # llm stuff
