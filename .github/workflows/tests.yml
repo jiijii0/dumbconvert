@@ -59,7 +59,11 @@ jobs:
           pip install --no-deps -e ./vendor/negpy
 
       - name: Tests
-        run: python -m unittest discover -s tests -v
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            (while true; do echo "MEM $(date +%T) $(free -m | awk 'NR==2{print $3 "/" $2 " MB"}') $(ps -eo rss,comm --sort=-rss | sed -n 2p)"; sleep 15; done) &
+          fi
+          python -m unittest discover -s tests -v
 
   negpy:
     # NegPy's own tests, for the copy in vendor/negpy that DumbConvert changes. Linux x86-64 is the
