@@ -544,13 +544,16 @@ _processors: dict[int, ImageProcessor] = {}
 _processors_lock = threading.Lock()
 
 
-def forget_processors():
-    """Drop every thread's NegPy engine and what it holds (decoded scans, GPU textures). A thread
-    that renders again makes a new one. For when the threads that owned them are gone (a closed
-    window's thread pools), whose engines would otherwise stay for the life of the process."""
+def forget_processors(gpu: bool = False):
+    """Drop every thread's CPU NegPy engine and what it holds (decoded scans). A thread that renders
+    again makes a new one. For when the threads that owned them are gone (a closed window's thread
+    pools), whose engines would otherwise stay for the life of the process. The graphics-card
+    engines are kept unless `gpu`: on some drivers (OpenGL) a device must not be destroyed from
+    another thread than the one that made it."""
     with _processors_lock:
         _processors.clear()
-        _gpu_processors.clear()
+        if gpu:
+            _gpu_processors.clear()
 
 
 def _processor() -> ImageProcessor:
