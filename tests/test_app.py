@@ -1038,10 +1038,15 @@ class RefineTabsTest(AppTestCase):
                 self.assertLessEqual(abs(win.more_body.height() - win.more_body.sizeHint().height()), 2,
                                      "the section is not the height of its tab")
         self.assertLess(heights[2], heights[1] - 60, "Finish should be much shorter than Color")
-        win._refine_tab(1)                          # midway the section is between the two heights
-        pump(0.08)
-        self.assertTrue(heights[2] < win.more_body.height() < heights[1], "the height jumped instead of gliding")
-        self.assertTrue(2.0 > win.refine_bar._pos > 1.0, "the highlight jumped instead of gliding")
+        win._refine_tab(1)                          # on the way the section passes between the two heights
+        import time
+        seen_h, seen_pos, end = [], [], time.time() + 1.5
+        while time.time() < end and (win.more_body.height() != heights[1] or win.refine_bar._pos != 1.0):
+            pump(0.01)
+            seen_h.append(win.more_body.height())
+            seen_pos.append(win.refine_bar._pos)
+        self.assertTrue(any(heights[2] < h < heights[1] for h in seen_h), "the height jumped instead of gliding")
+        self.assertTrue(any(2.0 > x > 1.0 for x in seen_pos), "the highlight jumped instead of gliding")
         pump(0.5)
         self.assertEqual(win.refine_bar._pos, 1.0)
         bar = win.refine_bar                        # a click on a name chooses it

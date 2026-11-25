@@ -176,6 +176,11 @@ def close(win):
     if win in _OPEN:
         _OPEN.remove(win)
     idle(win)
+    # The window filters the whole application's events (and so does its wheel guard): PySide keeps
+    # every application-wide filter alive, which would keep the window and all it holds for good.
+    qapp.removeEventFilter(win)
+    if getattr(win, "_wheel_guard", None) is not None:
+        qapp.removeEventFilter(win._wheel_guard)
     win._unsaved_ok = True if hasattr(win, "_unsaved_ok") else None
     win.hide()
     win.deleteLater()
@@ -184,6 +189,20 @@ def close(win):
     # its app-wide event filters with it, and the suite slowed down test after test.
     from PySide6.QtCore import QCoreApplication, QEvent
     QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    # The window's own thread pools keep their threads for good (the app keeps them for its whole
+    # life), and each thread keeps a NegPy engine with decoded scans: end them with the window.
+    for name in ("preview_pool", "export_pool", "zoom_pool"):
+        pool = getattr(win, name, None)
+        if pool is not None:
+            pool.clear()
+            pool.waitForDone(30000)
+            setattr(win, name, None)          # the last reference: the pool and its threads end
+    engine.forget_processors()
+    # Qt still holds a few of the window's own helpers (event filters, click handlers), and through
+    # them the Python side of the window: empty it, so its frames, pictures and caches are freed.
+    win.__dict__.clear()
+    import gc
+    gc.collect()
 
 
 def shown_picture(win) -> np.ndarray:
