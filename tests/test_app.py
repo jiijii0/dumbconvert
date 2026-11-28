@@ -295,6 +295,24 @@ class HealInWindowTest(AppTestCase):
         h, w = before.shape[:2]
         self.assertGreater(abs(int(after[int(y * h), int(x * w)].max()) - int(before[int(y * h), int(x * w)].max())), 30)
 
+    def test_brush_and_marks_grow_with_the_zoom(self):
+        # Zoomed in, the circles kept their size at fit: a heal reached zoom times further than drawn,
+        # onto edges the circle seemed clear of, where nothing stands out and nothing was repaired.
+        win = self.open_frame()
+        win.toggle_heal()
+        idle(win)
+        pv = win.preview
+        r = pv.view_rect()
+        x, y = DUST[0]
+        QTest.mouseClick(pv, Qt.LeftButton, Qt.NoModifier, QPoint(int(r.x() + x * r.width()), int(r.y() + y * r.height())))
+        idle(win)
+        brush, mark = pv.brush_px, pv.heal_marks[0][1]
+        pv.zoom_at(3.0)
+        self.assertAlmostEqual(pv.brush_px, 3 * brush, delta=0.5, msg="the brush kept its size at fit")
+        self.assertAlmostEqual(pv.heal_marks[0][1], 3 * mark, delta=0.5, msg="the healed spot's circle kept its size")
+        pv.reset_zoom()
+        self.assertAlmostEqual(pv.brush_px, brush, delta=0.5)
+
 
 class SelectionTest(AppTestCase):
     """GitHub #6: changes should reach every selected frame."""

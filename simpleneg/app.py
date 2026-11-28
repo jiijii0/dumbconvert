@@ -6409,6 +6409,8 @@ class MainWindow(QMainWindow):
     def on_zoom(self, z: float):
         pv = self.preview
         self._update_zoom_100()
+        if pv.heal_mode:
+            self._refresh_heal_marks()                    # the circles are drawn at this zoom
         if z <= 1.0:
             if self._fullscreen:                          # full view keeps its full-resolution picture
                 if self._hires_key == self._settings_key(self.current) if self.current else False:
@@ -6546,8 +6548,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{len(st.heal_spots)} spot(s) healed on this frame · {keys.MOD}+Z removes the last")
 
     def _brush_radius_px(self, size: float) -> float:
-        """A heal size (diameter at 1600 px of the raw scan) as a radius on screen."""
-        r = self.preview.image_rect()
+        """A heal size (diameter at 1600 px of the raw scan) as a radius on screen, at the current zoom."""
+        r = self.preview.view_rect()
         if not self._uv_ready() or r.isEmpty():
             return max(4.0, size / 1600 * max(r.width(), r.height()) / 2)
         grid = self._uv[2]
