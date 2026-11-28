@@ -1537,6 +1537,8 @@ class Backdrop(QWidget):
             pix = ph.hires or ph.source
             r = ph.view_rect().translated(QPointF(ph.mapTo(self, QPoint(0, 0))))
             p.setRenderHint(QPainter.SmoothPixmapTransform)
+            if ph.heal_mode or ph.area_mode:      # only where the tool works: none of it under the dimmed panels
+                p.setClipRect(QRectF(ph.rect()).translated(QPointF(ph.mapTo(self, QPoint(0, 0)))))
             p.drawPixmap(r, pix, QRectF(pix.rect()))
         elif not self.black:
             p.fillRect(self.rect(), self._brush)
@@ -2495,11 +2497,9 @@ class PreviewLabel(QLabel):
         self.update()
 
     def bounds(self) -> QRectF:
-        """The area a zoomed photo may fill: the whole window (in this widget's coordinates)."""
-        canvas = self.window().centralWidget() if hasattr(self.window(), "centralWidget") else None
-        if isinstance(canvas, Backdrop):
-            tl = self.mapFrom(canvas, QPoint(0, 0))
-            return QRectF(tl.x(), tl.y(), canvas.width(), canvas.height())
+        """How far a zoomed photo may be panned: until its edges reach the photo area (this widget),
+        so a picture's edges can always be brought out from under the side panels, where heal
+        clicks and lassos cannot go. The same with or without a tool, so leaving one doesn't move it."""
         return QRectF(self.rect())
 
     def _ref(self) -> QPointF:
