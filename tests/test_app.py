@@ -7,7 +7,8 @@ import sys
 import time
 import unittest
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QCompleter, QLabel
 
@@ -294,6 +295,32 @@ class HealInWindowTest(AppTestCase):
         after = shown_picture(win)
         h, w = before.shape[:2]
         self.assertGreater(abs(int(after[int(y * h), int(x * w)].max()) - int(before[int(y * h), int(x * w)].max())), 30)
+
+
+    def alt_scroll(self, dy, phase=Qt.ScrollUpdate):
+        pv = self.win.preview
+        pos = QPointF(pv.rect().center())
+        ev = QWheelEvent(pos, QPointF(pv.mapToGlobal(pos.toPoint())), QPoint(0, dy // 4), QPoint(0, dy),
+                         Qt.NoButton, Qt.AltModifier, phase, False)
+        QApplication.sendEvent(pv, ev)
+
+    def test_trackpad_alt_scroll_sizes_the_brush(self):
+        """A trackpad gesture (begin, small steps, end) grows the brush by what it adds up to;
+        its zero-delta begin / end events used to shrink it."""
+        win = self.open_frame()
+        win.toggle_heal()
+        idle(win)
+        size = win.heal_size
+        self.alt_scroll(0, Qt.ScrollBegin)
+        self.alt_scroll(0, Qt.ScrollEnd)
+        self.assertEqual(win.heal_size, size)
+        self.alt_scroll(0, Qt.ScrollBegin)
+        for _ in range(12):                    # 12 x 20 = two wheel notches
+            self.alt_scroll(20)
+        self.alt_scroll(0, Qt.ScrollEnd)
+        self.assertAlmostEqual(win.heal_size, size * 1.15 ** 2)
+        self.alt_scroll(-120)                  # a mouse wheel notch is one step
+        self.assertAlmostEqual(win.heal_size, size * 1.15)
 
 
 class SelectionTest(AppTestCase):

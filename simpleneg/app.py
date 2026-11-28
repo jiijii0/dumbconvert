@@ -2430,6 +2430,7 @@ class PreviewLabel(QLabel):
         self._spin_timer.timeout.connect(self._tick_spin)
         self._press: QPointF | None = None
         self._panned = False
+        self._brush_delta = 0                # Alt + scroll not yet turned into brush steps (1/8 degrees)
         self._hint_timer = QTimer(singleShot=True, interval=1200)
         self._hint_timer.timeout.connect(self.update)
 
@@ -2864,7 +2865,13 @@ class PreviewLabel(QLabel):
         if e.modifiers() & Qt.ControlModifier:           # Cmd on a Mac
             self.zoom_at(self.zoom * (1.0015 ** dy), pos)
         elif self.heal_mode and e.modifiers() & Qt.AltModifier:
-            self.brush_wheel.emit(1 if (dy or e.angleDelta().x()) > 0 else -1)
+            # One step per wheel notch (120); a trackpad's many small deltas add up, and its
+            # zero-delta begin / end events do nothing (they used to shrink the brush)
+            self._brush_delta += dy or e.angleDelta().x()
+            while abs(self._brush_delta) >= 120:
+                step = 1 if self._brush_delta > 0 else -1
+                self._brush_delta -= 120 * step
+                self.brush_wheel.emit(step)
         elif self.zoom > 1.0:
             d = e.pixelDelta() if not e.pixelDelta().isNull() else e.angleDelta() / 3
             self.pan_by(d.x(), d.y())
