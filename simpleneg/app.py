@@ -3428,6 +3428,8 @@ class MainWindow(QMainWindow):
             "pick_wb": (self.toggle_pick_wb, None),
             "heal": (self.toggle_heal, None),
             "heal_area": (self.toggle_heal_area, None),
+            "brush_smaller": (lambda: self.preview.heal_mode and self.on_brush_wheel(-1), None),
+            "brush_bigger": (lambda: self.preview.heal_mode and self.on_brush_wheel(+1), None),
             "zoom": (self.toggle_zoom_key, None),
             "fullscreen": (self.toggle_fullscreen, None),
             "reset": (self.reset_current, None),
@@ -6492,9 +6494,11 @@ class MainWindow(QMainWindow):
         self.heal_btn.setProperty("on", on)
         self.heal_btn.style().unpolish(self.heal_btn)
         self.heal_btn.style().polish(self.heal_btn)
-        self._tool_lock(on, ("heal", "zoom", "escape", "undo", "redo"), self.heal_btn)
+        self._tool_lock(on, ("heal", "brush_smaller", "brush_bigger", "zoom", "escape", "undo", "redo"), self.heal_btn)
         if on:
-            self.statusBar().showMessage("Heal dust: click each speck · Alt+scroll for brush size · zoom with "
+            brush = " / ".join(k for k in (self.key_for("brush_smaller"), self.key_for("brush_bigger")) if k)
+            self.statusBar().showMessage(f"Heal dust: click each speck · {brush + ' or ' if brush else ''}Alt+scroll "
+                                         "for brush size · zoom with "
                                          f"{self.key_for('zoom') or 'a click'} or {keys.MOD}+scroll · {self.key_for('heal') or 'the button'} or Esc when done")
             self._ensure_uv()
         else:

@@ -322,6 +322,32 @@ class HealInWindowTest(AppTestCase):
         self.alt_scroll(-120)                  # a mouse wheel notch is one step
         self.assertAlmostEqual(win.heal_size, size * 1.15)
 
+    def test_bracket_keys_size_the_brush(self):
+        """[ and ] size the heal brush, as in Photoshop and Affinity."""
+        win = self.open_frame()
+        size = win.heal_size
+        win.preview.setFocus()
+        QTest.keyClick(win.preview, Qt.Key_BracketRight)
+        self.assertEqual(win.heal_size, size, "the brush changed outside the heal tool")
+        win.toggle_heal()
+        idle(win)
+        QTest.keyClick(win.preview, Qt.Key_BracketRight)
+        self.assertAlmostEqual(win.heal_size, size * 1.15)
+        QTest.keyClick(win.preview, Qt.Key_BracketLeft)
+        QTest.keyClick(win.preview, Qt.Key_BracketLeft)
+        self.assertAlmostEqual(win.heal_size, size / 1.15)
+
+    def test_saved_key_layout_gets_the_bracket_keys(self):
+        from simpleneg import keys
+        saved = {k: a for k, a in keys.DEFAULT_BINDINGS.items() if a not in keys.NEW_ACTIONS}
+        keys.save(saved)
+        try:
+            loaded = keys.load()
+        finally:
+            keys.save(keys.DEFAULT_BINDINGS)
+        self.assertEqual(loaded.get("["), "brush_smaller")
+        self.assertEqual(loaded.get("]"), "brush_bigger")
+
 
 class SelectionTest(AppTestCase):
     """GitHub #6: changes should reach every selected frame."""
