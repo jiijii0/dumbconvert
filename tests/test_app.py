@@ -245,6 +245,53 @@ class CropTest(AppTestCase):
         pv = win.preview
         self.assertAlmostEqual(pv.crop.width() * pv._aspect / pv.crop.height(), 1.5, places=3)
 
+    def test_crop_edit_does_not_turn_the_frame(self):
+        # Reported on a Mac: going into the crop, the frame sometimes turned 90 degrees. The format picked
+        # in an earlier crop was still held, and the uncropped picture arriving refitted to it.
+        win = self.open_frame()
+        pv = win.preview
+        win.toggle_crop()
+        idle(win)
+        win.set_crop_format("4:3")
+        pv.crop = pv._largest(pv._k(), pv.crop.center(), app.QRectF(0.2, 0.2, 0.6, 0.6))
+        win.toggle_crop(apply=True)
+        idle(win)
+        win.rotate(1)                          # the crop turns with the picture: now portrait
+        idle(win)
+        win.toggle_crop()
+        idle(win)
+        self.assertTrue(pv.crop_is_portrait(), "the portrait crop turned to landscape")
+        x0, y0, x1, y1 = win.current.settings.crop
+        self.assertAlmostEqual(pv.crop.width(), x1 - x0, places=3)
+        self.assertAlmostEqual(pv.crop.height(), y1 - y0, places=3)
+        self.assertTrue(win.ratio_btns["Free"].isChecked())
+        win.toggle_crop(apply=False)
+        idle(win)
+
+    def test_keep_crop_format_setting(self):
+        # Settings > Keep crop format: the next crop starts on the last format, turned like this frame
+        app.set_pref("keep_crop_format", True)
+        self.addCleanup(app.set_pref, "keep_crop_format", False)
+        win = self.open_frame()
+        pv = win.preview
+        win.toggle_crop()
+        idle(win)
+        win.set_crop_format("4:3")
+        pv.crop = pv._largest(pv._k(), pv.crop.center(), app.QRectF(0.2, 0.2, 0.6, 0.6))
+        win.toggle_crop(apply=True)
+        idle(win)
+        win.rotate(1)                          # the crop turns with the picture: now portrait
+        idle(win)
+        win.toggle_crop()
+        idle(win)
+        self.assertTrue(win.ratio_btns["4:3"].isChecked(), "the format was not kept")
+        self.assertTrue(pv.crop_is_portrait(), "the portrait crop turned to landscape")
+        self.assertAlmostEqual(pv.crop.height() / pv._aspect / pv.crop.width(), 4 / 3, places=2)
+        x0, y0, x1, y1 = win.current.settings.crop
+        self.assertAlmostEqual(pv.crop.width(), x1 - x0, places=3)
+        win.toggle_crop(apply=False)
+        idle(win)
+
 
 class PreviewTest(AppTestCase):
     def test_no_strobe_while_dragging(self):

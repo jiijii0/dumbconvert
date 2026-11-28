@@ -620,7 +620,7 @@ def button(text: str, slot=None, name: str = "") -> QPushButton:
 
 # Preferences: the few choices that outlive a session (the Settings tab). Stored by macOS in
 # ~/Library/Preferences, next to the key bindings and the camera / lens presets.
-PREF_DEFAULTS = {"gpu": True, "border": True, "border_px": 80, "sync": "", "auto_crop_new": False, "scan_warnings": True, "flat_field": "", "light": "white", "export": "", "sheet": "", "accent": "purple"}
+PREF_DEFAULTS = {"gpu": True, "border": True, "border_px": 80, "sync": "", "auto_crop_new": False, "keep_crop_format": False, "scan_warnings": True, "flat_field": "", "light": "white", "export": "", "sheet": "", "accent": "purple"}
 
 
 def pref(key: str):
@@ -4275,6 +4275,9 @@ class MainWindow(QMainWindow):
         lay = section("New frames")
         self.pref_autocrop = switch("auto_crop_new")
         row(lay, "Auto crop", "Crop the film border away on every frame you add (and after Reset).", self.pref_autocrop)
+        self.pref_keep_format = switch("keep_crop_format")
+        row(lay, "Keep crop format", "The film format picked in the crop (3:2, 6:7...) stays picked for the next "
+            "crop, turned to match each frame. Off: every crop starts free.", self.pref_keep_format)
 
         # While working
         lay = section("While working")
@@ -6891,6 +6894,14 @@ class MainWindow(QMainWindow):
             pv.reset_zoom()
             pv.crop_mode = True
             self._crop_room(True)
+            held = next((n for n, b in self.ratio_btns.items() if b.isChecked()), "Free")
+            if pref("keep_crop_format") and self.CROP_FORMATS.get(held):
+                # the last format again, turned like the picture shown now (this frame's crop): a format
+                # held the other way round turned the frame 90 degrees when the uncropped picture arrived
+                r = self.CROP_FORMATS[held]
+                pv.ratio = 1 / r if pv._aspect and pv._aspect < 1.0 else r
+            else:
+                self.set_crop_format("Free")      # a format held from the last crop would reshape (or turn) this one
             c = self.current.settings.crop
             pv.crop = QRectF(c[0], c[1], c[2] - c[0], c[3] - c[1]) if c else QRectF(0, 0, 1, 1)
             # Auto crop on: start from where it put the frame, not from the whole scan with its border
