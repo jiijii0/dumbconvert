@@ -55,7 +55,7 @@ The defaults:
 | , / . | Straighten 0.1° (Shift: 1°) |
 | Backspace | Reset the frame |
 | Cmd + Backspace | Remove the selected frames from the list (right-click a frame or a roll does the same; files on disk are never touched) |
-| Crop (X) | A frame appears on the photo. Pull its corners, drag inside to move it, pick a film format under the photo (3:2, 4:3, 5:4, 6:7, 1:1, XPan; Turn swaps upright and landscape). Return applies, Esc cancels |
+| Crop (X) | A frame appears on the photo. Pull its corners, drag inside to move it, pick a film format under the photo (3:2, 4:3, 5:4, 6:7, 1:1, XPan; Turn swaps upright and landscape). Each crop starts free, unless **Keep crop format** is on in Settings. Return applies, Esc cancels |
 | F1 | Keys tab |
 
 The six corrections sit under the left hand (Q W E above A S D), so it never has to move: hold one and
