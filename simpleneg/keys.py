@@ -79,6 +79,8 @@ ACTIONS = [
     Action("auto_straighten", "Auto straighten", "Level", "geometry"),
     Action("crop", "Edit crop / apply crop", "Crop", "geometry"),
     Action("heal", "Heal dust: click specks (H again to finish)", "Heal", "geometry"),
+    Action("brush_smaller", "Heal brush smaller", "Brush −", "geometry", True),
+    Action("brush_bigger", "Heal brush bigger", "Brush +", "geometry", True),
     Action("heal_area", "Clean area: draw around dust or scratches (A again to finish)", "Area", "geometry"),
     Action("zoom", f"Zoom: fit ↔ 100% (also click, pinch or {MOD}+scroll)", "Zoom", "view"),
     Action("fullscreen", "Full screen: only the photo (again, or Esc, to leave)", "Full", "view"),
@@ -111,6 +113,7 @@ GROUP_COLORS = {"frames": "#1b8796", "density": "#77797f", "cyan": "#1c8fc0", "m
 #     A  S  D        Cyan · Magenta · Yellow                (hold, then up / down)
 #     Z  X  C  V  B  N  M      zoom · crop · auto crop · level · before (hold) · pick neutral · mirror
 #     R auto crop again · Y sync roll · O white border · T original scan · F full screen · J rotate left · K auto WB · L rotate right · U heal · I clean area · P sheet
+#     [ ] heal brush smaller / bigger (as in Photoshop and Affinity)
 #
 # The one-step actions (cyan_up, ...) still exist; they are just not on a key by default.
 DEFAULT_BINDINGS = {
@@ -120,7 +123,7 @@ DEFAULT_BINDINGS = {
     "A": "adjust_cyan", "S": "adjust_magenta", "D": "adjust_yellow",
     "Z": "zoom", "X": "crop", "C": "auto_crop", "V": "auto_straighten", "B": "before", "N": "pick_wb", "M": "mirror",
     "R": "auto_crop_refresh", "Y": "sync_roll", "O": "border", "T": "original", "F": "fullscreen", "J": "rotate_left", "K": "auto_wb", "L": "rotate_right",
-    "U": "heal", "I": "heal_area", "P": "contact_sheet",
+    "U": "heal", "I": "heal_area", "P": "contact_sheet", "[": "brush_smaller", "]": "brush_bigger",
     ",": "tilt_left", ".": "tilt_right", "0": "auto_wb", "Backspace": "reset", "F1": "keys",
 }
 
@@ -146,7 +149,8 @@ MODIFIERS = {Qt.Key_Shift, Qt.Key_Control, Qt.Key_Meta, Qt.Key_Alt, Qt.Key_AltGr
              Qt.Key_Tab, Qt.Key_Escape, Qt.Key_unknown}
 
 
-NEW_ACTIONS: set = {"auto_crop_refresh", "sync_roll", "border", "original"}   # actions added after v4 layouts were saved (see load)
+NEW_ACTIONS: set = {"auto_crop_refresh", "sync_roll", "border", "original", "brush_smaller",
+                    "brush_bigger"}   # actions added after v4 layouts were saved (see load)
 SETTINGS_KEY = "key_bindings_v4"   # v4: the corrections on Q W E / A S D, held (older saved layouts are not reused)
 
 

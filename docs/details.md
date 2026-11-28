@@ -50,7 +50,7 @@ The defaults:
 | Z / X / C / V | Zoom · Crop · Auto crop · Auto straighten |
 | B (hold) / N / M | Before · Pick a neutral spot (then click it) · Mirror |
 | J / K / L | Rotate left · Auto WB (also 0) · Rotate right |
-| U / I | Heal dust (click specks, Alt+scroll for brush size) · Clean an area (draw around it) |
+| U / I | Heal dust (click specks, [ / ] or Alt+scroll for brush size) · Clean an area (draw around it) |
 | F / P | Full screen: only the photo (F or Esc to leave) · Contact sheet of the roll |
 | , / . | Straighten 0.1° (Shift: 1°) |
 | Backspace | Reset the frame |
@@ -73,7 +73,7 @@ Check grain, focus and dust like in Lightroom: **Z** or a click toggles between 
 screen pixel) around the pointer; **pinch** or **Cmd + scroll** zooms smoothly; **drag** or **scroll** pans. Fit is
 the furthest out. Past the preview's resolution DumbConvert renders the full-resolution picture in the background
 ("Loading detail…", a few seconds for a 24 MP raw) and swaps it in; edits while zoomed update it. Healing works
-at any zoom (Alt + scroll sizes the brush). A new frame, a turn, a crop or straightening goes back to Fit.
+at any zoom ([ / ] or Alt + scroll size the brush). A new frame, a turn, a crop or straightening goes back to Fit.
 
 ## Exif tab
 
@@ -170,7 +170,7 @@ does not fit continues on a second sheet. The sheet is drawn by NegPy's contact-
 | Refine ▸ Finish: Glow | `glow_amount` (Lab stage): a soft glow around bright areas, like a minilab scan's soft focus |
 | Refine ▸ Sharpen | `sharpen` (Lab stage), NegPy's default 0.25 |
 | Refine ▸ Colour noise | `chroma_denoise` 0–3, default 1.0 (NegPy's 2.5 removes barely more speckle and costs some colour) |
-| Heal Dust (H) | `manual_heal_strokes`: each click is a search area; NegPy repairs only what stands out from the film around it. Clicks are mapped to the raw scan with NegPy's UV grid, so crop and rotation can change later. Scroll for brush size; every spot is one undo step |
+| Heal Dust (H) | `manual_heal_strokes`: each click is a search area; NegPy repairs only what stands out from the film around it. Clicks are mapped to the raw scan with NegPy's UV grid, so crop and rotation can change later. [ / ] or Alt + scroll for brush size; every spot is one undo step |
 | Clean Area (A) | The shape you draw is filled with heal bands (`manual_heal_strokes`), so inside it NegPy repairs whatever stands out from the film around it and leaves clean film alone. Right-click a shape to remove it; each shape is one undo step. |
 | Pick Grey (W) | DumbConvert's own: sets C/M/Y so the clicked spot comes out grey |
 | (automatic) Film crosstalk | From the roll's film stock (`crosstalk_matrix`), the film's own dye matrix under either light |

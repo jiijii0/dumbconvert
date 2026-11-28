@@ -2430,6 +2430,7 @@ class PreviewLabel(QLabel):
         self._spin_timer.timeout.connect(self._tick_spin)
         self._press: QPointF | None = None
         self._panned = False
+        self._brush_delta = 0                # Alt + scroll not yet turned into brush steps (1/8 degrees)
         self._hint_timer = QTimer(singleShot=True, interval=1200)
         self._hint_timer.timeout.connect(self.update)
 
@@ -2864,7 +2865,13 @@ class PreviewLabel(QLabel):
         if e.modifiers() & Qt.ControlModifier:           # Cmd on a Mac
             self.zoom_at(self.zoom * (1.0015 ** dy), pos)
         elif self.heal_mode and e.modifiers() & Qt.AltModifier:
-            self.brush_wheel.emit(1 if (dy or e.angleDelta().x()) > 0 else -1)
+            # One step per wheel notch (120); a trackpad's many small deltas add up, and its
+            # zero-delta begin / end events do nothing (they used to shrink the brush)
+            self._brush_delta += dy or e.angleDelta().x()
+            while abs(self._brush_delta) >= 120:
+                step = 1 if self._brush_delta > 0 else -1
+                self._brush_delta -= 120 * step
+                self.brush_wheel.emit(step)
         elif self.zoom > 1.0:
             d = e.pixelDelta() if not e.pixelDelta().isNull() else e.angleDelta() / 3
             self.pan_by(d.x(), d.y())
@@ -3421,6 +3428,8 @@ class MainWindow(QMainWindow):
             "pick_wb": (self.toggle_pick_wb, None),
             "heal": (self.toggle_heal, None),
             "heal_area": (self.toggle_heal_area, None),
+            "brush_smaller": (lambda: self.preview.heal_mode and self.on_brush_wheel(-1), None),
+            "brush_bigger": (lambda: self.preview.heal_mode and self.on_brush_wheel(+1), None),
             "zoom": (self.toggle_zoom_key, None),
             "fullscreen": (self.toggle_fullscreen, None),
             "reset": (self.reset_current, None),
@@ -6485,9 +6494,11 @@ class MainWindow(QMainWindow):
         self.heal_btn.setProperty("on", on)
         self.heal_btn.style().unpolish(self.heal_btn)
         self.heal_btn.style().polish(self.heal_btn)
-        self._tool_lock(on, ("heal", "zoom", "escape", "undo", "redo"), self.heal_btn)
+        self._tool_lock(on, ("heal", "brush_smaller", "brush_bigger", "zoom", "escape", "undo", "redo"), self.heal_btn)
         if on:
-            self.statusBar().showMessage("Heal dust: click each speck · Alt+scroll for brush size · zoom with "
+            brush = " / ".join(k for k in (self.key_for("brush_smaller"), self.key_for("brush_bigger")) if k)
+            self.statusBar().showMessage(f"Heal dust: click each speck · {brush + ' or ' if brush else ''}Alt+scroll "
+                                         "for brush size · zoom with "
                                          f"{self.key_for('zoom') or 'a click'} or {keys.MOD}+scroll · {self.key_for('heal') or 'the button'} or Esc when done")
             self._ensure_uv()
         else:
