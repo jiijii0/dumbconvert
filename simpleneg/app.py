@@ -3348,6 +3348,7 @@ class MainWindow(QMainWindow):
         self._straighten_timer.timeout.connect(self.request_preview)
         self._clipboard: engine.Settings | None = None
         self._fullscreen = False
+        self._panels_hidden = False                   # Tab: only the photo, in the normal window
         self._was_maximized = False
         self._recovery_on = True                      # off while another running window owns the file
         self._recovery_text = ""
@@ -3504,7 +3505,7 @@ class MainWindow(QMainWindow):
         working = index in (0, 1)
         self.main_stack.setCurrentIndex({2: 1, 3: 2}.get(index, 0))
         self.right_stack.setCurrentIndex(1 if index == 1 else 0)
-        self._update_toolbars()
+        self._fit_panels()
         self.tab_buttons[index].setChecked(True)
         self.export_wrap.setVisible(bool(self.groups) and working)
         keep = self.title_box.sizePolicy()
@@ -3519,7 +3520,7 @@ class MainWindow(QMainWindow):
 
     def _update_toolbars(self):
         """Under the photo: the Convert actions, or the EXIF copy / paste actions on the Exif tab."""
-        loaded = bool(self.groups) and not self._fullscreen
+        loaded = bool(self.groups) and not self._bare()
         exif = self.right_stack.currentIndex() == 1
         cropping = self.preview.crop_mode
         self.toolbar.setVisible(loaded and not exif and not cropping)
@@ -3549,6 +3550,13 @@ class MainWindow(QMainWindow):
             self._set_adjusting(None)
         if t not in (QEvent.KeyPress, QEvent.KeyRelease, QEvent.ShortcutOverride):
             return super().eventFilter(obj, e)
+        # Tab hides the panels, tools or not; in a text field or a dialog it still moves the focus
+        if (t == QEvent.KeyPress and e.key() == Qt.Key_Tab and e.modifiers() == Qt.NoModifier
+                and self.groups and self.main_stack.currentIndex() == 0 and QApplication.activeWindow() is self
+                and not self._typing()):
+            if not e.isAutoRepeat():
+                self.toggle_panels()
+            return True
         if (self.main_stack.currentIndex() != 0 or QApplication.activeWindow() is not self or self._typing()
                 or self.preview.crop_mode or self.preview.heal_mode or self.preview.area_mode):
             return super().eventFilter(obj, e)
@@ -3639,19 +3647,11 @@ class MainWindow(QMainWindow):
             self._was_maximized = self.isMaximized()
             self.set_tab(0)
         self.backdrop.black = on
-        self.tab_row.setVisible(not on)
-        self.title.setVisible(not on)
-        self.statusBar().setVisible(not on)
-        self.right_stack.setVisible(not on and bool(self.groups))
-        self.grid.setVisible(not on and bool(self.groups))
         self._root.setContentsMargins(*((0, 0, 0, 0) if on else self._root_margins))
+        self._fit_panels()
         if on:
-            self.left.setVisible(False)
-            self.toolbar.setVisible(False)
-            self.toolbar_exif.setVisible(False)
             self.showFullScreen()
         else:
-            self._update_toolbars()
             self.showMaximized() if self._was_maximized else self.showNormal()
             self._fit_left_column()
         self.preview.full_view = on
@@ -3665,6 +3665,57 @@ class MainWindow(QMainWindow):
             if self.preview.hires is not None or self._hires_key is not None:
                 self.preview.hires, self._hires_key = None, None
                 self.zoom_pool.start(Job(engine.release_cache, lambda r: None))   # free the full decode
+
+    def toggle_panels(self):
+        """Tab: the panels around the photo go away (rolls, right column, filmstrip, toolbars, tabs and
+        status bar) and the photo takes their room; Tab again brings them back. Works while a tool is
+        on, e.g. to heal dust at the picture's edge while zoomed. Full screen hides them anyway, so Tab
+        waits for it to end; the panels come back as Tab left them."""
+        if self._fullscreen or not (self.groups or self._panels_hidden):
+            return
+        self._panels_hidden = not self._panels_hidden
+        self._keep_view(self._fit_panels)
+        if self._panels_hidden:
+            self.toast.show_text("Panels hidden · Tab brings them back")
+
+    def _bare(self) -> bool:
+        """Only the photo shows: full screen (F), or the panels hidden (Tab) on the Convert / Exif page."""
+        return self._fullscreen or (self._panels_hidden and self.main_stack.currentIndex() == 0)
+
+    def _fit_panels(self):
+        """Show the panels that belong around the photo now: none when bare (see _bare); cropping
+        keeps the columns and the filmstrip away; the rolls column also needs room (_fit_left_column)."""
+        bare = self._bare()
+        side = bool(self.groups) and not bare and not self.preview.crop_mode
+        self.tab_row.setVisible(not bare)
+        self.statusBar().setVisible(not bare)
+        self.right_stack.setVisible(side)
+        self.grid.setVisible(side)
+        self._fit_left_column()
+        self._update_toolbars()
+
+    def _keep_view(self, change):
+        """Run `change` (panels shown or hidden) without moving a zoomed photo: it keeps its place and
+        size on the screen, and only the panels around it come and go. At fit it simply grows or shrinks."""
+        pv = self.preview
+        v = pv.view_rect() if pv.zoomed() else QRectF()
+        before = QRectF(QPointF(pv.mapToGlobal(v.topLeft().toPoint())), v.size())
+        change()
+        if v.isEmpty():
+            return
+        for lay in (self.layout(), self.centralWidget().layout(), self._root):   # place the panels now
+            lay.activate()
+        r = pv.image_rect()
+        if r.isEmpty():
+            return
+        pv.zoom = min(max(before.width() / r.width(), 1.0), pv.max_zoom())
+        at = QPointF(pv.mapFromGlobal(before.topLeft().toPoint()))
+        w, h, ref = r.width() * pv.zoom, r.height() * pv.zoom, pv._ref()
+        pv.center = QPointF((ref.x() - at.x()) / w, (ref.y() - at.y()) / h)
+        pv._sync_center()
+        pv._update_cursor()
+        pv.refresh()
+        pv.zoom_changed.emit(pv.zoom)             # 100% is a different zoom of the new fit
 
     def _sharp_fit_wanted(self) -> bool:
         """Full view shows the whole picture larger than the preview has pixels for: render it in full."""
@@ -4594,11 +4645,12 @@ class MainWindow(QMainWindow):
 
     def _fit_left_column(self):
         """The rolls column only shows when there's room; ↑ / ↓ still switch rolls without it."""
-        self.left.setVisible(bool(self.groups) and self.width() >= self.LEFT_HIDE_BELOW and not self._fullscreen)
+        self.left.setVisible(bool(self.groups) and self.width() >= self.LEFT_HIDE_BELOW and not self._bare()
+                             and not self.preview.crop_mode)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if hasattr(self, "left"):
+        if hasattr(self, "tab_row"):                  # the window is built
             self._fit_left_column()
 
     # ----- Adding / removing files -----------------------------------------
@@ -4700,12 +4752,9 @@ class MainWindow(QMainWindow):
         for f in imgs:
             self._add_photo(g, f)
         self._refresh_group_item(g)
-        self._fit_left_column()
-        self.right_stack.setVisible(True)
-        self.grid.setVisible(True)
         self.export_wrap.setVisible(self.main_stack.currentIndex() == 0)
         self.stack.setCurrentIndex(1)
-        self._update_toolbars()
+        self._fit_panels()
 
     def _add_photo(self, g: Group, f: Path):
         photo = Photo(path=f, group=g)
@@ -4870,11 +4919,9 @@ class MainWindow(QMainWindow):
         self.preview.setText("")
         self.title.setText("")
         self.stack.setCurrentIndex(0)
-        self.right_stack.setVisible(False)
-        self.grid.setVisible(False)
-        self.left.setVisible(False)
         self.export_wrap.setVisible(False)
-        self._update_toolbars()
+        self._panels_hidden = False                   # the first screen keeps its tabs
+        self._fit_panels()
 
     # ----- Saving the session, and recovery after a crash ---------------------------------------
     # The save icon (Cmd+S) keeps the session (rolls, frames, adjustments) in one place of the app's
@@ -6824,9 +6871,7 @@ class MainWindow(QMainWindow):
     def _crop_room_now(self, on: bool):
         """While cropping, the photo takes the room of the rolls column, the filmstrip and the right
         column (all locked while cropping): a bigger picture to crop on."""
-        self.left.setVisible(not on)
-        self.grid.setVisible(not on)
-        self.right_stack.setVisible(not on)
+        self._fit_panels()                            # follows crop_mode, set before this is called
 
     def crop_restore(self):
         """The crop toolbar's Reset: no crop of your own; auto crop again if new frames get it."""

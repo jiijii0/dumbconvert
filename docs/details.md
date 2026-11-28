@@ -52,6 +52,7 @@ The defaults:
 | J / K / L | Rotate left · Auto WB (also 0) · Rotate right |
 | U / I | Heal dust (click specks, Alt+scroll for brush size) · Clean an area (draw around it) |
 | F / P | Full screen: only the photo (F or Esc to leave) · Contact sheet of the roll |
+| Tab | Hide / show the panels: the photo takes the whole window (also while healing, cleaning or cropping) |
 | , / . | Straighten 0.1° (Shift: 1°) |
 | Backspace | Reset the frame |
 | Cmd + Backspace | Remove the selected frames from the list (right-click a frame or a roll does the same; files on disk are never touched) |
@@ -64,8 +65,8 @@ cyan is more red, which is why the on-screen C column has a cyan + and a red −
 put on a key: one-step + / − keys for every correction, copy, paste, undo, redo, export.
 
 Always the same (Ctrl instead of Cmd on Windows and Linux): Cmd+Z / Cmd+Shift+Z undo/redo, Cmd+C / Cmd+V copy/paste settings, Cmd+A select every frame
-(then any correction changes them all), Cmd+E export, Esc to leave a text field. Letters typed in text fields
-never change the picture.
+(then any correction changes them all), Cmd+E export, Esc to leave a text field, Tab to hide the panels. Letters
+typed in text fields never change the picture, and Tab there still moves to the next field.
 
 ## Zoom
 
@@ -73,7 +74,8 @@ Check grain, focus and dust like in Lightroom: **Z** or a click toggles between 
 screen pixel) around the pointer; **pinch** or **Cmd + scroll** zooms smoothly; **drag** or **scroll** pans. Fit is
 the furthest out. Past the preview's resolution DumbConvert renders the full-resolution picture in the background
 ("Loading detail…", a few seconds for a 24 MP raw) and swaps it in; edits while zoomed update it. Healing works
-at any zoom (Alt + scroll sizes the brush). A new frame, a turn, a crop or straightening goes back to Fit.
+at any zoom (Alt + scroll sizes the brush); **Tab** hides the panels so dust at the picture's edge is not under
+one, and a zoomed photo stays where it is while they go. A new frame, a turn, a crop or straightening goes back to Fit.
 
 ## Exif tab
 
