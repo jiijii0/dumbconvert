@@ -7,7 +7,7 @@ import sys
 import time
 import unittest
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRectF, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QCompleter, QLabel
 
@@ -295,6 +295,56 @@ class HealInWindowTest(AppTestCase):
         h, w = before.shape[:2]
         self.assertGreater(abs(int(after[int(y * h), int(x * w)].max()) - int(before[int(y * h), int(x * w)].max())), 30)
 
+    def test_zoomed_edges_can_be_reached(self):
+        """Zoomed in, the picture's edges stayed under the side panels, where heal clicks and
+        clean-area lassos cannot go."""
+        win = self.open_frame()
+        pv = win.preview
+        for toggle in (win.toggle_heal, win.toggle_heal_area):
+            toggle()
+            idle(win)
+            pv.zoom_at(pv.max_zoom())
+            for dx, dy in ((10**5, 10**5), (-(10**5), -(10**5))):     # as far as each corner goes
+                pv.pan_by(dx, dy)
+                v = pv.view_rect()
+                corner = v.topLeft() if dx > 0 else v.bottomRight()
+                self.assertTrue(QRectF(pv.rect()).adjusted(-1, -1, 1, 1).contains(corner), (toggle, corner))
+            before = pv.view_rect()
+            toggle()                               # leaving the tool leaves the picture where it is
+            idle(win)
+            self.assertEqual(pv.view_rect(), before, toggle)
+            pv.reset_zoom()
+
+    def test_zoomed_photo_not_drawn_under_the_panels_while_healing(self):
+        """While healing, the heal marks stop at the photo area, and so does the picture: it went on
+        under the dimmed panels, where marks vanished and clicks did nothing."""
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QWidget
+        win = self.open_frame()
+        pv, canvas = win.preview, win.centralWidget()
+        pv.zoom_at(pv.max_zoom())
+        idle(win)
+        end = time.time() + 60                 # the full-resolution picture, swapped in once it is ready
+        while (win._hires_busy or win.zoom_pool.activeThreadCount()) and time.time() < end:
+            pump(0.05)
+        idle(win)
+        tl = pv.mapTo(canvas, QPoint(0, 0))
+        self.assertGreater(tl.x(), 20, "the left column should be beside the photo")
+        spot = QPoint(tl.x() - 10, tl.y() + pv.height() // 2)           # just left of the photo area
+
+        def backdrop_at(pt):                   # the window background alone, without the panels on it
+            pix = QPixmap(canvas.size())
+            canvas.render(pix, QPoint(0, 0), canvas.rect(), QWidget.RenderFlag.DrawWindowBackground)
+            return pix.toImage().pixelColor(pt)
+
+        photo = backdrop_at(spot)
+        win.toggle_heal()
+        idle(win)
+        healing = backdrop_at(spot)
+        win.toggle_heal()
+        idle(win)
+        self.assertEqual(backdrop_at(spot), photo, "the photo came back under the panels after healing")
+        self.assertNotEqual(healing, photo, "the photo was drawn under the panels while healing")
 
 class SelectionTest(AppTestCase):
     """GitHub #6: changes should reach every selected frame."""
