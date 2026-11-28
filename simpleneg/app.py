@@ -6891,6 +6891,7 @@ class MainWindow(QMainWindow):
             pv.reset_zoom()
             pv.crop_mode = True
             self._crop_room(True)
+            self.set_crop_format("Free")          # a format held from the last crop would reshape (or turn) this one
             c = self.current.settings.crop
             pv.crop = QRectF(c[0], c[1], c[2] - c[0], c[3] - c[1]) if c else QRectF(0, 0, 1, 1)
             # Auto crop on: start from where it put the frame, not from the whole scan with its border
