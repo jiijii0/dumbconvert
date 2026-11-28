@@ -6043,6 +6043,8 @@ class MainWindow(QMainWindow):
             self._ensure_auto_crop(p)             # its crop is looked for once the levelling is known
         if isinstance(angle, str) or angle is None or not st.auto_crop or st.crop or abs(st.fine_rotation) > 0.05:
             return                                # nothing to level, or you changed your mind meanwhile
+        if p is self.current and self.preview.crop_mode:
+            return                                # the crop tool is open: you frame it, the picture stays put
         if p.group is None or p not in p.group.photos:
             return                                # removed from the list meanwhile
         untouched = len(p.history) == 1 and same_edits(p.history[0], st)

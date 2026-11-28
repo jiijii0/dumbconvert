@@ -245,6 +245,33 @@ class CropTest(AppTestCase):
         pv = win.preview
         self.assertAlmostEqual(pv.crop.width() * pv._aspect / pv.crop.height(), 1.5, places=3)
 
+    def test_levelling_does_not_turn_the_picture_in_the_crop_tool(self):
+        # Auto crop, then Edit at once: Auto crop's levelling came back while the frame was dragged,
+        # and the picture under the frame turned and re-rendered (the conversion thrashed)
+        import threading
+        win = self.open_frame()
+        st, pv = win.current.settings, win.preview
+        done = threading.Event()
+        real = app.engine.auto_level
+        app.engine.auto_level = lambda *a, **kw: done.wait(30) and 2.0   # a tilted scan, levelled slowly
+        self.addCleanup(setattr, app.engine, "auto_level", real)
+        self.addCleanup(done.set)
+        win.autocrop_cb.setChecked(True)
+        win.toggle_crop()
+        end = time.time() + 30
+        while (win.preview_busy or win.render_timer.isActive() or win._settle_timer.isActive()) and time.time() < end:
+            pump(0.02)
+        shown = []
+        original = pv.set_image
+        pv.set_image = lambda pix, *a, **kw: (shown.append(pix.size()), original(pix, *a, **kw))
+        done.set()                             # the levelling answers while the crop tool is open
+        idle(win)
+        self.assertEqual(shown, [], "the picture in the crop tool re-rendered when the levelling came back")
+        self.assertEqual(st.fine_rotation, 0.0, "the picture turned under the crop frame")
+        self.assertTrue(st.auto_crop)
+        win.toggle_crop(apply=False)
+        idle(win)
+
 
 class PreviewTest(AppTestCase):
     def test_no_strobe_while_dragging(self):
