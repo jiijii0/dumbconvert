@@ -296,6 +296,102 @@ class HealInWindowTest(AppTestCase):
         self.assertGreater(abs(int(after[int(y * h), int(x * w)].max()) - int(before[int(y * h), int(x * w)].max())), 30)
 
 
+
+class HidePanelsTest(AppTestCase):
+    """Tab hides the panels around the photo, like Lightroom: dust at the picture's edge can be
+    healed while zoomed without a panel over it."""
+
+    def panels(self, win):
+        return (win.left, win.right_stack, win.grid, win.toolbar, win.tab_row, win.statusBar())
+
+    def global_view(self, win):
+        r = win.preview.view_rect()
+        tl = win.preview.mapToGlobal(r.topLeft().toPoint())
+        return (tl.x(), tl.y(), round(r.width()), round(r.height()))
+
+    def test_tab_hides_the_panels_and_the_photo_grows(self):
+        win = self.open_roll(2)
+        win.preview.setFocus()
+        size = win.preview.size()
+        QTest.keyClick(win.preview, Qt.Key_Tab)
+        pump()
+        for w in self.panels(win):
+            self.assertFalse(w.isVisible(), f"{w} still shows")
+        self.assertGreater(win.preview.width(), size.width(), "the photo did not take the room")
+        self.assertGreater(win.preview.height(), size.height())
+        win.set_tab(2)                                     # the Keys page keeps its tabs
+        self.assertTrue(win.tab_row.isVisible())
+        win.set_tab(0)
+        self.assertFalse(win.tab_row.isVisible())
+        QTest.keyClick(win.preview, Qt.Key_Tab)
+        pump()
+        for w in self.panels(win):
+            self.assertTrue(w.isVisible(), f"{w} did not come back")
+        self.assertEqual(win.preview.size(), size)
+
+    def test_a_window_narrowed_meanwhile_gets_no_rolls_column(self):
+        win = self.open_roll(2)
+        win.toggle_panels()
+        pump()
+        win.resize(win.LEFT_HIDE_BELOW - 100, 800)
+        pump()
+        win.toggle_panels()
+        pump()
+        self.assertFalse(win.left.isVisible(), "Tab brought the rolls column into a narrow window")
+        self.assertTrue(win.right_stack.isVisible())
+
+    def test_tab_moves_between_text_fields(self):
+        win = self.open_roll()
+        win._toggle_details(win.current.group, True)
+        pump()
+        line = win.stock_box.lineEdit()
+        QTest.mouseClick(line, Qt.LeftButton)
+        pump(0.05)
+        QTest.keyClick(QApplication.focusWidget(), Qt.Key_Tab)
+        pump()
+        self.assertFalse(win._panels_hidden, "Tab in a text field hid the panels")
+        self.assertTrue(win.right_stack.isVisible())
+        self.assertIsNot(QApplication.focusWidget(), line, "Tab no longer moves to the next field")
+
+    def test_tab_works_while_healing_and_the_zoomed_photo_stays_put(self):
+        win = self.open_frame()
+        win.toggle_heal()
+        idle(win)
+        win.preview.zoom_at(3.0)                           # larger than the window either way
+        idle(win)
+        view = self.global_view(win)
+        QTest.keyClick(win.preview, Qt.Key_Tab)
+        pump()
+        self.assertTrue(win.preview.heal_mode, "Tab ended healing")
+        self.assertFalse(win.right_stack.isVisible())
+        for a, b in zip(self.global_view(win), view):
+            self.assertLessEqual(abs(a - b), 1, "the zoomed photo moved or changed size")
+        QTest.keyClick(win.preview, Qt.Key_Tab)
+        pump()
+        self.assertTrue(win.right_stack.isVisible())
+        self.assertIsNotNone(win.right_stack.graphicsEffect(), "the panels lost the healing tool's dimming")
+        for a, b in zip(self.global_view(win), view):
+            self.assertLessEqual(abs(a - b), 1)
+        win.toggle_heal()
+
+    def test_full_screen_and_the_crop_leave_tab_as_it_was(self):
+        win = self.open_frame()
+        win.toggle_panels()
+        win.toggle_fullscreen()
+        win.toggle_panels()                                # nothing to hide in full screen: no change
+        win.toggle_fullscreen()
+        pump()
+        self.assertTrue(win._panels_hidden)
+        self.assertFalse(win.grid.isVisible(), "leaving full screen brought the panels back")
+        win.toggle_crop()
+        win.toggle_crop(apply=False)
+        pump()
+        self.assertFalse(win.grid.isVisible(), "leaving the crop brought the panels back")
+        win.toggle_panels()
+        pump()
+        self.assertTrue(win.grid.isVisible())
+        self.assertTrue(win.tab_row.isVisible())
+
 class SelectionTest(AppTestCase):
     """GitHub #6: changes should reach every selected frame."""
 

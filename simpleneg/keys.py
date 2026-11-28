@@ -124,10 +124,12 @@ DEFAULT_BINDINGS = {
     ",": "tilt_left", ".": "tilt_right", "0": "auto_wb", "Backspace": "reset", "F1": "keys",
 }
 
-# Always the same, so they are not on the drawing's menu.
+# Always the same, so they are not on the drawing's menu. Tab is one of them (like Lightroom's): it
+# also moves between text fields, so it is watched in MainWindow.eventFilter, not bound.
 FIXED = [(f"{MOD}+Z / {MOD}+Shift+Z", "Undo / redo"), (f"{MOD}+C / {MOD}+V", "Copy settings / paste to selected"),
          (f"{MOD}+A", "Select every frame (then any correction changes them all)"),
          (f"{MOD}+E", "Export…"), (f"{MOD}+S", "Save this session (offered back at the next start)"),
+         ("Tab", "Hide / show the panels around the photo"),
          ("Esc", "Leave a text field, cancel the crop, leave full screen")]
 
 # The drawing: rows of (label on the cap, key name or None if it can't be bound, width in key units)
